@@ -3,10 +3,15 @@
 Config::Config()
     :_prefs(NULL)
     ,_tcpPort(502)
+    ,_tcpPort2(502)
+    ,_targetIP("127.0.0.1")
     ,_tcpTimeout(10000)
     ,_modbusBaudRate(9600)
     ,_modbusConfig(SERIAL_8N1)
     ,_modbusRtsPin(-1)
+    ,_modbusBaudRate2(9600)
+    ,_modbusConfig2(SERIAL_8N1)
+    ,_modbusRtsPin2(-1)
     ,_serialBaudRate(115200)
     ,_serialConfig(SERIAL_8N1)
 {}
@@ -15,10 +20,15 @@ void Config::begin(Preferences *prefs)
 {
     _prefs = prefs;
     _tcpPort = _prefs->getUShort("tcpPort", _tcpPort);
+    _tcpPort2 = _prefs->getUShort("tcpPort2", _tcpPort2);
+    _targetIP = _prefs->getString("targetIP", _targetIP);
     _tcpTimeout = _prefs->getULong("tcpTimeout", _tcpTimeout);
     _modbusBaudRate = _prefs->getULong("modbusBaudRate", _modbusBaudRate);
     _modbusConfig = _prefs->getULong("modbusConfig", _modbusConfig);
     _modbusRtsPin = _prefs->getChar("modbusRtsPin", _modbusRtsPin);
+    _modbusBaudRate2 = _prefs->getULong("modbusBaudRate2", _modbusBaudRate2);
+    _modbusConfig2 = _prefs->getULong("modbusConfig2", _modbusConfig2);
+    _modbusRtsPin2 = _prefs->getChar("modbusRtsPin2", _modbusRtsPin2);
     _serialBaudRate = _prefs->getULong("serialBaudRate", _serialBaudRate);
     _serialConfig = _prefs->getULong("serialConfig", _serialConfig);
 }
@@ -27,11 +37,33 @@ uint16_t Config::getTcpPort(){
     return _tcpPort;
 }
 
+uint16_t Config::getTcpPort2(){
+    return _tcpPort2;
+}
+
 void Config::setTcpPort(uint16_t value){
     if (_tcpPort == value) return;
     _tcpPort = value;
     _prefs->putUShort("tcpPort", _tcpPort);
 }
+
+void Config::setTcpPort2(uint16_t value){
+    if (_tcpPort2 == value) return;
+    _tcpPort2 = value;
+    _prefs->putUShort("tcpPort2", _tcpPort2);
+}
+
+String Config::getTargetIP() const {
+    return _targetIP;
+}
+
+void Config::setTargetIP(const String& ip) {
+    _targetIP = ip;
+    // Save to preferences if needed
+    _prefs->begin("your_preference_namespace", false);
+    _prefs->putString("targetIP", _targetIP);
+}
+
 
 uint32_t Config::getTcpTimeout(){
     return _tcpTimeout;
@@ -102,6 +134,67 @@ void Config::setModbusRtsPin(int8_t value){
     if (_modbusRtsPin == value) return;
     _modbusRtsPin = value;
     _prefs->putChar("modbusRtsPin", _modbusRtsPin);
+}
+
+uint32_t Config::getModbusConfig2(){
+    return _modbusConfig2;
+}
+
+unsigned long Config::getModbusBaudRate2(){
+    return _modbusBaudRate2;
+}
+
+void Config::setModbusBaudRate2(unsigned long value){
+    if (_modbusBaudRate2 == value) return;
+    _modbusBaudRate2 = value;
+    _prefs->putULong("modbusBaudRate2", _modbusBaudRate2);
+}
+
+uint8_t Config::getModbusDataBits2(){
+    return ((_modbusConfig2 & 0xc) >> 2) + 5;
+}
+
+void Config::setModbusDataBits2(uint8_t value){
+    auto dataBits = getModbusDataBits2();
+    value -= 5;
+    value = (value << 2) & 0xc;
+    if (value == dataBits) return;
+    _modbusConfig2 = (_modbusConfig2 & 0xfffffff3) | value;
+    _prefs->putULong("modbusConfig2", _modbusConfig2);
+}
+
+uint8_t Config::getModbusParity2(){
+    return _modbusConfig2 & 0x3;
+}
+
+void Config::setModbusParity2(uint8_t value){
+    auto parity = getModbusParity2();
+    value = value & 0x3;
+    if (parity == value) return;
+    _modbusConfig2 = (_modbusConfig2 & 0xfffffffc) | value;
+    _prefs->putULong("modbusConfig2", _modbusConfig2);
+}
+
+uint8_t Config::getModbusStopBits2(){
+    return (_modbusConfig2 & 0x30) >> 4;
+}
+
+void Config::setModbusStopBits2(uint8_t value){
+    auto stopbits = getModbusStopBits2();
+    value = (value << 4) & 0x30;
+    if (stopbits == value) return;
+    _modbusConfig2 = (_modbusConfig2 & 0xffffffcf) | value;
+    _prefs->putULong("modbusConfig2", _modbusConfig2);
+}
+
+int8_t Config::getModbusRtsPin2(){
+    return _modbusRtsPin2;
+}
+
+void Config::setModbusRtsPin2(int8_t value){
+    if (_modbusRtsPin2 == value) return;
+    _modbusRtsPin2 = value;
+    _prefs->putChar("modbusRtsPin2", _modbusRtsPin2);
 }
 
 uint32_t Config::getSerialConfig(){

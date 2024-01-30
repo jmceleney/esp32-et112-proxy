@@ -1,7 +1,7 @@
 #include "pages.h"
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
 
-void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusBridgeWiFi *bridge, Config *config, WiFiManager *wm){
+void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusClientTCP *modbusTCPClient, ModbusServerRTU *modbusRTUServer, ModbusBridgeWiFi *bridge, Config *config, WiFiManager *wm){
   server->on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /");
     auto *response = request->beginResponseStream("text/html");
@@ -15,7 +15,7 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusBridgeWiFi *
     sendResponseTrailer(response);
     request->send(response);
   });
-  server->on("/status", HTTP_GET, [rtu, bridge](AsyncWebServerRequest *request){
+  server->on("/status", HTTP_GET, [rtu, modbusTCPClient, modbusRTUServer, bridge](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /status");
     auto *response = request->beginResponseStream("text/html");
     sendResponseHeader(response, "Status");
@@ -29,12 +29,17 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusBridgeWiFi *
     sendTableRow(response, "ESP MAC", WiFi.macAddress());
     sendTableRow(response, "ESP IP",  WiFi.localIP().toString() );
 
-    sendTableRow(response, "RTU Messages", rtu->getMessageCount());
-    sendTableRow(response, "RTU Pending Messages", rtu->pendingRequests());
-    sendTableRow(response, "RTU Errors", rtu->getErrorCount());
+    sendTableRow(response, "Primary RTU Messages", rtu->getMessageCount());
+    sendTableRow(response, "Primary RTU Pending Messages", rtu->pendingRequests());
+    sendTableRow(response, "Primary RTU Errors", rtu->getErrorCount());
     sendTableRow(response, "Bridge Message", bridge->getMessageCount());
     sendTableRow(response, "Bridge Clients", bridge->activeClients());
     sendTableRow(response, "Bridge Errors", bridge->getErrorCount());
+    sendTableRow(response, "Secondary TCP Messages", modbusTCPClient->getMessageCount());
+    sendTableRow(response, "Secondary TCP Pending Messages", modbusTCPClient->pendingRequests());
+    sendTableRow(response, "Secondary TCP Errors", modbusTCPClient->getErrorCount());
+    sendTableRow(response, "RTU Server Message", modbusRTUServer->getMessageCount());
+    sendTableRow(response, "RTU Server Errors", modbusRTUServer->getErrorCount());
     response->print("<tr><td>&nbsp;</td><td></td></tr>");
     sendTableRow(response, "Build time", __DATE__ " " __TIME__);
     response->print("</table><p></p>");
@@ -63,12 +68,12 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusBridgeWiFi *
   server->on("/config", HTTP_GET, [config](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /config");
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Modbus TCP");
+    sendResponseHeader(response, "Modbus Server TCP");
     response->print("<form method=\"post\">");
     response->print("<table>"
       "<tr>"
         "<td>"
-          "<label for=\"tp\">TCP Port</label>"
+          "<label for=\"tp\">Local TCP Port</label>"
         "</td>"
         "<td>");
     response->printf("<input type=\"number\" min=\"1\" max=\"65535\" id=\"tp\" name=\"tp\" value=\"%d\">", config->getTcpPort());
@@ -83,7 +88,7 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusBridgeWiFi *
     response->print("</td>"
         "</tr>"
         "</table>"
-        "<h3>Modbus RTU</h3>"
+        "<h3>Modbus Primary RTU</h3>"
         "<table>"
         "<tr>"
           "<td>"
@@ -149,6 +154,94 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusBridgeWiFi *
           "</td>"
         "</tr>"
         "</table>"
+        "<hr>"
+        "<h3>Modbus TCP Client Settings (loopback or remote)</h3>"
+        "<table>"
+        "<tr>"
+          "<td>"
+            "<label for=\"sip\">Server IP</label>"
+          "</td>"
+          "<td>");
+    response->printf("<input type=\"text\" id=\"sip\" name=\"sip\" value=\"%s\">", config->getTargetIP().c_str());
+    response->print("</td>"
+        "</tr>"
+        "<tr>"
+          "<td>"
+            "<label for=\"tp2\">Server Port</label>"
+          "</td>"
+          "<td>");
+    response->printf("<input type=\"number\" min=\"1\" max=\"65535\" id=\"tp2\" name=\"tp2\" value=\"%d\">", config->getTcpPort2());
+
+    response->print("</td>"
+        "</tr>"
+        "</table>"
+        "<h3>Modbus Secondary RTU (server/slave)</h3>"
+        "<table>"
+        "<tr>"
+          "<td>"
+            "<label for=\"mb2\">Baud rate</label>"
+          "</td>"
+          "<td>");
+    response->printf("<input type=\"number\" min=\"0\" id=\"mb2\" name=\"mb2\" value=\"%lu\">", config->getModbusBaudRate2());
+    response->print("</td>"
+        "</tr>"
+        "<tr>"
+          "<td>"
+            "<label for=\"md2\">Data bits</label>"
+          "</td>"
+          "<td>");
+    response->printf("<input type=\"number\" min=\"5\" max=\"8\" id=\"md2\" name=\"md2\" value=\"%d\">", config->getModbusDataBits2());
+    response->print("</td>"
+        "</tr>"
+        "<tr>"
+          "<td>"
+            "<label for=\"mp2\">Parity</label>"
+          "</td>"
+          "<td>");
+    response->printf("<select id=\"mp2\" name=\"mp2\" data-value=\"%d\">", config->getModbusParity2());
+    response->print("<option value=\"0\">None</option>"
+              "<option value=\"2\">Even</option>"
+              "<option value=\"3\">Odd</option>"
+            "</select>"
+          "</td>"
+        "</tr>"
+        "<tr>"
+          "<td>"
+            "<label for=\"ms2\">Stop bits</label>"
+          "</td>"
+          "<td>");
+    response->printf("<select id=\"ms2\" name=\"ms2\" data-value=\"%d\">", config->getModbusStopBits2());
+    response->print("<option value=\"1\">1 bit</option>"
+              "<option value=\"2\">1.5 bits</option>"
+              "<option value=\"3\">2 bits</option>"
+            "</select>"
+          "</td>"
+        "</tr>"
+        "<tr>"
+          "<td>"
+            "<label for=\"mr2\">RTS Pin</label>"
+          "</td>"
+          "<td>");
+    response->printf("<select id=\"mr2\" name=\"mr2\" data-value=\"%d\">", config->getModbusRtsPin2());
+    response->print("<option value=\"-1\">Auto</option>"
+              "<option value=\"4\">D4</option>"
+              "<option value=\"13\">D13</option>"
+              "<option value=\"14\">D14</option>"
+              "<option value=\"18\">D18</option>"
+              "<option value=\"19\">D19</option>"
+              "<option value=\"21\">D21</option>"
+              "<option value=\"22\">D22</option>"
+              "<option value=\"23\">D23</option>"
+              "<option value=\"25\">D25</option>"
+              "<option value=\"26\">D26</option>"
+              "<option value=\"27\">D27</option>"
+              "<option value=\"32\">D32</option>"
+              "<option value=\"33\">D33</option>"
+            "</select>"
+          "</td>"
+        "</tr>"
+        "</table>"
+        "<hr>"
         "<h3>Serial (Debug)</h3>"
         "<table>"
         "<tr>"
@@ -208,10 +301,28 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusBridgeWiFi *
   });
   server->on("/config", HTTP_POST, [config](AsyncWebServerRequest *request){
     dbgln("[webserver] POST /config");
+    bool validIP = true;
     if (request->hasParam("tp", true)){
       auto port = request->getParam("tp", true)->value().toInt();
       config->setTcpPort(port);
       dbgln("[webserver] saved port");
+    }
+    if (request->hasParam("tp2", true)){
+      auto port = request->getParam("tp2", true)->value().toInt();
+      config->setTcpPort2(port);
+      dbgln("[webserver] saved port2");
+    }
+    if (request->hasParam("sip", true)){
+      String targetIP = request->getParam("sip", true)->value();
+        IPAddress ip;
+        if (ip.fromString(targetIP)) {
+            config->setTargetIP(targetIP);
+            dbgln("[webserver] saved target IP");
+        } else {
+            dbgln("[webserver] invalid target IP");
+            validIP = false;
+            // Optionally: Add code to handle invalid IP address
+        }
     }
     if (request->hasParam("tt", true)){
       auto timeout = request->getParam("tt", true)->value().toInt();
@@ -243,6 +354,33 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusBridgeWiFi *
       config->setModbusRtsPin(rts);
       dbgln("[webserver] saved modbus rts pin");
     }
+
+    if (request->hasParam("mb2", true)){
+      auto baud = request->getParam("mb2", true)->value().toInt();
+      config->setModbusBaudRate2(baud);
+      dbgln("[webserver] saved modbus baud rate 2");
+    }
+    if (request->hasParam("md2", true)){
+      auto data = request->getParam("md2", true)->value().toInt();
+      config->setModbusDataBits2(data);
+      dbgln("[webserver] saved modbus data bits 2");
+    }
+    if (request->hasParam("mp2", true)){
+      auto parity = request->getParam("mp2", true)->value().toInt();
+      config->setModbusParity2(parity);
+      dbgln("[webserver] saved modbus parity 2");
+    }
+    if (request->hasParam("ms2", true)){
+      auto stop = request->getParam("ms2", true)->value().toInt();
+      config->setModbusStopBits2(stop);
+      dbgln("[webserver] saved modbus stop bits 2");
+    }
+    if (request->hasParam("mr2", true)){
+      auto rts = request->getParam("mr2", true)->value().toInt();
+      config->setModbusRtsPin2(rts);
+      dbgln("[webserver] saved modbus rts pin 2");
+    }
+
     if (request->hasParam("sb", true)){
       auto baud = request->getParam("sb", true)->value().toInt();
       config->setSerialBaudRate(baud);
@@ -263,7 +401,17 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusBridgeWiFi *
       config->setSerialStopBits(stop);
       dbgln("[webserver] saved serial stop bits");
     }
-    request->redirect("/");    
+    // Redirect logic with error handling
+    if (validIP) {
+        // Redirect to the config page or a success page
+        request->redirect("/");
+    } else {
+        // Redirect back to the form with an error message
+        // This can be implemented in different ways, for example:
+        request->redirect("/config?error=invalidIP");
+        // Then, on the GET handler for "/config", check for this error parameter and display a message if present
+    }
+    
   });
   server->on("/debug", HTTP_GET, [](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /debug");

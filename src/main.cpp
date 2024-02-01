@@ -9,8 +9,17 @@
 #include "ModbusCache.h"
 #include "config.h"
 #include "pages.h"
-//#include <HardwareSerial.h>
-//#include <WiFiServer.h>
+#include <esp_err.h>
+
+extern "C" void app_error_handler(esp_err_t error)
+{
+    // Print the exception details to the serial interface
+    Serial.print("Exception: ");
+    Serial.println(esp_err_to_name(error));
+    Serial.flush();
+    delay(2000);  // Delay to allow the serial output to be sent
+    esp_restart(); // Restart the ESP32
+}
 
 AsyncWebServer webServer(80);
 Config config;
@@ -20,19 +29,27 @@ ModbusBridgeWiFi MBbridge;
 WiFiManager wm;
 
 const uint16_t modbusAddressList[] = {
-    // Range 0-35
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 
-    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 
-    30, 31, 32, 33, 34, 35,
-    771,
-    4355,
-    // Range 20480-20486
+    0, 1, 2, 3, 4, 5,  // Volts*10, Amps*100, Watts*10
+    11,                // [300012] Carlo Gavazzi Controls identification code
+    14,15,             // PF (INT16), Freq (INT16)
+    16, 17, 18, 19,    // kWh (+) TOT * 10, Kvarh (+) TOT * 10
+    32,33,34,35,       // kWh (-) TOT * 10, Kvarh (-) TOT * 10
+};
+
+// 
+const uint16_t modbusAddressListStatic[] = {
+    
+    770,771, // Version, Revision
+    4355,    // Measurement mode
+    // Range 20480-20486 - Serial number
     20480, 20481, 20482, 20483, 20484, 20485, 20486
 };
-IPAddress serverIP;
+
+String serverIPStr;
 uint16_t serverPort;
 
 const size_t addressCount = sizeof(modbusAddressList) / sizeof(modbusAddressList[0]);
+const size_t addressStaticCount = sizeof(modbusAddressListStatic) / sizeof(modbusAddressListStatic[0]);
 ModbusCache* modbusCache = nullptr;
 
 void setup() {
@@ -53,8 +70,7 @@ void setup() {
     ESP.restart();
   }
   dbgln("[wifi] finished");
-
-  dbgln("[modbus] start");
+  dbgln("[modbus bridge setup] start");
 
   MBUlogLvl = LOG_LEVEL_WARNING;
   RTUutils::prepareHardwareSerial(modbusSerial);
@@ -67,65 +83,35 @@ void setup() {
   modbusSerial.begin(config.getModbusBaudRate(), config.getModbusConfig());
 #endif
 
-  MBclient = new ModbusClientRTU(config.getModbusRtsPin());
+  MBclient = new ModbusClientRTU(config.getModbusRtsPin(), 10); // queuelimit 10
   MBclient->setTimeout(1000);
-  MBclient->begin(modbusSerial, -1);
+  MBclient->begin(modbusSerial, 1);
 
   for (uint8_t i = 1; i < 248; i++)
   {
     MBbridge.attachServer(i, i, ANY_FUNCTION_CODE, MBclient);
   }
 
-  MBbridge.start(config.getTcpPort(), 10, config.getTcpTimeout());
-
-  dbgln("[modbus] finished");
+  MBbridge.start(config.getTcpPort(), 20, config.getTcpTimeout());
+  dbgln("[modbus bridge setup] finished");
   dbgln("[modbusCache] begin");
-  bool validConfig = true;
 
-    // Check and parse the server IP
-  if (!serverIP.fromString(config.getTargetIP())) {
-      Serial.println("Error: Invalid server IP address.");
-      validConfig = false;
-  }
-
-  // Get the server port
+  serverIPStr = config.getTargetIP();
   serverPort = config.getTcpPort2();
-  if (serverPort == 0) {
-      Serial.println("Error: Invalid server port.");
-      validConfig = false;
-  }
-
-  modbusCache = new ModbusCache(modbusAddressList, addressCount, validConfig ? serverIP : IPAddress(127, 0, 0, 1), validConfig ? serverPort : 502);// Initialize ModbusCache if the configuration is valid
-  if (validConfig) {
-    // Log IP address and port
-    dbgln("Server IP: " + serverIP.toString());
-    dbgln("Server port: " + String(serverPort));
-    modbusCache->begin();    
-  }
+  modbusCache = new ModbusCache(modbusAddressList, addressCount, modbusAddressListStatic, addressStaticCount, serverIPStr, serverPort);// Initialize ModbusCache if the configuration is valid
+  
+  modbusCache->begin();    
   
   dbgln("[modbusCache] finished");
 
-  ModbusServerRTU& modbusRTUServer = modbusCache->getModbusRTUServer();
-  ModbusClientTCP& modbusTCPClient = modbusCache->getModbusTCPClient();
-
-  setupPages(&webServer, MBclient, &modbusTCPClient, &modbusRTUServer, &MBbridge, &config, &wm);
+  setupPages(&webServer, MBclient, modbusCache, &MBbridge, &config, &wm);
   webServer.begin();
   dbgln("[setup] finished");
 }
 
 void loop() {
-  static unsigned long lastUpdateTime = 0; // Stores the last time `update` was called
-    const unsigned long updateInterval = 400; // Update interval in milliseconds
-
-    unsigned long currentMillis = millis();
-
-    // Check if `updateInterval` time has passed since last update
-    if (currentMillis - lastUpdateTime >= updateInterval) {
-        // Save the last update time
-        lastUpdateTime = currentMillis;
-
-        if (modbusCache) {
-            modbusCache->update();
-        }
+    if (modbusCache) {
+        modbusCache->update();
     }
+    yield();
 }

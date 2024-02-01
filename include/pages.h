@@ -5,13 +5,12 @@
     #include <ESPAsyncWebServer.h>
     #include <ModbusBridgeWiFi.h>
     #include <ModbusClientRTU.h>
-    #include <ModbusServerRTU.h>
-    #include <ModbusClientTCP.h>
+    #include <ModbusCache.h>
     #include <Update.h>
     #include "config.h"
     #include "debug.h"
 
-    void setupPages(AsyncWebServer* server, ModbusClientRTU *rtu, ModbusClientTCP *modbusTCPClient, ModbusServerRTU *modbusRTUServer, ModbusBridgeWiFi *bridge, Config *config, WiFiManager *wm);
+    void setupPages(AsyncWebServer* server, ModbusClientRTU *rtu, ModbusCache *modbusCache, ModbusBridgeWiFi *bridge, Config *config, WiFiManager *wm);
     void sendResponseHeader(AsyncResponseStream *response, const char *title, bool inlineStyle = false);
     void sendResponseTrailer(AsyncResponseStream *response);
     void sendButton(AsyncResponseStream *response, const char *title, const char *action, const char *css = "");

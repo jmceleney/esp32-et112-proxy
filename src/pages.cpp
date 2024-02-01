@@ -1,7 +1,7 @@
 #include "pages.h"
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
 
-void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusClientTCP *modbusTCPClient, ModbusServerRTU *modbusRTUServer, ModbusBridgeWiFi *bridge, Config *config, WiFiManager *wm){
+void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbusCache, ModbusBridgeWiFi *bridge, Config *config, WiFiManager *wm){
   server->on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /");
     auto *response = request->beginResponseStream("text/html");
@@ -15,8 +15,17 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusClientTCP *m
     sendResponseTrailer(response);
     request->send(response);
   });
-  server->on("/status", HTTP_GET, [rtu, modbusTCPClient, modbusRTUServer, bridge](AsyncWebServerRequest *request){
+  server->on("/status", HTTP_GET, [rtu, modbusCache, bridge](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /status");
+    ModbusClientTCP& modbusTCPClient = modbusCache->getModbusTCPClient();
+    ModbusServerRTU& modbusRTUServer = modbusCache->getModbusRTUServer();
+    bool operationalStatus = modbusCache->getIsOperational();
+    float voltage = modbusCache->getVoltage();
+    float amps = modbusCache->getAmps();
+    float watts = modbusCache->getWatts();
+    float powerFactor = modbusCache->getPowerFactor();
+    float frequency = modbusCache->getFrequency();
+
     auto *response = request->beginResponseStream("text/html");
     sendResponseHeader(response, "Status");
     response->print("<table>");
@@ -35,11 +44,35 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusClientTCP *m
     sendTableRow(response, "Bridge Message", bridge->getMessageCount());
     sendTableRow(response, "Bridge Clients", bridge->activeClients());
     sendTableRow(response, "Bridge Errors", bridge->getErrorCount());
-    sendTableRow(response, "Secondary TCP Messages", modbusTCPClient->getMessageCount());
-    sendTableRow(response, "Secondary TCP Pending Messages", modbusTCPClient->pendingRequests());
-    sendTableRow(response, "Secondary TCP Errors", modbusTCPClient->getErrorCount());
-    sendTableRow(response, "RTU Server Message", modbusRTUServer->getMessageCount());
-    sendTableRow(response, "RTU Server Errors", modbusRTUServer->getErrorCount());
+    sendTableRow(response, "Secondary TCP Messages", modbusTCPClient.getMessageCount());
+    sendTableRow(response, "Secondary TCP Pending Messages", modbusTCPClient.pendingRequests());
+    sendTableRow(response, "Secondary TCP Errors", modbusTCPClient.getErrorCount());
+    sendTableRow(response, "RTU Server Message", modbusRTUServer.getMessageCount());
+    sendTableRow(response, "RTU Server Errors", modbusRTUServer.getErrorCount());
+    sendTableRow(response, "RTU Server Operational", operationalStatus ? "Yes" : "No");
+    // Format and send these values to the web page
+    char buffer[50]; // Buffer to hold the formatted string
+
+    // Format voltage
+    sprintf(buffer, "%.1f V", voltage); // Assuming you want two decimal places for voltage
+    sendTableRow(response, "Voltage", buffer);
+
+    // Format amps
+    sprintf(buffer, "%.3f A", amps); // Assuming you want three decimal places for amps
+    sendTableRow(response, "Amps", buffer);
+
+    // Format watts
+    sprintf(buffer, "%.1f W", watts); // Watts as a whole number
+    sendTableRow(response, "Watts", buffer);
+
+    // Format power factor
+    sprintf(buffer, "%.3f", powerFactor); // Assuming you want three decimal places for power factor
+    sendTableRow(response, "Power Factor", buffer);
+
+    // Format frequency
+    sprintf(buffer, "%.1f Hz", frequency); // Assuming you want one decimal place for frequency
+    sendTableRow(response, "Frequency", buffer);
+
     response->print("<tr><td>&nbsp;</td><td></td></tr>");
     sendTableRow(response, "Build time", __DATE__ " " __TIME__);
     response->print("</table><p></p>");

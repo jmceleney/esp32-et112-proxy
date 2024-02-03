@@ -211,18 +211,14 @@ void ModbusCache::fetchFromRemote(const uint16_t* regList, size_t regListSize) {
     yield();
 }
 
-void ModbusCache::updateServerStatusBasedOnCommFailure()
-{
-    if (millis() - lastSuccessfulUpdate > (update_interval + 2000))
-    {
+void ModbusCache::updateServerStatusBasedOnCommFailure() {
+    if (millis() - lastSuccessfulUpdate > (update_interval + 4000)) {
         isOperational = false;
     }
 }
 
-void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount)
-{
-    if (regCount > 0)
-    {
+void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
+    if (regCount > 0) {
         ModbusMessage request = ModbusMessage(1, 3, startAddress, regCount);
         uint32_t currentToken = globalToken++;
 
@@ -249,8 +245,7 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount)
     }
 }
 
-void ModbusCache::handleData(ModbusMessage response, uint32_t token)
-{
+void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
     dbgln("Received response for token: " + String(token));
     auto it = instance->requestMap.find(token);
     if (it != instance->requestMap.end()) {
@@ -270,8 +265,7 @@ void ModbusCache::handleData(ModbusMessage response, uint32_t token)
         dbg("Received values: [");
 
         // Process payload
-        for (size_t i = 0; i < payload.size(); i += 2)
-        {
+        for (size_t i = 0; i < payload.size(); i += 2) {
             uint16_t value = (uint16_t)payload[i] << 8 | payload[i + 1];
             dbg(String(value) + " {" + String(startAddress) + "}, ");
             instance->setRegisterValue(startAddress, value);

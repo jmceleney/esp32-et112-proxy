@@ -1,5 +1,49 @@
 #include "pages.h"
+#include <ArduinoJson.h>
+
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
+
+const char STATUS_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+    <title>ESP32 Modbus Gateway - Status</title>
+    <link rel="stylesheet" href="style.css"></head>
+    <script>
+        function fetchData() {
+            fetch('/status.json')
+                .then(response => response.json())
+                .then(data => {
+                    const table = document.getElementById('statusTable');
+                    table.innerHTML = ''; // Clear existing data
+                    for (const key in data) {
+                        const row = table.insertRow(-1);
+                        const cell1 = row.insertCell(0);
+                        const cell2 = row.insertCell(1);
+                        cell1.innerHTML = key;
+                        cell2.innerHTML = data[key];
+                    }
+                })
+                .catch(error => console.error('Error:', error));
+        }
+
+        setInterval(fetchData, 3000); // Refresh every 3 seconds
+        document.addEventListener('DOMContentLoaded', fetchData); // Initial fetch
+    </script>
+</head>
+<body>
+    <h2>ESP32 Modbus Gateway</h2>
+    <h3>Status</h3>
+    <div id="content">
+    <table id="statusTable"></table>
+    <p></p>
+    <form method="get" action="/">
+    <button class="">Back</button></form><p></p></div>
+</body>
+</html>
+)rawliteral";
 
 void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbusCache, ModbusBridgeWiFi *bridge, Config *config, WiFiManager *wm){
   server->on("/", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -15,71 +59,56 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
     sendResponseTrailer(response);
     request->send(response);
   });
+
   server->on("/status", HTTP_GET, [rtu, modbusCache, bridge](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /status");
-    ModbusClientTCP& modbusTCPClient = modbusCache->getModbusTCPClient();
-    ModbusServerRTU& modbusRTUServer = modbusCache->getModbusRTUServer();
-    bool operationalStatus = modbusCache->getIsOperational();
-    float voltage = modbusCache->getVoltage();
-    float amps = modbusCache->getAmps();
-    float watts = modbusCache->getWatts();
-    float powerFactor = modbusCache->getPowerFactor();
-    float frequency = modbusCache->getFrequency();
-
-    auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Status");
-    response->print("<table>");
-
-    // show ESP infos...
-    sendTableRow(response, "ESP Uptime (sec)", esp_timer_get_time() / 1000000);
-    sendTableRow(response, "ESP SSID", WiFi.SSID());
-    sendTableRow(response, "ESP RSSI", WiFi.RSSI());
-    sendTableRow(response, "ESP WiFi Quality", WiFiQuality(WiFi.RSSI()));
-    sendTableRow(response, "ESP MAC", WiFi.macAddress());
-    sendTableRow(response, "ESP IP",  WiFi.localIP().toString() );
-
-    sendTableRow(response, "Primary RTU Messages", rtu->getMessageCount());
-    sendTableRow(response, "Primary RTU Pending Messages", rtu->pendingRequests());
-    sendTableRow(response, "Primary RTU Errors", rtu->getErrorCount());
-    sendTableRow(response, "Bridge Message", bridge->getMessageCount());
-    sendTableRow(response, "Bridge Clients", bridge->activeClients());
-    sendTableRow(response, "Bridge Errors", bridge->getErrorCount());
-    sendTableRow(response, "Secondary TCP Messages", modbusTCPClient.getMessageCount());
-    sendTableRow(response, "Secondary TCP Pending Messages", modbusTCPClient.pendingRequests());
-    sendTableRow(response, "Secondary TCP Errors", modbusTCPClient.getErrorCount());
-    sendTableRow(response, "RTU Server Message", modbusRTUServer.getMessageCount());
-    sendTableRow(response, "RTU Server Errors", modbusRTUServer.getErrorCount());
-    sendTableRow(response, "RTU Server Operational", operationalStatus ? "Yes" : "No");
-    // Format and send these values to the web page
-    char buffer[50]; // Buffer to hold the formatted string
-
-    // Format voltage
-    sprintf(buffer, "%.1f V", voltage); // Assuming you want two decimal places for voltage
-    sendTableRow(response, "Voltage", buffer);
-
-    // Format amps
-    sprintf(buffer, "%.3f A", amps); // Assuming you want three decimal places for amps
-    sendTableRow(response, "Amps", buffer);
-
-    // Format watts
-    sprintf(buffer, "%.1f W", watts); // Watts as a whole number
-    sendTableRow(response, "Watts", buffer);
-
-    // Format power factor
-    sprintf(buffer, "%.3f", powerFactor); // Assuming you want three decimal places for power factor
-    sendTableRow(response, "Power Factor", buffer);
-
-    // Format frequency
-    sprintf(buffer, "%.1f Hz", frequency); // Assuming you want one decimal place for frequency
-    sendTableRow(response, "Frequency", buffer);
-
-    response->print("<tr><td>&nbsp;</td><td></td></tr>");
-    sendTableRow(response, "Build time", __DATE__ " " __TIME__);
-    response->print("</table><p></p>");
-    sendButton(response, "Back", "/");
-    sendResponseTrailer(response);
-    request->send(response);
+    request->send_P(200, "text/html", STATUS_HTML);
   });
+
+  // Endpoint to serve JSON data
+  server->on("/status.json", HTTP_GET, [rtu, modbusCache, bridge](AsyncWebServerRequest *request) {
+        DynamicJsonDocument doc(4096);
+
+        doc["ESP Uptime (sec)"] = esp_timer_get_time() / 1000000;
+        doc["ESP SSID"] = WiFi.SSID();
+        doc["ESP RSSI"] = WiFi.RSSI();
+        doc["ESP WiFi Quality"] = WiFiQuality(WiFi.RSSI());
+        doc["ESP MAC"] = WiFi.macAddress();
+        doc["ESP IP"] = WiFi.localIP().toString();
+        doc["Primary RTU Messages"] = rtu->getMessageCount();
+        doc["Primary RTU Pending Messages"] = rtu->pendingRequests();
+        doc["Primary RTU Errors"] = rtu->getErrorCount();
+        doc["Bridge Message"] = bridge->getMessageCount();
+        doc["Bridge Clients"] = bridge->activeClients();
+        doc["Bridge Errors"] = bridge->getErrorCount();
+
+        ModbusClientTCP& modbusTCPClient = modbusCache->getModbusTCPClient();
+        doc["Secondary TCP Messages"] = modbusTCPClient.getMessageCount();
+        doc["Secondary TCP Pending Messages"] = modbusTCPClient.pendingRequests();
+        doc["Secondary TCP Errors"] = modbusTCPClient.getErrorCount();
+
+        ModbusServerRTU& modbusRTUServer = modbusCache->getModbusRTUServer();
+        doc["RTU Server Message"] = modbusRTUServer.getMessageCount();
+        doc["RTU Server Errors"] = modbusRTUServer.getErrorCount();
+        doc["RTU Server Operational"] = modbusCache->getIsOperational() ? "Yes" : "No";
+
+        char buffer[50]; // Buffer to hold formatted strings
+        sprintf(buffer, "%.1f V", modbusCache->getVoltage());
+        doc["Voltage"] = buffer;
+        sprintf(buffer, "%.3f A", modbusCache->getAmps());
+        doc["Amps"] = buffer;
+        sprintf(buffer, "%.1f W", modbusCache->getWatts());
+        doc["Watts"] = buffer;
+        sprintf(buffer, "%.3f", modbusCache->getPowerFactor());
+        doc["Power Factor"] = buffer;
+        sprintf(buffer, "%.1f Hz", modbusCache->getFrequency());
+        doc["Frequency"] = buffer;
+
+        String jsonResponse;
+        serializeJson(doc, jsonResponse);
+        request->send(200, "application/json", jsonResponse);
+  });
+
   server->on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /reboot");
     auto *response = request->beginResponseStream("text/html");

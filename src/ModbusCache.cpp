@@ -55,7 +55,10 @@ void ModbusCache::begin()
 {
     // Assuming Serial1 is the HardwareSerial object you want to use
     dbgln("Begin mosbusCache");
-
+    
+    mutex = xSemaphoreCreateMutex();
+    // Initialize all register values to zero
+    memset(registerValues, 0, sizeof(uint16_t) * MAX_REGISTERS);
     buildUnifiedRegisterList();
 
     RTUutils::prepareHardwareSerial(Serial1);
@@ -238,17 +241,20 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount)
         // Log start address, register count, and token
         dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress) + " with token: " + String(currentToken));
         printHex(request.data(), request.size());
-        unsigned long timestamp = millis();
-        requestMap[currentToken] = std::make_tuple(startAddress, regCount, timestamp); // Store the request info along with timestamp
-        insertionOrder.push(currentToken); // Add the token to the queue
-        // Check if the map is at its maximum size
-        if (requestMap.size() >= 200) {
-            // Remove the oldest entry
-            uint32_t oldestToken = insertionOrder.front();
-            dbgln("Removing oldest entry with token: " + String(oldestToken));
-            requestMap.erase(oldestToken);
-            dbgln("Erasing token done");
-            insertionOrder.pop();
+        if (xSemaphoreTake(mutex, portMAX_DELAY)) { // Wait indefinitely until the mutex is available
+            unsigned long timestamp = millis();
+            requestMap[currentToken] = std::make_tuple(startAddress, regCount, timestamp); // Store the request info along with timestamp
+            insertionOrder.push(currentToken); // Add the token to the queue
+            // Check if the map is at its maximum size
+            if (requestMap.size() >= 200) {
+                // Remove the oldest entry
+                uint32_t oldestToken = insertionOrder.front();
+                dbgln("Removing oldest entry with token: " + String(oldestToken));
+                requestMap.erase(oldestToken);
+                dbgln("Erasing token done");
+                insertionOrder.pop();
+            }
+            xSemaphoreGive(mutex); // Release the mutex
         }
         dbgln("[send:" + String(currentToken) + "] Queue size: " + String(instance->insertionOrder.size()) + ", map size: " + String(instance->requestMap.size()));
         modbusTCPClient.addRequest(request, currentToken);
@@ -314,43 +320,48 @@ void ModbusCache::handleError(Error err, uint32_t token) {
 }
 
 void ModbusCache::purgeToken(uint32_t token) {
-    std::vector<uint32_t> tokensToPurge; // List of tokens to be purged
-    unsigned long currentTime = millis();
+    if (xSemaphoreTake(mutex, portMAX_DELAY)) { // Wait indefinitely until the mutex is available
+        std::vector<uint32_t> tokensToPurge; // List of tokens to be purged
+        unsigned long currentTime = millis();
 
-    // Add incoming token to the list
-    tokensToPurge.push_back(token);
+        // Add incoming token to the list
+        tokensToPurge.push_back(token);
 
-    // Find other tokens that are older than 6000ms
-    for (const auto& entry : requestMap) {
-        uint32_t currentToken = entry.first;
-        unsigned long sentTimestamp = std::get<2>(entry.second);
-        if (currentTime - sentTimestamp > 4000) {
-            tokensToPurge.push_back(currentToken);
+        // Find other tokens that are older than 6000ms
+        for (const auto& entry : requestMap) {
+            uint32_t currentToken = entry.first;
+            unsigned long sentTimestamp = std::get<2>(entry.second);
+            if (currentTime - sentTimestamp > 4000) {
+                tokensToPurge.push_back(currentToken);
+            }
         }
-    }
 
-    // Remove tokens from the map
-    for (uint32_t purgeToken : tokensToPurge) {
-        dbgln("Erasing token " + String(purgeToken) + " from map");
-        requestMap.erase(purgeToken);
-    }
-
-    // Efficiently process the queue
-    std::queue<uint32_t> tempQueue;
-    while (!insertionOrder.empty()) {
-        uint32_t currentToken = insertionOrder.front();
-        insertionOrder.pop();
-        if (std::find(tokensToPurge.begin(), tokensToPurge.end(), currentToken) == tokensToPurge.end()) {
-            tempQueue.push(currentToken);
+        // Remove tokens from the map
+        for (uint32_t purgeToken : tokensToPurge) {
+            dbgln("Erasing token " + String(purgeToken) + " from map");
+            requestMap.erase(purgeToken);
+            dbgln("Erasing token done");
         }
+
+        // Efficiently process the queue
+        std::queue<uint32_t> tempQueue;
+        while (!insertionOrder.empty()) {
+            uint32_t currentToken = insertionOrder.front();
+            insertionOrder.pop();
+            if (std::find(tokensToPurge.begin(), tokensToPurge.end(), currentToken) == tokensToPurge.end()) {
+                tempQueue.push(currentToken);
+            }
+        }
+        dbgln("Swapping queues");
+        std::swap(insertionOrder, tempQueue);
+        dbgln("Swapping done");
+        xSemaphoreGive(mutex); // Release the mutex
     }
-    std::swap(insertionOrder, tempQueue);
     dbgln("Erasing tokens done");
 }
 
 
-ModbusMessage ModbusCache::respondFromCache(ModbusMessage request)
-{
+ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
     dbgln("Received request to local server:");
     printHex(request.data(), request.size());
     if (!instance->isOperational)

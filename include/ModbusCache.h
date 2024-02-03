@@ -74,6 +74,7 @@ private:
     static const uint16_t FREQ_ADDR = 15;
     std::map<uint16_t, bool> staticRegisterFetchStatus; // Map to track static register fetch status
     bool staticRegistersFetched = false; // Flag to indicate completion of static register fetching
+    SemaphoreHandle_t mutex;
 };
 
 #endif // MODBUSCACHE_H

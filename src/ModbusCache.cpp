@@ -128,8 +128,8 @@ void ModbusCache::ensureTCPConnection()
     static unsigned long lastConnectionAttemptTime = 0;
     const unsigned long connectionDelay = 2000;
 
-    if (!wifiClient.connected())
-    {
+    dbgln("Ensuring TCP connection...");
+    if (!wifiClient.connected()) {
         IPAddress newIP = WiFi.localIP();
         if(serverIPString == "127.0.0.1" && newIP != serverIP) {
             dbgln("Local IP address changed from " + serverIP.toString() + " to " + newIP.toString());
@@ -141,8 +141,7 @@ void ModbusCache::ensureTCPConnection()
         dbg("Client not connected");
 
         // Check if sufficient time has elapsed since the last connection attempt
-        if (currentTime - lastConnectionAttemptTime >= connectionDelay)
-        {
+        if (currentTime - lastConnectionAttemptTime >= connectionDelay) {
             dbgln(" - Reconnecting to IP: " + serverIP.toString() + ", port: " + String(config.getTcpPort2()));
 
             // Reconnect logic
@@ -150,12 +149,11 @@ void ModbusCache::ensureTCPConnection()
 
             // Update the last connection attempt time
             lastConnectionAttemptTime = currentTime;
-        }
-        else
-        {
+        } else {
             dbgln(" - Waiting to reconnect...");
         }
     }
+    dbgln("Ensuring TCP connection done");
 }
 
 uint16_t ModbusCache::getRegisterValue(uint16_t address) {
@@ -180,27 +178,19 @@ void ModbusCache::fetchFromRemote(const uint16_t* regList, size_t regListSize) {
     // log startAddress and the entire regList, in the format [1,2,3...]
     dbg("startAddress: " + String(startAddress) + ", ");
     dbg("regList: [");
-    for (size_t i = 0; i < regListSize; ++i)
-    {
+    for (size_t i = 0; i < regListSize; ++i) {
         dbg(String(regList[i]));
-        if (i < regListSize - 1)
-        {
-            dbg(", ");
-        }
+        if (i < regListSize - 1) { dbg(", "); }
     }
     dbgln("]");
 
     uint16_t regCount = 1; // Start with a count of 1 for the first address
 
-    for (size_t i = 1; i < regListSize; ++i)
-    { // Start from the second element
-        if (regList[i] == (regList[i - 1] + 1))
-        {
+    for (size_t i = 1; i < regListSize; ++i) { // Start from the second element
+        if (regList[i] == (regList[i - 1] + 1)) {
             // Address is contiguous with the previous one
             regCount++;
-        }
-        else
-        {
+        } else {
             // Found a non-contiguous address, send request for the previous block
             dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress));
             sendModbusRequest(startAddress, regCount);
@@ -211,15 +201,13 @@ void ModbusCache::fetchFromRemote(const uint16_t* regList, size_t regListSize) {
         }
 
         // Check if it's time to send a request or if it's the end of the list
-        if (regCount >= 100 || i == regListSize - 1)
-        {
+        if (regCount >= 100 || i == regListSize - 1) {
             dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress));
             sendModbusRequest(startAddress, regCount);
             startAddress = regList[i] + 1; // Prepare for the next block
             regCount = 0;
         }
     }
-    wifiClient.flush();
     yield();
 }
 

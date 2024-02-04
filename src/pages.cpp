@@ -69,7 +69,18 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
   server->on("/status.json", HTTP_GET, [rtu, modbusCache, bridge](AsyncWebServerRequest *request) {
         DynamicJsonDocument doc(4096);
 
-        doc["ESP Uptime (sec)"] = esp_timer_get_time() / 1000000;
+        // doc["ESP Uptime (sec)"] = esp_timer_get_time() / 1000000;
+        // Instead of the amove, let's render the uptime in a more human-readable format
+        unsigned long uptime = millis() / 1000;
+        unsigned long days = uptime / 86400;
+        uptime %= 86400;
+        unsigned long hours = uptime / 3600;
+        uptime %= 3600;
+        unsigned long minutes = uptime / 60;
+        unsigned long seconds = uptime % 60;
+        char uptimeStr[50];
+        sprintf(uptimeStr, "%lu days, %02lu:%02lu:%02lu", days, hours, minutes, seconds);
+        doc["ESP Uptime"] = uptimeStr;
         doc["ESP SSID"] = WiFi.SSID();
         doc["ESP RSSI"] = WiFi.RSSI();
         doc["ESP WiFi Quality"] = WiFiQuality(WiFi.RSSI());
@@ -88,9 +99,12 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
         doc["Secondary TCP Errors"] = modbusTCPClient.getErrorCount();
 
         ModbusServerRTU& modbusRTUServer = modbusCache->getModbusRTUServer();
-        doc["RTU Server Message"] = modbusRTUServer.getMessageCount();
-        doc["RTU Server Errors"] = modbusRTUServer.getErrorCount();
-        doc["RTU Server Operational"] = modbusCache->getIsOperational() ? "Yes" : "No";
+        doc["Server Message"] = modbusRTUServer.getMessageCount();
+        doc["Server Errors"] = modbusRTUServer.getErrorCount();
+        doc["Server - Static Registers Fetched"] = modbusCache->getStaticRegistersFetched() ? "Yes" : "No";
+        doc["Server - Dynamic Registers Fetched"] = modbusCache->getDynamicRegistersFetched() ? "Yes" : "No";
+        doc["Server - Operational"] = modbusCache->getIsOperational() ? "Yes" : "No";
+        
 
         char buffer[50]; // Buffer to hold formatted strings
         sprintf(buffer, "%.1f V", modbusCache->getVoltage());
@@ -103,6 +117,8 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
         doc["Power Factor"] = buffer;
         sprintf(buffer, "%.1f Hz", modbusCache->getFrequency());
         doc["Frequency"] = buffer;
+        sprintf(buffer, "%.1f kWh", modbusCache->getImportTotal());
+        doc["Import Total"] = buffer;
 
         String jsonResponse;
         serializeJson(doc, jsonResponse);

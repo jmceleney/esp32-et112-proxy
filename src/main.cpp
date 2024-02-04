@@ -9,8 +9,10 @@
 #include "ModbusCache.h"
 #include "config.h"
 #include "pages.h"
-#include <esp_err.h>
 
+
+/*
+#include <esp_err.h>
 extern "C" void app_error_handler(esp_err_t error)
 {
     // Print the exception details to the serial interface
@@ -20,6 +22,7 @@ extern "C" void app_error_handler(esp_err_t error)
     delay(2000);  // Delay to allow the serial output to be sent
     esp_restart(); // Restart the ESP32
 }
+*/
 
 AsyncWebServer webServer(80);
 Config config;
@@ -30,7 +33,6 @@ WiFiManager wm;
 
 const uint16_t modbusAddressList[] = {
     0, 1, 2, 3, 4, 5,  // Volts*10, Amps*100, Watts*10
-    11,                // [300012] Carlo Gavazzi Controls identification code
     14,15,             // PF (INT16), Freq (INT16)
     16, 17, 18, 19,    // kWh (+) TOT * 10, Kvarh (+) TOT * 10
     32,33,34,35,       // kWh (-) TOT * 10, Kvarh (-) TOT * 10
@@ -38,7 +40,7 @@ const uint16_t modbusAddressList[] = {
 
 // 
 const uint16_t modbusAddressListStatic[] = {
-    
+    11,      // [300012] Carlo Gavazzi Controls identification code
     770,771, // Version, Revision
     4355,    // Measurement mode
     // Range 20480-20486 - Serial number

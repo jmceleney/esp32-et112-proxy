@@ -1,4 +1,5 @@
 #include "ModbusCache.h"
+#include <unordered_set>
 
 extern Config config; // Declare config as extern
 
@@ -95,8 +96,7 @@ void ModbusCache::buildUnifiedRegisterList() {
     }
 }
 
-void ModbusCache::update()
-{
+void ModbusCache::update() {
     unsigned long currentMillis = millis();
 
     // Check if `update_interval` time has passed since last update
@@ -245,6 +245,7 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
     }
 }
 
+// This function handles responses from the Modbus TCP client
 void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
     dbgln("Received response for token: " + String(token));
     auto it = instance->requestMap.find(token);
@@ -269,22 +270,37 @@ void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
             uint16_t value = (uint16_t)payload[i] << 8 | payload[i + 1];
             dbg(String(value) + " {" + String(startAddress) + "}, ");
             instance->setRegisterValue(startAddress, value);
+            if(instance->isStaticRegister(startAddress)) {
+                dbgln("Register " + String(startAddress) + " is static");
+               instance->fetchedStaticRegisters.insert(startAddress); 
+            }
+            if(instance->isDynamicRegister(startAddress)) {
+                dbgln("Register " + String(startAddress) + " is dynamic");
+                instance->fetchedDynamicRegisters.insert(startAddress);
+            }
             startAddress++;
         }
         dbgln("] DONE");
-
+        
         if (!instance->staticRegistersFetched) {
-            instance->staticRegisterFetchStatus[startAddress] = true;
-
-            // Check if all static registers have been fetched
-            instance->staticRegistersFetched = std::all_of(instance->staticRegisterFetchStatus.begin(), 
-                                                 instance->staticRegisterFetchStatus.end(), 
-                                                 [](const std::pair<uint16_t, bool>& entry) { return entry.second; });
-
+            instance->staticRegistersFetched = instance->fetchedStaticRegisters.size() == instance->addressStaticCount;
+            dbg("Fetched static registers: ");
+            for (uint16_t reg : instance->fetchedStaticRegisters) {
+                dbg(String(reg) + ", ");
+            }
+            dbgln();
+        }
+        if (!instance->dynamicRegistersFetched) {
+            instance->dynamicRegistersFetched = instance->fetchedDynamicRegisters.size() == instance->addressCount;
+            dbg("Fetched dynamic registers: ");
+            for (uint16_t reg : instance->fetchedDynamicRegisters) {
+                dbg(String(reg) + ", ");
+            }
+            dbgln();
         }
 
         instance->lastSuccessfulUpdate = millis();
-        instance->isOperational = true;
+        instance->isOperational = instance->staticRegistersFetched && instance->dynamicRegistersFetched;
         instance->purgeToken(token);
 
         // Output queue and map sizes
@@ -346,8 +362,7 @@ void ModbusCache::purgeToken(uint32_t token) {
 ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
     dbgln("Received request to local server:");
     printHex(request.data(), request.size());
-    if (!instance->isOperational)
-    {
+    if (!instance->isOperational) {
         // Server is not operational, return no response
         dbgln("Server is not operational, returning no response");
         return NIL_RESPONSE;
@@ -441,6 +456,11 @@ float ModbusCache::getFrequency()
 {
     int16_t frequencyRaw = getRegisterValue(FREQ_ADDR);
     return frequencyRaw / 10.0f;
+}
+
+float ModbusCache::getImportTotal() {
+    int32_t importRaw = read32BitSignedValue(IMPORT_ADDR);
+    return importRaw / 10.0f;
 }
 
 uint32_t ModbusCache::read32BitValue(uint16_t address)

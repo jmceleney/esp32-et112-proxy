@@ -8,6 +8,7 @@
 #include <ModbusClientTCP.h>
 #include <map>
 #include <IPAddress.h>
+#include <unordered_set>
 
 #define MAX_REGISTERS 400
 
@@ -28,9 +29,17 @@ public:
     float getWatts();
     float getPowerFactor();
     float getFrequency();
+    float getImportTotal();
     bool getIsOperational() const {
         return isOperational;
     }
+    bool getDynamicRegistersFetched() const {
+        return dynamicRegistersFetched;
+    }
+    bool getStaticRegistersFetched() const {
+        return staticRegistersFetched;
+    }
+    
 
 private:
     const uint16_t* addressList;
@@ -72,8 +81,24 @@ private:
     static const uint16_t WATTS_ADDR = 4;
     static const uint16_t PF_ADDR = 14;
     static const uint16_t FREQ_ADDR = 15;
-    std::map<uint16_t, bool> staticRegisterFetchStatus; // Map to track static register fetch status
+    static const uint16_t IMPORT_ADDR = 16;
+    std::unordered_set<uint16_t> fetchedStaticRegisters;
+    std::unordered_set<uint16_t> fetchedDynamicRegisters;
     bool staticRegistersFetched = false; // Flag to indicate completion of static register fetching
+    bool dynamicRegistersFetched = false; // Flag to indicate completion of dynamic register fetching
+    bool isStaticRegister(uint16_t registerNumber) {
+        for (size_t i = 0; i < addressStaticCount; ++i) {
+            if (addressListStatic[i] == registerNumber) { return true; }
+        }
+        return false; // Register number not found
+    }
+    bool isDynamicRegister(uint16_t registerNumber) {
+        for (size_t i = 0; i < addressCount; ++i) {
+            if (addressList[i] == registerNumber) { return true; }
+        }
+        return false; // Register number not found
+    }
+
     SemaphoreHandle_t mutex;
 };
 

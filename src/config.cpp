@@ -4,6 +4,7 @@ Config::Config()
     :_prefs(NULL)
     ,_tcpPort(502)
     ,_tcpPort2(502)
+    ,_tcpPort3(10502)
     ,_targetIP("127.0.0.1")
     ,_tcpTimeout(10000)
     ,_modbusBaudRate(9600)
@@ -21,6 +22,7 @@ void Config::begin(Preferences *prefs)
     _prefs = prefs;
     _tcpPort = _prefs->getUShort("tcpPort", _tcpPort);
     _tcpPort2 = _prefs->getUShort("tcpPort2", _tcpPort2);
+    _tcpPort3 = _prefs->getUShort("tcpPort3", _tcpPort3);
     _targetIP = _prefs->getString("targetIP", _targetIP);
     _tcpTimeout = _prefs->getULong("tcpTimeout", _tcpTimeout);
     _modbusBaudRate = _prefs->getULong("modbusBaudRate", _modbusBaudRate);
@@ -41,6 +43,10 @@ uint16_t Config::getTcpPort2(){
     return _tcpPort2;
 }
 
+uint16_t Config::getTcpPort3(){
+    return _tcpPort3;
+}
+
 void Config::setTcpPort(uint16_t value){
     if (_tcpPort == value) return;
     _tcpPort = value;
@@ -51,6 +57,12 @@ void Config::setTcpPort2(uint16_t value){
     if (_tcpPort2 == value) return;
     _tcpPort2 = value;
     _prefs->putUShort("tcpPort2", _tcpPort2);
+}
+
+void Config::setTcpPort3(uint16_t value){
+    if (_tcpPort3 == value) return;
+    _tcpPort3 = value;
+    _prefs->putUShort("tcpPort3", _tcpPort3);
 }
 
 String Config::getTargetIP() const {

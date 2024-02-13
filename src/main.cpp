@@ -5,7 +5,7 @@
 #include <Preferences.h>
 #include <Logging.h>
 #include <ModbusBridgeWiFi.h>
-#include <ModbusClientRTU.h>
+#include <ModbusRTUWrapper.h>
 #include "ModbusCache.h"
 #include "config.h"
 #include "pages.h"
@@ -31,27 +31,43 @@ ModbusClientRTU *MBclient;
 ModbusBridgeWiFi MBbridge;
 WiFiManager wm;
 
-const uint16_t modbusAddressList[] = {
-    0, 1, 2, 3, 4, 5,  // Volts*10, Amps*100, Watts*10
-    14,15,             // PF (INT16), Freq (INT16)
-    16, 17, 18, 19,    // kWh (+) TOT * 10, Kvarh (+) TOT * 10
-    32,33,34,35,       // kWh (-) TOT * 10, Kvarh (-) TOT * 10
+std::vector<ModbusRegister> dynamicRegisters = {
+    {0, RegisterType::INT32, "Volts", 0.1, UnitType::V},
+    {2, RegisterType::INT32, "Amps", 0.001, UnitType::A},
+    {4, RegisterType::INT32, "Watts", 0.1, UnitType::W},
+    {6, RegisterType::INT32, "VA", 0.1, UnitType::VA},
+    {8, RegisterType::INT32, "Volt Amp Reactive", 0.1, UnitType::var},
+    {10, RegisterType::INT32, "W Demand", 0.1, UnitType::W},
+    {12, RegisterType::INT32, "W Demand Peak", 0.1, UnitType::W},
+    {14, RegisterType::INT16, "Power Factor", 0.001, UnitType::PF},
+    {15, RegisterType::INT16, "Frequency", 0.1, UnitType::Hz},
+    {16, RegisterType::INT32, "Energy kWh (+)", 0.1, UnitType::KWh},
+    {18, RegisterType::INT32, "Reactive Power Kvarh (+)", 0.1, UnitType::KVarh},
+    {20, RegisterType::INT32, "kWh (+) PARTIAL", 0.1, UnitType::KWh},
+    {22, RegisterType::INT32, "Kvarh (+) PARTIAL", 0.1, UnitType::KVarh},
+    {32, RegisterType::INT32, "Energy kWh (-)", 0.1, UnitType::KWh},
+    {34, RegisterType::INT32, "Reactive Power Kvarh (-)", 0.1, UnitType::KVarh},
 };
 
-// 
-const uint16_t modbusAddressListStatic[] = {
-    11,      // [300012] Carlo Gavazzi Controls identification code
-    770,771, // Version, Revision
-    4355,    // Measurement mode
-    // Range 20480-20486 - Serial number
-    20480, 20481, 20482, 20483, 20484, 20485, 20486
+std::vector<ModbusRegister> staticRegisters = {
+    {11, RegisterType::INT16, "Carlo Gavazzi Controls identification code"},
+    {770, RegisterType::UINT16, "Version"},
+    {771, RegisterType::UINT16, "Revision"},
+    {4112, RegisterType::UINT32, "Integration Time for dmd calc"},
+    {4355, RegisterType::INT16, "Measurement mode"},
+    {20480, RegisterType::UINT16, "Serial number 1"},
+    {20481, RegisterType::UINT16, "Serial number 2"},
+    {20482, RegisterType::UINT16, "Serial number 3"},
+    {20483, RegisterType::UINT16, "Serial number 4"},
+    {20484, RegisterType::UINT16, "Serial number 5"},
+    {20485, RegisterType::UINT16, "Serial number 6"},
+    {20486, RegisterType::UINT16, "Serial number 7"},
 };
+
 
 String serverIPStr;
 uint16_t serverPort;
 
-const size_t addressCount = sizeof(modbusAddressList) / sizeof(modbusAddressList[0]);
-const size_t addressStaticCount = sizeof(modbusAddressListStatic) / sizeof(modbusAddressListStatic[0]);
 ModbusCache* modbusCache = nullptr;
 
 void setup() {
@@ -67,6 +83,10 @@ void setup() {
   wm.setClass("invert");
   auto reboot = false;
   wm.setAPCallback([&reboot](WiFiManager *wifiManager){reboot = true;});
+  wm.setConnectTimeout(20);
+  wm.setConnectRetries(100);
+  if (wm.getWiFiIsSaved()) wm.setConfigPortalTimeout(180);
+
   wm.autoConnect();
   if (reboot){
     ESP.restart();
@@ -100,7 +120,8 @@ void setup() {
 
   serverIPStr = config.getTargetIP();
   serverPort = config.getTcpPort2();
-  modbusCache = new ModbusCache(modbusAddressList, addressCount, modbusAddressListStatic, addressStaticCount, serverIPStr, serverPort);// Initialize ModbusCache if the configuration is valid
+  modbusCache = new ModbusCache(dynamicRegisters, staticRegisters, serverIPStr, serverPort);
+    //modbusAddressList, addressCount, modbusAddressListStatic, addressStaticCount, serverIPStr, serverPort);// Initialize ModbusCache if the configuration is valid
   
   modbusCache->begin();    
   

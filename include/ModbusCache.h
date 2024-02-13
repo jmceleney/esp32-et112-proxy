@@ -3,33 +3,68 @@
 
 #include <Arduino.h>
 #include <ModbusServerRTU.h>
+#include "ModbusServerTCPasync.h"
 #include "config.h"
 #include <WiFi.h>
-#include <ModbusClientTCP.h>
+//#include <ModbusClientTCP.h>
+#include <ModbusTCPWrapper.h>
 #include <map>
+#include <set>
+#include <queue>
+#include <optional>
 #include <IPAddress.h>
 #include <unordered_set>
 
 #define MAX_REGISTERS 400
 
+enum class RegisterType {
+    UINT16,
+    INT16,
+    UINT32,
+    INT32
+};
+
+enum class UnitType {
+    V,
+    A,
+    W,
+    PF,
+    Hz,
+    KWh,
+    KVarh,
+    VA,
+    var
+    // Add more units as needed
+};
+
+struct ModbusRegister {
+    uint16_t address;
+    RegisterType type;
+    String description;
+    std::optional<double> scalingFactor;
+    std::optional<UnitType> unit; // Now optional  
+
+    ModbusRegister(uint16_t addr, RegisterType t, const String& desc, std::optional<double> scale = std::nullopt, std::optional<UnitType> unitType = std::nullopt)
+        : address(addr), type(t), description(desc), scalingFactor(scale), unit(unitType) {}    
+};
+
 class ModbusCache {
 public:
-    ModbusCache(const uint16_t* addressList, size_t addressCount, const uint16_t* addressListStatic, size_t addressStaticCount, String& serverIPStr, uint16_t serverPort);
+    ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters, 
+            const std::vector<ModbusRegister>& staticRegisters, 
+            const String& serverIPStr, 
+            uint16_t port);
     void begin();
     void update();
-    uint16_t getRegisterValue(uint16_t address);
+    void addRegister(const ModbusRegister& reg); // Add a register to the cache
+    std::vector<uint16_t> getRegisterValues(uint16_t startAddress, uint16_t count);
+    //uint16_t getRegisterValue(uint16_t address);
     uint16_t update_interval = 500;
-    void setRegisterValue(uint16_t address, uint16_t value);
+    void setRegisterValue(uint16_t address, uint32_t value, bool is32Bit = false);
     static ModbusMessage respondFromCache(ModbusMessage request);
     // Getter methods
     ModbusServerRTU& getModbusRTUServer();
-    ModbusClientTCP& getModbusTCPClient();
-    float getVoltage();
-    float getAmps();
-    float getWatts();
-    float getPowerFactor();
-    float getFrequency();
-    float getImportTotal();
+    ModbusClientTCPasync* getModbusTCPClient();
     bool getIsOperational() const {
         return isOperational;
     }
@@ -39,66 +74,100 @@ public:
     bool getStaticRegistersFetched() const {
         return staticRegistersFetched;
     }
+    std::set<uint16_t> getDynamicRegisterAddresses() const {
+        return dynamicRegisterAddresses;
+    }
+    std::set<uint16_t> getUnexpectedRegisters() const {
+        return unexpectedRegisters;
+    }
+    std::optional<ModbusRegister> getRegisterDefinition(uint16_t address) const {
+        auto it = registerDefinitions.find(address);
+        if (it != registerDefinitions.end()) {
+            return it->second; // Found the register definition
+        }
+        return std::nullopt; // Register definition not found
+    }
+    float getRegisterScaledValue(uint16_t address);
+    String formatRegisterValue(uint16_t address, float value);
+    String getFormattedRegisterValue(uint16_t address);
     
 
 private:
-    const uint16_t* addressList;
-    size_t addressCount;
-    const uint16_t* addressListStatic;
-    size_t addressStaticCount;
+    std::vector<ModbusRegister> registers; // All registers
+    std::map<uint16_t, uint16_t> register16BitValues; // Values for 16-bit registers
+    std::map<uint16_t, uint32_t> register32BitValues; // Values for 32-bit registers
+    std::set<uint16_t> dynamicRegisterAddresses; // Addresses of dynamic registers
+    std::set<uint16_t> staticRegisterAddresses; // Addresses of static registers
+    std::set<uint16_t> unexpectedRegisters; // Addresses of registers not defined in the cache
+    std::map<uint16_t, const ModbusRegister> registerDefinitions;
+
+    bool isStaticRegister(uint16_t registerNumber) {
+        // Check if the register number is in the staticRegisterAddresses set
+        return staticRegisterAddresses.find(registerNumber) != staticRegisterAddresses.end();
+    }
+
+    bool isDynamicRegister(uint16_t registerNumber) {
+        // Check if the register number is in the dynamicRegisterAddresses set
+        return dynamicRegisterAddresses.find(registerNumber) != dynamicRegisterAddresses.end();
+    }
+
+    bool is32BitRegister(uint16_t address) {
+        auto it = registerDefinitions.find(address);
+        if (it != registerDefinitions.end()) {
+            // Check if the register type is either UINT32 or INT32
+            return it->second.type == RegisterType::UINT32 || it->second.type == RegisterType::INT32;
+        }
+        return false; // Address not found or not a 32-bit register
+    }
+
+    bool is16BitRegister(uint16_t address) {
+        auto it = registerDefinitions.find(address);
+        if (it != registerDefinitions.end()) {
+            // Check if the register type is either UINT16 or INT16
+            return it->second.type == RegisterType::UINT16 || it->second.type == RegisterType::INT16;
+        }
+        return false; // Address not found or not a 16-bit register
+    }
+
+
+    uint16_t read16BitRegister(uint16_t address);
+    uint32_t read32BitRegister(uint16_t address);
+    void initializeRegisters(const std::vector<ModbusRegister>& dynamicRegisters, 
+                                      const std::vector<ModbusRegister>& staticRegisters);
+    void write16BitRegister(uint16_t address, uint16_t value);
+    void write32BitRegister(uint16_t address, uint32_t value);
+    std::pair<uint16_t, uint16_t> split32BitRegister(uint32_t value);
     String serverIPString;
     IPAddress currentIPAddress;
     unsigned long lastPollStart = 0;  // Time of the last poll start
     IPAddress serverIP; // IP address of the Modbus TCP server
     uint16_t serverPort; // Port number of the Modbus TCP server
     ModbusServerRTU modbusRTUServer;
-    ModbusClientTCP modbusTCPClient;
-    uint16_t registerValues[MAX_REGISTERS];
-    std::vector<uint16_t> unifiedRegisterList; // Unified list of registers
-    std::map<uint16_t, size_t> registerIndexMap; // Map for quick lookup of register index
-    void buildUnifiedRegisterList();
-    void fetchFromRemote(const uint16_t* regList, size_t regListSize);
+    ModbusServerTCPasync MBserver;
+    ModbusClientTCPasync* modbusTCPClient;
+    void fetchFromRemote(const std::set<uint16_t>& regAddresses);
     void sendModbusRequest(uint16_t startAddress, uint16_t regCount);
     static ModbusCache* instance;
     WiFiClient wifiClient;
     void ensureTCPConnection();
     static void handleData(ModbusMessage response, uint32_t token);
-    static void handleError(Error err, uint32_t token);// Static instance pointer
+    void processResponsePayload(ModbusMessage& response, uint16_t startAddress, uint16_t regCount);
+    static void handleError(Error error, uint32_t token);// Static instance pointer
     void purgeToken(uint32_t token);
-    //std::map<uint32_t, std::pair<uint16_t, uint16_t>> requestMap; // Map to store token -> (startAddress, regCount)
     std::map<uint32_t, std::tuple<uint16_t, uint16_t, unsigned long>> requestMap; // Map to store token -> (startAddress, regCount, timestamp)
     std::queue<uint32_t> insertionOrder; // Queue to store the order in which requests were made
     unsigned long lastSuccessfulUpdate;
     bool isOperational;
-    void updateServerStatusBasedOnCommFailure();
+    void updateServerStatus();
     // Utility method to read a 32-bit value from two 16-bit registers
     uint32_t read32BitValue(uint16_t address);
     int32_t read32BitSignedValue(uint16_t address);
 
-    // Hard-coded register addresses
-    static const uint16_t VOLTAGE_ADDR = 0;
-    static const uint16_t AMPS_ADDR = 2;
-    static const uint16_t WATTS_ADDR = 4;
-    static const uint16_t PF_ADDR = 14;
-    static const uint16_t FREQ_ADDR = 15;
-    static const uint16_t IMPORT_ADDR = 16;
     std::unordered_set<uint16_t> fetchedStaticRegisters;
     std::unordered_set<uint16_t> fetchedDynamicRegisters;
     bool staticRegistersFetched = false; // Flag to indicate completion of static register fetching
     bool dynamicRegistersFetched = false; // Flag to indicate completion of dynamic register fetching
-    bool isStaticRegister(uint16_t registerNumber) {
-        for (size_t i = 0; i < addressStaticCount; ++i) {
-            if (addressListStatic[i] == registerNumber) { return true; }
-        }
-        return false; // Register number not found
-    }
-    bool isDynamicRegister(uint16_t registerNumber) {
-        for (size_t i = 0; i < addressCount; ++i) {
-            if (addressList[i] == registerNumber) { return true; }
-        }
-        return false; // Register number not found
-    }
-
+ 
     SemaphoreHandle_t mutex;
 };
 

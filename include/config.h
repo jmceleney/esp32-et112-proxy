@@ -12,6 +12,7 @@
             Preferences *_prefs;
             int16_t _tcpPort;
             int16_t _tcpPort2;
+            int16_t _tcpPort3;
             String _targetIP;
             uint32_t _tcpTimeout;
             unsigned long _modbusBaudRate;
@@ -29,6 +30,8 @@
             void setTcpPort(uint16_t value);
             uint16_t getTcpPort2();
             void setTcpPort2(uint16_t value);
+            uint16_t getTcpPort3();
+            void setTcpPort3(uint16_t value);
             uint32_t getTcpTimeout();
             void setTcpTimeout(uint32_t value);
             String getTargetIP() const;

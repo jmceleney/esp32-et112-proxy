@@ -1,7 +1,7 @@
 #include "ModbusCache.h"
 #include <unordered_set>
 
-extern Config config; // Declare config as extern
+extern Config config;
 
 // Global variables for token and response handling
 uint32_t globalToken = 0;
@@ -23,15 +23,14 @@ void printHex(const uint8_t *buffer, size_t length) {
 // Initialize static instance pointer
 ModbusCache *ModbusCache::instance = nullptr;
 
-ModbusCache::ModbusCache(const uint16_t *addressList, size_t addressCount, const uint16_t *addressListStatic, size_t addressStaticCount, String &serverIPStr, uint16_t port)
-    : addressList(addressList), // Fast changing registers
-      addressCount(addressCount),
-      addressListStatic(addressListStatic), // Only have to fetch these once
-      addressStaticCount(addressStaticCount),
+ModbusCache::ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters, 
+                         const std::vector<ModbusRegister>& staticRegisters, 
+                         const String& serverIPStr, 
+                         uint16_t port) :
       serverIPString(serverIPStr),
       serverPort(port),
       modbusRTUServer(2000, config.getModbusRtsPin2()),
-      modbusTCPClient(wifiClient,10) // queueLimit 10
+      modbusTCPClient(nullptr) //,10) // queueLimit 10
 {
     if (serverIPString == "127.0.0.1") {
         IPAddress newIP = WiFi.localIP();
@@ -41,14 +40,13 @@ ModbusCache::ModbusCache(const uint16_t *addressList, size_t addressCount, const
     } else if (!serverIP.fromString(serverIPString)) {
         Serial.println("Error: Invalid IP address. Aborting operation.");
         // Enter a safe state, stop further processing, or reset the system
-        while (true)
-        {
+        while (true) {
             delay(1000); // Halt operation
         }
     }
 
-    modbusTCPClient.setTarget(serverIP, serverPort, 1000);
-    memset(registerValues, 0, sizeof(registerValues));
+    initializeRegisters(dynamicRegisters, staticRegisters);
+    modbusTCPClient = new ModbusClientTCPasync(serverIP, serverPort, 10); // Dynamically allocate ModbusClientTCPasync
     instance = this; // Set the instance pointer to this object
 }
 
@@ -58,162 +56,223 @@ void ModbusCache::begin()
     dbgln("Begin mosbusCache");
     
     mutex = xSemaphoreCreateMutex();
-    // Initialize all register values to zero
-    memset(registerValues, 0, sizeof(uint16_t) * MAX_REGISTERS);
-    buildUnifiedRegisterList();
-
+    if (mutex == NULL) {
+        dbgln("Failed to create mutex");
+    }
+    
     RTUutils::prepareHardwareSerial(Serial1);
     Serial1.begin(config.getModbusBaudRate2(), config.getModbusConfig2(), 25, 26); // Start the Serial communication
 
-    // Start the Modbus RTU server
-    modbusRTUServer.begin(Serial1); // or modbusRTUServer.begin(Serial1, -1) to specify coreID
-
     // Register worker function
     modbusRTUServer.registerWorker(1, ANY_FUNCTION_CODE, &ModbusCache::respondFromCache);
+    MBserver.registerWorker(1, ANY_FUNCTION_CODE, &ModbusCache::respondFromCache);
 
-    // Initialize Modbus TCP Client
-    modbusTCPClient.begin();
-    ensureTCPConnection();
+    // Start the Modbus RTU server
+    modbusRTUServer.begin(Serial1); // or modbusRTUServer.begin(Serial1, -1) to specify coreID
+    MBserver.start(config.getTcpPort3(), 20, config.getTcpTimeout());
 
-    modbusTCPClient.setTarget(serverIP, serverPort, 1000);
-    modbusTCPClient.onDataHandler(&ModbusCache::handleData);
-    modbusTCPClient.onErrorHandler(&ModbusCache::handleError);
+    modbusTCPClient->setMaxInflightRequests(15);
+    modbusTCPClient->connect(serverIP, serverPort);
+    modbusTCPClient->onDataHandler(&ModbusCache::handleData);
+    modbusTCPClient->onErrorHandler(&ModbusCache::handleError);
 }
 
-void ModbusCache::buildUnifiedRegisterList() {
-    // Add dynamic registers first
-    for (size_t i = 0; i < addressCount; ++i) {
-        unifiedRegisterList.push_back(addressList[i]);
-        registerIndexMap[addressList[i]] = i;
+void ModbusCache::initializeRegisters(const std::vector<ModbusRegister>& dynamicRegisters, 
+                                      const std::vector<ModbusRegister>& staticRegisters) {
+    for (const auto& reg : dynamicRegisters) {
+        // Log what we're doing
+        dbgln("Adding dynamic register at address: " + String(reg.address));
+        registers.push_back(reg);
+        registerDefinitions.insert({reg.address, reg});
+        
+        if (reg.type == RegisterType::UINT32 || reg.type == RegisterType::INT32) {
+            register32BitValues[reg.address] = 0; // Initialize with default value
+        } else {
+            register16BitValues[reg.address] = 0; // Initialize with default value
+        }
+        dynamicRegisterAddresses.insert(reg.address);
     }
 
-    // Add static registers, avoiding duplicates
-    for (size_t i = 0; i < addressStaticCount; ++i) {
-        if (registerIndexMap.find(addressListStatic[i]) == registerIndexMap.end()) {
-            unifiedRegisterList.push_back(addressListStatic[i]);
-            registerIndexMap[addressListStatic[i]] = unifiedRegisterList.size() - 1;
+    for (const auto& reg : staticRegisters) {
+        // Log what we're doing
+        dbgln("Adding static register at address: " + String(reg.address));
+        registers.push_back(reg);
+        registerDefinitions.insert({reg.address, reg});
+
+        if (reg.type == RegisterType::UINT32 || reg.type == RegisterType::INT32) {
+            if (register32BitValues.find(reg.address) == register32BitValues.end()) {
+                register32BitValues[reg.address] = 0; // Initialize if not already present
+            }
+        } else {
+            if (register16BitValues.find(reg.address) == register16BitValues.end()) {
+                register16BitValues[reg.address] = 0; // Initialize if not already present
+            }
+        }
+        staticRegisterAddresses.insert(reg.address);
+    }
+    // Log which registers are 16 bit and 32 bit
+    dbgln("16-bit registers: ");
+    for (auto addr : register16BitValues) {
+        dbgln(String(addr.first));
+    }
+    dbgln("32-bit registers: ");
+    for (auto addr : register32BitValues) {
+        dbgln(String(addr.first));
+    }
+
+}
+
+std::vector<uint16_t> ModbusCache::getRegisterValues(uint16_t startAddress, uint16_t count) {
+    std::vector<uint16_t> values;
+    for (uint16_t i = 0; i < count; ++i) {
+        uint16_t address = startAddress + i;
+        if (is32BitRegister(address)) {
+            // Handle 32-bit register
+            uint32_t value32 = read32BitRegister(address);
+            auto [high, low] = split32BitRegister(value32);
+            values.push_back(low);
+            values.push_back(high);
+            ++i; // Skip next address since it's part of the 32-bit value
+        } else {
+            // Handle 16-bit register
+            values.push_back(read16BitRegister(address));
         }
     }
+    return values;
+}
+
+uint16_t ModbusCache::read16BitRegister(uint16_t address) {
+    if (register16BitValues.find(address) != register16BitValues.end()) {
+        return register16BitValues[address];
+    }
+    // Add this address to the set of unexpected registers
+    unexpectedRegisters.insert(address);
+    return 0; // Placeholder for non-existent register
+}
+
+uint32_t ModbusCache::read32BitRegister(uint16_t address) {
+    if (is32BitRegister(address)) {
+        return register32BitValues[address];
+    }
+    return 0; // Placeholder for non-existent register
+}
+
+std::pair<uint16_t, uint16_t> ModbusCache::split32BitRegister(uint32_t value) {
+    return std::make_pair(static_cast<uint16_t>(value >> 16), static_cast<uint16_t>(value & 0xFFFF));
 }
 
 void ModbusCache::update() {
     unsigned long currentMillis = millis();
 
-    // Check if `update_interval` time has passed since last update
-    if (currentMillis - lastPollStart >= update_interval)
-    {
-        lastPollStart = currentMillis; // Update the last poll start time
+    if (currentMillis - lastPollStart >= update_interval) {
+        lastPollStart = currentMillis;
 
-        // Check the number of pending requests
-        if (modbusTCPClient.pendingRequests() > 4) {
-            dbgln("Skipping update due to more than 4 pending requests");
-            return; // Exit the function if there are more than 4 pending requests
+        if (requestMap.size() > 8) {
+            dbgln("Skipping update due to more than 8 pending requests");
+            return;
         }
 
         dbgln("Update modbusCache");
-        ensureTCPConnection();
 
         if (!staticRegistersFetched) {
-            fetchFromRemote(addressListStatic, addressStaticCount);
+            dbgln("Fetching static registers...");
+            fetchFromRemote(staticRegisterAddresses);
         } else {
-            fetchFromRemote(addressList, addressCount);
+            dbgln("Fetching dynamic registers...");
+            fetchFromRemote(dynamicRegisterAddresses);
         }
 
-        updateServerStatusBasedOnCommFailure();
+        updateServerStatus();
     }
 }
 
-void ModbusCache::ensureTCPConnection()
-{
-    static unsigned long lastConnectionAttemptTime = 0;
-    const unsigned long connectionDelay = 2000;
-
-    dbgln("Ensuring TCP connection...");
-    if (!wifiClient.connected()) {
-        IPAddress newIP = WiFi.localIP();
-        if(serverIPString == "127.0.0.1" && newIP != serverIP) {
-            dbgln("Local IP address changed from " + serverIP.toString() + " to " + newIP.toString());
-            serverIP = newIP;
-            modbusTCPClient.setTarget(serverIP, serverPort, 1000);
-        }
-
-        unsigned long currentTime = millis();
-        dbg("Client not connected");
-
-        // Check if sufficient time has elapsed since the last connection attempt
-        if (currentTime - lastConnectionAttemptTime >= connectionDelay) {
-            dbgln(" - Reconnecting to IP: " + serverIP.toString() + ", port: " + String(config.getTcpPort2()));
-
-            // Reconnect logic
-            modbusTCPClient.setTarget(serverIP, config.getTcpPort2());
-
-            // Update the last connection attempt time
-            lastConnectionAttemptTime = currentTime;
+void ModbusCache::setRegisterValue(uint16_t address, uint32_t value, bool is32Bit) {
+    if (is32Bit) {
+        // For 32-bit registers, update the whole 32-bit value atomically
+        if (is32BitRegister(address)) {
+            register32BitValues[address] = value;
         } else {
-            dbgln(" - Waiting to reconnect...");
+            // Log or handle the error if trying to write a 32-bit value to a non-32-bit register
+            dbgln("Error: Attempt to write 32-bit value to non-32-bit register at address: " + String(address));
+        }
+    } else {
+        // For 16-bit registers, update normally
+        if (is16BitRegister(address)) {
+            // Cast to 16-bit to ensure value fits into 16-bit register
+            register16BitValues[address] = static_cast<uint16_t>(value);
+        } else {
+            // Log or handle the error if trying to write to an address not designated for 16-bit values
+            dbgln("Error: Attempt to write 16-bit value to non-16-bit register or 32-bit register at address: " + String(address));
         }
     }
-    dbgln("Ensuring TCP connection done");
 }
 
-uint16_t ModbusCache::getRegisterValue(uint16_t address) {
-    auto it = registerIndexMap.find(address);
-    if (it != registerIndexMap.end()) {
-        return registerValues[it->second];
-    }
-    return 0; // Address not found
-}
+void ModbusCache::fetchFromRemote(const std::set<uint16_t>& regAddresses) {
+    if (regAddresses.empty()) return; // Early return if there are no addresses to process
 
-void ModbusCache::setRegisterValue(uint16_t address, uint16_t value) {
-    auto it = registerIndexMap.find(address);
-    if (it != registerIndexMap.end()) {
-        registerValues[it->second] = value;
-    }
-    // If address not found, value setting is skipped
-}
+    uint16_t startAddress = *regAddresses.begin();
+    uint16_t lastAddress = startAddress;
+    bool lastWas32Bit = is32BitRegister(startAddress);
+    // Initialize regCount based on the first register size.
+    uint16_t regCount = lastWas32Bit ? 2 : 1;
 
-void ModbusCache::fetchFromRemote(const uint16_t* regList, size_t regListSize) {
-    uint16_t startAddress = regList[0]; // Initialize to the first address
+    //dbgln("startAddress: " + String(startAddress));
 
-    // log startAddress and the entire regList, in the format [1,2,3...]
-    dbg("startAddress: " + String(startAddress) + ", ");
-    dbg("regList: [");
-    for (size_t i = 0; i < regListSize; ++i) {
-        dbg(String(regList[i]));
-        if (i < regListSize - 1) { dbg(", "); }
-    }
-    dbgln("]");
+    for (auto it = std::next(regAddresses.begin()); it != regAddresses.end(); ++it) {
+        dbg(String(*it) + ", ");
+        uint16_t currentAddress = *it;
+        // If this is a static register that we have already fetched, but fetching
+        // of all static registers is not yet complete, skip it.
+        if (!staticRegistersFetched && fetchedStaticRegisters.find(currentAddress) != fetchedStaticRegisters.end()) {
+            continue;
+        }
 
-    uint16_t regCount = 1; // Start with a count of 1 for the first address
+        // If this register is already in the queue, skip it.
+        bool isCurrent32Bit = is32BitRegister(currentAddress);
 
-    for (size_t i = 1; i < regListSize; ++i) { // Start from the second element
-        if (regList[i] == (regList[i - 1] + 1)) {
-            // Address is contiguous with the previous one
-            regCount++;
+        // Calculate expected next address considering the size of the last register.
+        uint16_t expectedNextAddress = lastAddress + (lastWas32Bit ? 2 : 1);
+
+        if (currentAddress == expectedNextAddress) {
+            // Address is contiguous with the last one considering register size.
+            regCount += isCurrent32Bit ? 2 : 1;
         } else {
-            // Found a non-contiguous address, send request for the previous block
-            dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress));
+            // Found a non-contiguous address, send request for the previous block.
+            //dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress));
             sendModbusRequest(startAddress, regCount);
 
-            // Start a new block
-            startAddress = regList[i];
-            regCount = 1;
+            // Start new block from the current address.
+            startAddress = currentAddress;
+            regCount = isCurrent32Bit ? 2 : 1;
         }
 
-        // Check if it's time to send a request or if it's the end of the list
-        if (regCount >= 100 || i == regListSize - 1) {
-            dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress));
+        // Update for the next iteration.
+        lastAddress = currentAddress;
+        lastWas32Bit = isCurrent32Bit;
+
+        // Always check at the end of each iteration to send due to request size limit or if it's the last item.
+        if (regCount >= 100 || std::next(it) == regAddresses.end()) {
+            //dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress));
             sendModbusRequest(startAddress, regCount);
-            startAddress = regList[i] + 1; // Prepare for the next block
-            regCount = 0;
+
+            // Prepare for potentially next block, reset regCount only if not at the end.
+            if (std::next(it) != regAddresses.end()) {
+                startAddress = *std::next(it);
+                lastWas32Bit = is32BitRegister(startAddress);
+                regCount = lastWas32Bit ? 2 : 1;
+                lastAddress = startAddress;
+            }
         }
     }
-    yield();
+    //dbgln("]");
 }
 
-void ModbusCache::updateServerStatusBasedOnCommFailure() {
-    if (millis() - lastSuccessfulUpdate > (update_interval + 4000)) {
+
+void ModbusCache::updateServerStatus() {
+    if (millis() - lastSuccessfulUpdate > (update_interval + 6000)) {
         isOperational = false;
+    } else if(staticRegistersFetched && dynamicRegistersFetched) {
+        isOperational = true;
     }
 }
 
@@ -223,7 +282,7 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
         uint32_t currentToken = globalToken++;
 
         // Log start address, register count, and token
-        dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress) + " with token: " + String(currentToken));
+        //dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress) + " with token: " + String(currentToken));
         printHex(request.data(), request.size());
         if (xSemaphoreTake(mutex, portMAX_DELAY)) { // Wait indefinitely until the mutex is available
             unsigned long timestamp = millis();
@@ -233,88 +292,50 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
             if (requestMap.size() >= 200) {
                 // Remove the oldest entry
                 uint32_t oldestToken = insertionOrder.front();
-                dbgln("Removing oldest entry with token: " + String(oldestToken));
+                //dbgln("Removing oldest entry with token: " + String(oldestToken));
                 requestMap.erase(oldestToken);
-                dbgln("Erasing token done");
+                //dbgln("Erasing token done");
                 insertionOrder.pop();
             }
             xSemaphoreGive(mutex); // Release the mutex
         }
-        dbgln("[send:" + String(currentToken) + "] Queue size: " + String(instance->insertionOrder.size()) + ", map size: " + String(instance->requestMap.size()));
-        modbusTCPClient.addRequest(request, currentToken);
+        //dbgln("[send:" + String(currentToken) + "] Queue size: " + String(instance->insertionOrder.size()) + ", map size: " + String(instance->requestMap.size()));
+        modbusTCPClient->addRequest(request, currentToken);
     }
 }
 
 // This function handles responses from the Modbus TCP client
 void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
     dbgln("Received response for token: " + String(token));
+    printHex(response.data(), response.size());
     auto it = instance->requestMap.find(token);
     if (it != instance->requestMap.end()) {
         uint16_t startAddress = std::get<0>(it->second);
         uint16_t regCount = std::get<1>(it->second);
         unsigned long sentTimestamp = std::get<2>(it->second);
-
+        
         unsigned long responseTime = millis() - sentTimestamp;
         dbgln("Response time for token " + String(token) + ": " + String(responseTime) + " ms");
 
-        // Log start address and register count
         dbgln("[handleData] Start address: " + String(startAddress) + ", register count: " + String(regCount));
-        printHex(response.data(), response.size());
+        //printHex(response.data(), response.size());
 
-        // Extract payload from response
-        std::vector<uint8_t> payload(response.data() + 3, response.data() + response.size());
-        dbg("Received values: [");
-
-        // Process payload
-        for (size_t i = 0; i < payload.size(); i += 2) {
-            uint16_t value = (uint16_t)payload[i] << 8 | payload[i + 1];
-            dbg(String(value) + " {" + String(startAddress) + "}, ");
-            instance->setRegisterValue(startAddress, value);
-            if(instance->isStaticRegister(startAddress)) {
-                dbgln("Register " + String(startAddress) + " is static");
-               instance->fetchedStaticRegisters.insert(startAddress); 
-            }
-            if(instance->isDynamicRegister(startAddress)) {
-                dbgln("Register " + String(startAddress) + " is dynamic");
-                instance->fetchedDynamicRegisters.insert(startAddress);
-            }
-            startAddress++;
-        }
-        dbgln("] DONE");
-        
-        if (!instance->staticRegistersFetched) {
-            instance->staticRegistersFetched = instance->fetchedStaticRegisters.size() == instance->addressStaticCount;
-            dbg("Fetched static registers: ");
-            for (uint16_t reg : instance->fetchedStaticRegisters) {
-                dbg(String(reg) + ", ");
-            }
-            dbgln();
-        }
-        if (!instance->dynamicRegistersFetched) {
-            instance->dynamicRegistersFetched = instance->fetchedDynamicRegisters.size() == instance->addressCount;
-            dbg("Fetched dynamic registers: ");
-            for (uint16_t reg : instance->fetchedDynamicRegisters) {
-                dbg(String(reg) + ", ");
-            }
-            dbgln();
-        }
+        instance->processResponsePayload(response, startAddress, regCount); // This is a new method to be implemented
 
         instance->lastSuccessfulUpdate = millis();
-        instance->isOperational = instance->staticRegistersFetched && instance->dynamicRegistersFetched;
-        instance->purgeToken(token);
+        instance->purgeToken(token); // Cleanup the token now that the response has been processed
 
-        // Output queue and map sizes
         dbgln("[rcpt:" + String(token) + "] Queue size: " + String(instance->insertionOrder.size()) + ", map size: " + String(instance->requestMap.size()));
-        
     } else {
-        // Log the unfound token
         dbgln("Token " + String(token) + " not found in map");
     }
 }
 
-void ModbusCache::handleError(Error err, uint32_t token) {
+void ModbusCache::handleError(Error error, uint32_t token) {
+    // ModbusError wraps the error code and provides a readable error message for it
+    ModbusError me(error);
+    Serial.printf("Error response: %02X - %s token: %d\n", (int)me, (const char *)me, token);
     instance->purgeToken(token);
-    dbgln("Error " + String(err) + " for token " + String(token));
 }
 
 void ModbusCache::purgeToken(uint32_t token) {
@@ -329,16 +350,16 @@ void ModbusCache::purgeToken(uint32_t token) {
         for (const auto& entry : requestMap) {
             uint32_t currentToken = entry.first;
             unsigned long sentTimestamp = std::get<2>(entry.second);
-            if (currentTime - sentTimestamp > 4000) {
+            if (currentTime - sentTimestamp > 20000) {
                 tokensToPurge.push_back(currentToken);
             }
         }
 
         // Remove tokens from the map
         for (uint32_t purgeToken : tokensToPurge) {
-            dbgln("Erasing token " + String(purgeToken) + " from map");
+            //dbgln("Erasing token " + String(purgeToken) + " from map");
             requestMap.erase(purgeToken);
-            dbgln("Erasing token done");
+            //dbgln("Erasing token done");
         }
 
         // Efficiently process the queue
@@ -358,126 +379,260 @@ void ModbusCache::purgeToken(uint32_t token) {
     dbgln("Erasing tokens done");
 }
 
+uint32_t extract32BitValue(const uint8_t* buffer, size_t index) {
+    uint32_t value = static_cast<uint32_t>(buffer[index + 2]) << 24 |
+                     static_cast<uint32_t>(buffer[index + 3]) << 16 |
+                     static_cast<uint32_t>(buffer[index]) << 8 |
+                     static_cast<uint32_t>(buffer[index + 1]);
+
+    String debugMsg = "32-bit Value: " + String(buffer[index]) + ", " +
+                      String(buffer[index + 1]) + ", " + String(buffer[index + 2]) + ", " +
+                      String(buffer[index + 3]);
+    //dbgln(debugMsg);
+    //dbgln("Resulting 32-bit Value: " + String(value));
+
+    return value;
+}
+
+uint16_t extract16BitValue(const uint8_t* buffer, size_t index) {
+    // log the 2 bytes in order
+    //dbgln("16-bit Value: " + String(buffer[index]) + ", " + String(buffer[index + 1]));
+    return static_cast<uint16_t>(buffer[index]) << 8 |
+           static_cast<uint16_t>(buffer[index + 1]);
+}
+
+
+void ModbusCache::processResponsePayload(ModbusMessage& response, uint16_t startAddress, uint16_t regCount) {
+    dbgln("[processResponsePayload] Processing payload...");
+    // Log the payload
+    //printHex(response.data(), response.size());
+    size_t payloadIndex = 0;
+    //const uint8_t* payload = const_cast<ModbusMessage&>(response).data();
+    const uint8_t* payload = response.data() + 3;
+
+    for (uint16_t i = 0; i < regCount; ++i) {
+        uint16_t currentAddress = startAddress + i;
+        bool isStatic = isStaticRegister(currentAddress);
+        bool isDynamic = isDynamicRegister(currentAddress);
+        if (is32BitRegister(currentAddress)) {
+            uint32_t value = extract32BitValue(payload, payloadIndex);
+            // dbgln("32-bit Value at address " + String(currentAddress) + ": " + String(value));
+            // Log what we know about the register, including its dynamic/static status
+            //dbgln("32-bit Value at address " + String(currentAddress) + ": " + String(value) + " (Static: " + String(isStatic) + ", Dynamic: " + String(isDynamic) + ")");
+
+            setRegisterValue(currentAddress, value, true); // true indicates 32-bit operation
+            payloadIndex += 4; // Move past the 32-bit value in the payload
+            i++; // Skip the next address, as it's part of the 32-bit value
+        } else if (is16BitRegister(currentAddress)) {
+            uint16_t value = extract16BitValue(payload, payloadIndex);
+            //dbgln("16-bit Value at address " + String(currentAddress) + ": " + String(value));
+            // Log what we know about the register, including its dynamic/static status
+            //dbgln("16-bit Value at address " + String(currentAddress) + ": " + String(value) + " (Static: " + String(isStatic) + ", Dynamic: " + String(isDynamic) + ")");
+            setRegisterValue(currentAddress, value); // Default is 16-bit operation
+            payloadIndex += 2; // Move past the 16-bit value in the payload
+        } else {
+            dbgln("Address " + String(currentAddress) + " not defined as 16 or 32 bit. Skipping...");
+            continue; // Skip processing this address if it doesn't match known types
+        }
+
+        // Update processed registers sets
+        if (isStatic) {
+            fetchedStaticRegisters.insert(currentAddress);
+        } else if (isDynamic) {
+            fetchedDynamicRegisters.insert(currentAddress);
+        }
+    }
+
+    // Efficiently set completion booleans
+    if (!staticRegistersFetched) {
+        dbgln("staticRegistersFetched: " + String(staticRegistersFetched) + ", staticRegisterAddresses.size(): " + String(staticRegisterAddresses.size()) + ", fetchedStaticRegisters.size(): " + String(fetchedStaticRegisters.size()));
+        if (staticRegisterAddresses.size() == fetchedStaticRegisters.size()) {
+            staticRegistersFetched = true;
+        }
+    }
+    if (!dynamicRegistersFetched) {
+        dbgln("dynamicRegistersFetched: " + String(dynamicRegistersFetched) + ", dynamicRegisterAddresses.size(): " + String(dynamicRegisterAddresses.size()) + ", fetchedDynamicRegisters.size(): " + String(fetchedDynamicRegisters.size()));
+        if (dynamicRegisterAddresses.size() == fetchedDynamicRegisters.size()) {
+            dynamicRegistersFetched = true;
+        } 
+    }
+}
 
 ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
     dbgln("Received request to local server:");
     printHex(request.data(), request.size());
+
     if (!instance->isOperational) {
-        // Server is not operational, return no response
         dbgln("Server is not operational, returning no response");
-        return NIL_RESPONSE;
+        return ModbusMessage(); // Assuming an empty ModbusMessage indicates no response
     }
 
     uint8_t slaveID = request[0];
     uint8_t functionCode = request[1];
+    uint16_t address = (request[2] << 8) | request[3];
+    uint16_t valueOrWords = (request[4] << 8) | request[5];
 
-    // Log what we know about the request in one line
+    if (functionCode == 6) { // Write Single Register
+        dbgln("Write Single Register - Slave ID: " + String(slaveID) + ", Address: " + String(address) + ", Value: " + String(valueOrWords));
 
-    if (functionCode == 6)
-    { // Write Single Register
-        uint16_t address = (uint16_t)request[2] << 8 | request[3];
-        uint16_t valueToWrite = (uint16_t)request[4] << 8 | request[5];
-
-        // Log the request details
-        dbgln("Write Single Register - Slave ID: " + String(slaveID) + ", Address: " + String(address) + ", Value: " + String(valueToWrite));
-        // Create and send the request
+        // Forward the request to the actual device/server.
         ModbusMessage forwardRequest;
-        forwardRequest.add(slaveID, functionCode, address, valueToWrite);
+        forwardRequest.add(slaveID, functionCode, address, valueOrWords);
         uint32_t currentToken = globalToken++;
+        instance->modbusTCPClient->addRequest(forwardRequest, currentToken);
 
-        instance->modbusTCPClient.addRequest(forwardRequest, currentToken);
-        instance->setRegisterValue(address, valueToWrite);
-        return ECHO_RESPONSE;
+        // Update the value in the cache.
+        // The implementation depends on how you've structured your cache. 
+        // Here's a simplified example, adjust according to your actual implementation.
+        instance->setRegisterValue(address, valueOrWords); // This function needs to be designed to handle 16-bit writes.
+
+        // Assuming a successful write is confirmed by echoing back the request or a specific success message.
+        return forwardRequest; // Echo back the request for simplicity, adjust based on actual confirmation needed.
+    } else if (functionCode == 3 || functionCode == 4) { // Read Holding Registers or Read Input Registers
+        dbgln("Read Registers - Slave ID: " + String(slaveID) + ", Address: " + String(address) + ", Quantity: " + String(valueOrWords));
+        
+        auto values = instance->getRegisterValues(address, valueOrWords); // Fetch requested values
+        if (values.empty()) {
+            dbgln("No data available for the requested registers.");
+            return ModbusMessage(); // Return an empty message or a specific error response
+        }
+
+        ModbusMessage response;
+        response.add(slaveID); // Add slave ID
+        response.add(functionCode); // Add function code
+        response.add(static_cast<uint8_t>(valueOrWords * 2)); // Byte count
+
+        // for (auto it = values.rbegin(); it != values.rend(); ++it) { // reverse this to match the order of the request
+        int wordCount = 0;
+        for (auto it = values.begin(); it != values.end(); ++it) {
+            auto value = *it;   
+            response.add(value);
+            wordCount++;
+            // Stop looping if wordcount equals valueOrWords
+            if (wordCount == valueOrWords) { // We might want word one of a 2 word register
+                break;
+            }
+            // Log the value and the MSB and LSB
+            //dbgln("Value: " + String(value) + ", MSB: " + String((value >> 8) & 0xFF) + ", LSB: " + String(value & 0xFF));
+        }
+
+        dbgln("Sending response from cache:");
+        printHex(response.data(), response.size());
+        return response;
     }
-    // Check if the function code is 3 or 4
-    if (functionCode != 3 && functionCode != 4)
-    {
-        return NIL_RESPONSE;
-    }
 
-    uint16_t address = (uint16_t)request[2] << 8 | request[3];
-    uint16_t words = (uint16_t)request[4] << 8 | request[5];
-    dbgln("Slave ID: " + String(slaveID) + ", function code: " + String(functionCode) + ", address: " + String(address) + ", words: " + String(words));
-
-    // Preparing response
-    uint8_t byteCount = words * 2; // Each register is 2 bytes
-    ModbusMessage response;        // Create an empty ModbusMessage
-    std::vector<uint8_t> responseBytes = {byteCount};
-    response.add(slaveID, functionCode, (uint8_t)byteCount); // Add slave ID, function code, and byte count to the response
-
-    for (uint16_t i = 0; i < words; ++i)
-    {
-        uint16_t currentValue = instance->getRegisterValue(address + i);
-        // Now add uint16_t values to the response
-        response.add(currentValue);
-    }
-
-    dbgln("Sending response from cache:");
-    printHex(response.data(), response.size());
-
-    return response;
+    return ModbusMessage(); // For unsupported function codes, return an empty message
 }
 
-ModbusServerRTU &ModbusCache::getModbusRTUServer()
-{
+
+ModbusServerRTU &ModbusCache::getModbusRTUServer() {
     return modbusRTUServer;
 }
 
-ModbusClientTCP &ModbusCache::getModbusTCPClient()
-{
+ModbusClientTCPasync* ModbusCache::getModbusTCPClient() {
     return modbusTCPClient;
 }
 
-float ModbusCache::getVoltage()
-{
-    int32_t voltsRaw = read32BitSignedValue(VOLTAGE_ADDR);
-    return voltsRaw / 10.0f; // Assuming volts are stored as volts*10
+
+uint32_t ModbusCache::read32BitValue(uint16_t address) {
+    auto values = getRegisterValues(address, 2); // Fetch two 16-bit registers: MSW and LSW
+
+    if (values.size() < 2) {
+        // Error handling: not enough data returned
+        dbgln("Error: Expected 2 registers, received less.");
+        return 0;
+    }
+
+    // Assuming the first value is the MSW and the second is the LSW, maintaining endianness.
+    uint32_t highWord = static_cast<uint32_t>(values[0]);
+    uint32_t lowWord = static_cast<uint32_t>(values[1]);
+
+    // Correctly combine the words into a 32-bit value
+    return (highWord << 16) | lowWord;
 }
 
-float ModbusCache::getAmps()
-{
-    int32_t ampsRaw = read32BitSignedValue(AMPS_ADDR);
-    return ampsRaw / 1000.0f; // Assuming amps are stored as amps*1000
+
+int32_t ModbusCache::read32BitSignedValue(uint16_t address) {
+    // Fetch two consecutive 16-bit registers starting from the specified address.
+    auto values = getRegisterValues(address, 2); // Fetches two registers: high word and low word
+
+    if (values.size() < 2) {
+        // Error handling: not enough data returned
+        dbgln("Error: Expected 2 registers, received less.");
+        return 0; // or another appropriate error value
+    }
+
+    // Combine the high word and low word into a 32-bit unsigned integer
+    uint32_t combined = ((uint32_t)values[0] << 16) | (uint32_t)values[1];
+
+    // Interpret the combined value as a 32-bit signed integer
+    int32_t signedValue = static_cast<int32_t>(combined);
+    return signedValue;
 }
 
-float ModbusCache::getWatts()
-{
-    int32_t wattsRaw = read32BitSignedValue(WATTS_ADDR);
-    return wattsRaw / 10.0f;
+float ModbusCache::getRegisterScaledValue(uint16_t address) {
+    auto it = registerDefinitions.find(address);
+    if (it == registerDefinitions.end()) {
+        return 0.0; // Register not found
+    }
+    const ModbusRegister& reg = it->second;
+    float value = 0.0;
+
+    if (is32BitRegister(address)) {
+        // For 32-bit registers, differentiate between signed and unsigned values
+        if (reg.type == RegisterType::UINT32) {
+            value = static_cast<float>(read32BitRegister(address));
+        } else if (reg.type == RegisterType::INT32) {
+            // Cast to int32_t before float to preserve sign
+            value = static_cast<float>(static_cast<int32_t>(read32BitRegister(address)));
+        }
+    } else if (is16BitRegister(address)) {
+        // For 16-bit registers, differentiate between signed and unsigned values
+        if (reg.type == RegisterType::UINT16) {
+            value = static_cast<float>(read16BitRegister(address));
+        } else if (reg.type == RegisterType::INT16) {
+            // Cast to int16_t before float to preserve sign
+            value = static_cast<float>(static_cast<int16_t>(read16BitRegister(address)));
+        }
+    }
+
+    if (reg.scalingFactor.has_value()) {
+        value *= reg.scalingFactor.value();
+    }
+
+    return value;
 }
 
-float ModbusCache::getPowerFactor()
-{
-    int16_t powerFactorRaw = getRegisterValue(PF_ADDR);
-    return powerFactorRaw / 1000.0f;
+
+String ModbusCache::formatRegisterValue(uint16_t address, float value) {
+    auto it = registerDefinitions.find(address);
+    if (it == registerDefinitions.end()) {
+        return "N/A"; // Register not found
+    }
+    const ModbusRegister& reg = it->second;
+    char buffer[50];
+    if (reg.unit.has_value()) {
+        switch (reg.unit.value()) {
+            case UnitType::V: snprintf(buffer, sizeof(buffer), "%.1f V", value); break;
+            case UnitType::A: snprintf(buffer, sizeof(buffer), "%.3f A", value); break;
+            case UnitType::W: snprintf(buffer, sizeof(buffer), "%.1f W", value); break;
+            case UnitType::PF: snprintf(buffer, sizeof(buffer),"%.3f", value); break;
+            case UnitType::Hz: snprintf(buffer, sizeof(buffer),"%.1f Hz", value); break;
+            case UnitType::KWh: snprintf(buffer, sizeof(buffer),"%.1f kWh", value); break;
+            case UnitType::KVarh: snprintf(buffer, sizeof(buffer),"%.1f kVARh", value); break;
+            case UnitType::VA: snprintf(buffer, sizeof(buffer),"%.1f VA", value); break;
+            case UnitType::var: snprintf(buffer, sizeof(buffer),"%.1f var", value); break;
+            // Add more units as needed
+            default: snprintf(buffer, sizeof(buffer), "%f", value);
+        }
+    } else {
+        snprintf(buffer, sizeof(buffer), "%f", value); // Default formatting
+    }
+    return String(buffer);
 }
 
-float ModbusCache::getFrequency()
-{
-    int16_t frequencyRaw = getRegisterValue(FREQ_ADDR);
-    return frequencyRaw / 10.0f;
-}
-
-float ModbusCache::getImportTotal() {
-    int32_t importRaw = read32BitSignedValue(IMPORT_ADDR);
-    return importRaw / 10.0f;
-}
-
-uint32_t ModbusCache::read32BitValue(uint16_t address)
-{
-    uint16_t lowWord = getRegisterValue(address);      // LSW (Least Significant Word)
-    uint16_t highWord = getRegisterValue(address + 1); // MSW (Most Significant Word)
-    return (uint32_t)lowWord | ((uint32_t)highWord << 16);
-}
-
-int32_t ModbusCache::read32BitSignedValue(uint16_t address)
-{
-    uint16_t lowWord = getRegisterValue(address);      // LSW (Least Significant Word)
-    uint16_t highWord = getRegisterValue(address + 1); // MSW (Most Significant Word)
-
-    // Combine the words into a 32-bit signed integer
-    int32_t combined = (int32_t)lowWord | ((int32_t)highWord << 16);
-
-    // Handle the sign bit correctly
-    return combined;
+// Now combine the two functions, and provide a formatted string for a given register address
+String ModbusCache::getFormattedRegisterValue(uint16_t address) {
+    float value = getRegisterScaledValue(address);
+    return formatRegisterValue(address, value);
 }

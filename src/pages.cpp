@@ -69,8 +69,6 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
   server->on("/status.json", HTTP_GET, [rtu, modbusCache, bridge](AsyncWebServerRequest *request) {
         DynamicJsonDocument doc(4096);
 
-        // doc["ESP Uptime (sec)"] = esp_timer_get_time() / 1000000;
-        // Instead of the amove, let's render the uptime in a more human-readable format
         unsigned long uptime = millis() / 1000;
         unsigned long days = uptime / 86400;
         uptime %= 86400;
@@ -93,10 +91,9 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
         doc["Bridge Clients"] = bridge->activeClients();
         doc["Bridge Errors"] = bridge->getErrorCount();
 
-        ModbusClientTCP& modbusTCPClient = modbusCache->getModbusTCPClient();
-        doc["Secondary TCP Messages"] = modbusTCPClient.getMessageCount();
-        doc["Secondary TCP Pending Messages"] = modbusTCPClient.pendingRequests();
-        doc["Secondary TCP Errors"] = modbusTCPClient.getErrorCount();
+        ModbusClientTCPasync* modbusTCPClient = modbusCache->getModbusTCPClient();
+        doc["Secondary TCP Messages"] = modbusTCPClient->getMessageCount();
+        doc["Secondary TCP Errors"] = modbusTCPClient->getErrorCount();
 
         ModbusServerRTU& modbusRTUServer = modbusCache->getModbusRTUServer();
         doc["Server Message"] = modbusRTUServer.getMessageCount();
@@ -106,22 +103,32 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
         doc["Server - Operational"] = modbusCache->getIsOperational() ? "Yes" : "No";
         
 
-        char buffer[50]; // Buffer to hold formatted strings
-        sprintf(buffer, "%.1f V", modbusCache->getVoltage());
-        doc["Voltage"] = buffer;
-        sprintf(buffer, "%.3f A", modbusCache->getAmps());
-        doc["Amps"] = buffer;
-        sprintf(buffer, "%.1f W", modbusCache->getWatts());
-        doc["Watts"] = buffer;
-        sprintf(buffer, "%.3f", modbusCache->getPowerFactor());
-        doc["Power Factor"] = buffer;
-        sprintf(buffer, "%.1f Hz", modbusCache->getFrequency());
-        doc["Frequency"] = buffer;
-        sprintf(buffer, "%.1f kWh", modbusCache->getImportTotal());
-        doc["Import Total"] = buffer;
+        for (auto& address : modbusCache->getDynamicRegisterAddresses()) {
+            String formattedValue = modbusCache->getFormattedRegisterValue(address);
+            auto regDef = modbusCache->getRegisterDefinition(address);
+            if (regDef.has_value()) { // Check if the definition exists
+              // log this pair
+              String& key = regDef->description;
+              String& value = formattedValue; // The value you're adding to the JSON document
+              //String debugMessage = "[JSON Key-Value] Key: " + key + ", Value: " + value;
+              //dbgln(debugMessage);
+              doc[key] = value;
+            }
+        }
+        // Now add unexpected registers, which is a set of addresses that were not defined in the cache
+        // These have no value, so let's make a comma-separated list of addresses
+        String unexpectedRegisters;
+        for (auto& address : modbusCache->getUnexpectedRegisters()) {
+            unexpectedRegisters += String(address) + ", ";
+        }
+        unexpectedRegisters.remove(unexpectedRegisters.length() - 2); // Remove the trailing comma and space
+        doc["Unexpected Registers"] = unexpectedRegisters;
+        
 
         String jsonResponse;
         serializeJson(doc, jsonResponse);
+        // log the JSON response
+        //dbgln("[webserver] JSON response: " + jsonResponse);
         request->send(200, "application/json", jsonResponse);
   });
 
@@ -319,6 +326,17 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
           "</td>"
         "</tr>"
         "</table>"
+        "<h3>Modbus Secondary TCP Server</h3>"
+        "<table>"
+        "<tr>"
+          "<td>"
+            "<label for=\"mb2\">Port Number</label>"
+          "</td>"
+          "<td>");
+    response->printf("<input type=\"number\" min=\"1\" max=\"65535\" id=\"tp3\" name=\"tp3\" value=\"%d\">", config->getTcpPort3());
+    response->print("</td>"
+        "</tr>"
+        "</table>"
         "<hr>"
         "<h3>Serial (Debug)</h3>"
         "<table>"
@@ -389,6 +407,11 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
       auto port = request->getParam("tp2", true)->value().toInt();
       config->setTcpPort2(port);
       dbgln("[webserver] saved port2");
+    }
+    if (request->hasParam("tp3", true)){
+      auto port = request->getParam("tp3", true)->value().toInt();
+      config->setTcpPort3(port);
+      dbgln("[webserver] saved port3");
     }
     if (request->hasParam("sip", true)){
       String targetIP = request->getParam("sip", true)->value();

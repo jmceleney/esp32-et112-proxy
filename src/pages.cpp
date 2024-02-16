@@ -12,26 +12,51 @@ const char STATUS_HTML[] PROGMEM = R"rawliteral(
     <title>ESP32 Modbus Gateway - Status</title>
     <link rel="stylesheet" href="style.css"></head>
     <script>
-        function fetchData() {
-            fetch('/status.json')
-                .then(response => response.json())
-                .then(data => {
-                    const table = document.getElementById('statusTable');
-                    table.innerHTML = ''; // Clear existing data
-                    for (const key in data) {
-                        const row = table.insertRow(-1);
-                        const cell1 = row.insertCell(0);
-                        const cell2 = row.insertCell(1);
-                        cell1.innerHTML = key;
-                        cell2.innerHTML = data[key];
-                    }
-                })
-                .catch(error => console.error('Error:', error));
-        }
+    function fetchData() {
+        fetch('/status.json')
+            .then(response => response.json())
+            .then(data => {
+                const table = document.getElementById('statusTable');
+                table.innerHTML = ''; // Clear existing table content
 
-        setInterval(fetchData, 3000); // Refresh every 3 seconds
-        document.addEventListener('DOMContentLoaded', fetchData); // Initial fetch
-    </script>
+                // Add table header
+                const header = table.createTHead();
+                const headerRow = header.insertRow(0);
+                const headers = ["Name", "Value", "Low", "High"];
+                headers.forEach(headerText => {
+                    const cell = headerRow.insertCell(-1);
+                    cell.textContent = headerText;
+                });
+
+                // Ensure the table body is clear
+                let tbody = table.getElementsByTagName('tbody')[0];
+                if (!tbody) {
+                    tbody = table.createTBody();
+                } else {
+                    tbody.innerHTML = ''; // Clear existing table body content
+                }
+
+                // Assuming 'data' is the array under a key like 'data' in the JSON response
+                data.data.forEach(item => {
+                    const row = tbody.insertRow(-1);
+                    const cellName = row.insertCell(0);
+                    const cellValue = row.insertCell(1);
+                    const cellLow = row.insertCell(2);
+                    const cellHigh = row.insertCell(3);
+                    
+                    cellName.textContent = item.name;
+                    cellValue.textContent = item.value;
+                    cellLow.textContent = item.low;
+                    cellHigh.textContent = item.high;
+                });
+            })
+            .catch(error => console.error('Error:', error));
+    }
+
+    setInterval(fetchData, 3000); // Refresh every 3 seconds
+    document.addEventListener('DOMContentLoaded', fetchData); // Initial fetch
+</script>
+
 </head>
 <body>
     <h2>ESP32 Modbus Gateway</h2>
@@ -67,70 +92,83 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
 
   // Endpoint to serve JSON data
   server->on("/status.json", HTTP_GET, [rtu, modbusCache, bridge](AsyncWebServerRequest *request) {
-        DynamicJsonDocument doc(4096);
+    DynamicJsonDocument doc(4096);
+    JsonArray data = doc.createNestedArray("data");
 
-        unsigned long uptime = millis() / 1000;
-        unsigned long days = uptime / 86400;
-        uptime %= 86400;
-        unsigned long hours = uptime / 3600;
-        uptime %= 3600;
-        unsigned long minutes = uptime / 60;
-        unsigned long seconds = uptime % 60;
-        char uptimeStr[50];
-        sprintf(uptimeStr, "%lu days, %02lu:%02lu:%02lu", days, hours, minutes, seconds);
-        doc["ESP Uptime"] = uptimeStr;
-        doc["ESP SSID"] = WiFi.SSID();
-        doc["ESP RSSI"] = WiFi.RSSI();
-        doc["ESP WiFi Quality"] = WiFiQuality(WiFi.RSSI());
-        doc["ESP MAC"] = WiFi.macAddress();
-        doc["ESP IP"] = WiFi.localIP().toString();
-        doc["Primary RTU Messages"] = rtu->getMessageCount();
-        doc["Primary RTU Pending Messages"] = rtu->pendingRequests();
-        doc["Primary RTU Errors"] = rtu->getErrorCount();
-        doc["Bridge Message"] = bridge->getMessageCount();
-        doc["Bridge Clients"] = bridge->activeClients();
-        doc["Bridge Errors"] = bridge->getErrorCount();
+    // Add system information as objects to the array
+    auto addSystemInfo = [&data](const char* name, const String& value) {
+        JsonObject obj = data.createNestedObject();
+        obj["name"] = name;
+        obj["value"] = value;
+    };
 
-        ModbusClientTCPasync* modbusTCPClient = modbusCache->getModbusTCPClient();
-        doc["Secondary TCP Messages"] = modbusTCPClient->getMessageCount();
-        doc["Secondary TCP Errors"] = modbusTCPClient->getErrorCount();
+    unsigned long uptime = millis() / 1000;
+    unsigned long days = uptime / 86400;
+    uptime %= 86400;
+    unsigned long hours = uptime / 3600;
+    uptime %= 3600;
+    unsigned long minutes = uptime / 60;
+    unsigned long seconds = uptime % 60;
+    char uptimeStr[50];
+    sprintf(uptimeStr, "%lu days, %02lu:%02lu:%02lu", days, hours, minutes, seconds);
 
-        ModbusServerRTU& modbusRTUServer = modbusCache->getModbusRTUServer();
-        doc["Server Message"] = modbusRTUServer.getMessageCount();
-        doc["Server Errors"] = modbusRTUServer.getErrorCount();
-        doc["Server - Static Registers Fetched"] = modbusCache->getStaticRegistersFetched() ? "Yes" : "No";
-        doc["Server - Dynamic Registers Fetched"] = modbusCache->getDynamicRegistersFetched() ? "Yes" : "No";
-        doc["Server - Operational"] = modbusCache->getIsOperational() ? "Yes" : "No";
-        
+    addSystemInfo("ESP Uptime", uptimeStr);
+    addSystemInfo("ESP SSID", WiFi.SSID());
+    addSystemInfo("ESP RSSI", String(WiFi.RSSI()));
+    addSystemInfo("ESP WiFi Quality", String(WiFiQuality(WiFi.RSSI())));
+    addSystemInfo("ESP MAC", WiFi.macAddress());
+    addSystemInfo("ESP IP", WiFi.localIP().toString());
+    addSystemInfo("Primary RTU Messages", String(rtu->getMessageCount()));
+    addSystemInfo("Primary RTU Pending Messages", String(rtu->pendingRequests()));
+    addSystemInfo("Primary RTU Errors", String(rtu->getErrorCount()));
+    addSystemInfo("Bridge Message", String(bridge->getMessageCount()));
+    addSystemInfo("Bridge Clients", String(bridge->activeClients()));
+    addSystemInfo("Bridge Errors", String(bridge->getErrorCount()));
 
-        for (auto& address : modbusCache->getDynamicRegisterAddresses()) {
-            String formattedValue = modbusCache->getFormattedRegisterValue(address);
-            auto regDef = modbusCache->getRegisterDefinition(address);
-            if (regDef.has_value()) { // Check if the definition exists
-              // log this pair
-              String& key = regDef->description;
-              String& value = formattedValue; // The value you're adding to the JSON document
-              //String debugMessage = "[JSON Key-Value] Key: " + key + ", Value: " + value;
-              //dbgln(debugMessage);
-              doc[key] = value;
-            }
+    // Add Modbus information as objects to the array
+    ModbusClientTCPasync* modbusTCPClient = modbusCache->getModbusTCPClient();
+    addSystemInfo("Secondary TCP Messages", String(modbusTCPClient->getMessageCount()));
+    addSystemInfo("Secondary TCP Errors", String(modbusTCPClient->getErrorCount()));
+
+    ModbusServerRTU& modbusRTUServer = modbusCache->getModbusRTUServer();
+    addSystemInfo("Server Message", String(modbusRTUServer.getMessageCount()));
+    addSystemInfo("Server Errors", String(modbusRTUServer.getErrorCount()));
+    addSystemInfo("Server - Static Registers Fetched", modbusCache->getStaticRegistersFetched() ? "Yes" : "No");
+    addSystemInfo("Server - Dynamic Registers Fetched", modbusCache->getDynamicRegistersFetched() ? "Yes" : "No");
+    addSystemInfo("Server - Operational", modbusCache->getIsOperational() ? "Yes" : "No");
+
+    // Add dynamic registers with low and high watermarks
+    for (auto& address : modbusCache->getDynamicRegisterAddresses()) {
+        String formattedValue = modbusCache->getFormattedRegisterValue(address);
+        std::pair<String, String> waterMarks = modbusCache->getFormattedWaterMarks(address);
+
+        auto regDef = modbusCache->getRegisterDefinition(address);
+        if (regDef.has_value()) {
+            JsonObject obj = data.createNestedObject();
+            obj["name"] = regDef->description;
+            obj["value"] = formattedValue;
+            obj["low"] = waterMarks.second;  // Low watermark
+            obj["high"] = waterMarks.first; // High watermark
         }
-        // Now add unexpected registers, which is a set of addresses that were not defined in the cache
-        // These have no value, so let's make a comma-separated list of addresses
-        String unexpectedRegisters;
-        for (auto& address : modbusCache->getUnexpectedRegisters()) {
-            unexpectedRegisters += String(address) + ", ";
-        }
+    }
+    // Show insaneCounter
+    addSystemInfo("Bogus Register Count", String(modbusCache->getInsaneCounter()));
+
+    // Add unexpected registers as a single entry
+    String unexpectedRegisters;
+    for (auto& address : modbusCache->getUnexpectedRegisters()) {
+        unexpectedRegisters += String(address) + ", ";
+    }
+    if (!unexpectedRegisters.isEmpty()) {
         unexpectedRegisters.remove(unexpectedRegisters.length() - 2); // Remove the trailing comma and space
-        doc["Unexpected Registers"] = unexpectedRegisters;
-        
+        addSystemInfo("Unexpected Registers", unexpectedRegisters);
+    }
 
-        String jsonResponse;
-        serializeJson(doc, jsonResponse);
-        // log the JSON response
-        //dbgln("[webserver] JSON response: " + jsonResponse);
-        request->send(200, "application/json", jsonResponse);
-  });
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    request->send(200, "application/json", jsonResponse);
+});
+
 
   server->on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /reboot");

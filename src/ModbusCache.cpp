@@ -71,7 +71,7 @@ void ModbusCache::begin()
     modbusRTUServer.begin(Serial1); // or modbusRTUServer.begin(Serial1, -1) to specify coreID
     MBserver.start(config.getTcpPort3(), 20, config.getTcpTimeout());
 
-    modbusTCPClient->setMaxInflightRequests(15);
+    modbusTCPClient->setMaxInflightRequests(6);
     modbusTCPClient->connect(serverIP, serverPort);
     modbusTCPClient->onDataHandler(&ModbusCache::handleData);
     modbusTCPClient->onErrorHandler(&ModbusCache::handleError);
@@ -129,9 +129,9 @@ std::vector<uint16_t> ModbusCache::getRegisterValues(uint16_t startAddress, uint
         if (is32BitRegister(address)) {
             // Handle 32-bit register
             uint32_t value32 = read32BitRegister(address);
-            auto [high, low] = split32BitRegister(value32);
-            values.push_back(low);
-            values.push_back(high);
+            Uint16Pair pair = split32BitRegister(value32);
+            values.push_back(pair.lowWord);
+            values.push_back(pair.highWord);
             ++i; // Skip next address since it's part of the 32-bit value
         } else {
             // Handle 16-bit register
@@ -157,8 +157,11 @@ uint32_t ModbusCache::read32BitRegister(uint16_t address) {
     return 0; // Placeholder for non-existent register
 }
 
-std::pair<uint16_t, uint16_t> ModbusCache::split32BitRegister(uint32_t value) {
-    return std::make_pair(static_cast<uint16_t>(value >> 16), static_cast<uint16_t>(value & 0xFFFF));
+Uint16Pair ModbusCache::split32BitRegister(uint32_t value) {
+    Uint16Pair result;
+    result.highWord = static_cast<uint16_t>(value >> 16); // Extract the high word
+    result.lowWord = static_cast<uint16_t>(value & 0xFFFF); // Extract the low word
+    return result;
 }
 
 void ModbusCache::update() {
@@ -167,8 +170,9 @@ void ModbusCache::update() {
     if (currentMillis - lastPollStart >= update_interval) {
         lastPollStart = currentMillis;
 
-        if (requestMap.size() > 8) {
-            dbgln("Skipping update due to more than 8 pending requests");
+        if (requestMap.size() > 2) {
+            dbgln("Skipping update due to more than 2 pending requests");
+            yield();
             return;
         }
 
@@ -186,22 +190,127 @@ void ModbusCache::update() {
     }
 }
 
-void ModbusCache::setRegisterValue(uint16_t address, uint32_t value, bool is32Bit) {
+void ModbusCache::updateWaterMarks(uint16_t address, uint32_t value, bool is32Bit) {
+    auto it = registerDefinitions.find(address);
+    if (it == registerDefinitions.end()) {
+        // Handle error or log: register definition not found
+        return;
+    }
+    const ModbusRegister& reg = it->second;
+
+    // Convert the value to signed or unsigned based on the register definition before comparison
     if (is32Bit) {
-        // For 32-bit registers, update the whole 32-bit value atomically
+        if (reg.type == RegisterType::UINT32) {
+            // Directly compare and update without needing to read the current value
+            if (highWaterMarks.find(address) == highWaterMarks.end() || value > highWaterMarks[address]) {
+                highWaterMarks[address] = value;
+            }
+            if (lowWaterMarks.find(address) == lowWaterMarks.end() || value < lowWaterMarks[address]) {
+                lowWaterMarks[address] = value;
+            }
+        } else if (reg.type == RegisterType::INT32) {
+            int32_t signedValue = static_cast<int32_t>(value);
+            // Direct comparison without reading the current value again
+            if (highWaterMarks.find(address) == highWaterMarks.end() || signedValue > static_cast<int32_t>(highWaterMarks[address])) {
+                highWaterMarks[address] = static_cast<uint32_t>(signedValue);
+            }
+            if (lowWaterMarks.find(address) == lowWaterMarks.end() || signedValue < static_cast<int32_t>(lowWaterMarks[address])) {
+                lowWaterMarks[address] = static_cast<uint32_t>(signedValue);
+            }
+        }
+    } else { // 16-bit logic
+        if (reg.type == RegisterType::UINT16) {
+            uint16_t newValue = static_cast<uint16_t>(value);
+            // Again, direct comparison without the need for current value
+            if (highWaterMarks.find(address) == highWaterMarks.end() || newValue > static_cast<uint16_t>(highWaterMarks[address])) {
+                highWaterMarks[address] = newValue;
+            }
+            if (lowWaterMarks.find(address) == lowWaterMarks.end() || newValue < static_cast<uint16_t>(lowWaterMarks[address])) {
+                lowWaterMarks[address] = newValue;
+            }
+        } else if (reg.type == RegisterType::INT16) {
+            int16_t signedValue = static_cast<int16_t>(value);
+            // And no need for current value in signed 16-bit logic
+            if (highWaterMarks.find(address) == highWaterMarks.end() || signedValue > static_cast<int16_t>(highWaterMarks[address])) {
+                highWaterMarks[address] = static_cast<uint16_t>(signedValue);
+            }
+            if (lowWaterMarks.find(address) == lowWaterMarks.end() || signedValue < static_cast<int16_t>(lowWaterMarks[address])) {
+                lowWaterMarks[address] = static_cast<uint16_t>(signedValue);
+            }
+        }
+    }
+}
+
+bool ModbusCache::checkNewRegisterValue(uint16_t address, uint32_t proposedRawValue) {
+    auto regIt = registerDefinitions.find(address);
+    if (regIt == registerDefinitions.end()) {
+        return true;
+    }
+    const ModbusRegister& reg = regIt->second;
+    float proposedValue = getScaledValueFromRegister(reg, proposedRawValue);
+    float currentValue = getRegisterScaledValue(address);
+
+    // If the register is uninitialized (current value is 0), accept the new value
+    if (currentValue == 0.0) {
+        return true;
+    }
+
+    switch (reg.unit.value_or(UnitType::var)) { // Assuming 'var' as default or no unit type
+        case UnitType::KWh:
+        case UnitType::KVarh: {
+            float diff = std::abs(proposedValue - currentValue);
+            // Accept only if the difference is <= 30
+            return diff <= 30;
+        }
+        case UnitType::W:
+        case UnitType::VA:
+        case UnitType::var: {
+            // Value must be within -25000 to +25000
+            return proposedValue >= -25000 && proposedValue <= 25000;
+        }
+        case UnitType::Hz: {
+            // Value must be within 40 to 65
+            return proposedValue >= 40 && proposedValue <= 65;
+        }
+        case UnitType::A: {
+            // Value must be within -150 to +150
+            return proposedValue >= -150 && proposedValue <= 150;
+        }
+        case UnitType::V:
+            // "V" should be a positive number between 205 and 265
+            if (proposedValue < 205.0 || proposedValue > 265.0) return false;
+            return true;
+        default:
+            // If unit type does not require specific checks, or is unrecognized, accept the value
+            return true;
+    }
+}
+
+
+void ModbusCache::setRegisterValue(uint16_t address, uint32_t value, bool is32Bit) {
+    bool sane_value = checkNewRegisterValue(address, value);
+    if (!sane_value) {
+        insaneCounter++;
+        dbgln("New value for register " + String(address) + " is not sane. Rejecting...");
+        return;
+    }
+    if (is32Bit) {
         if (is32BitRegister(address)) {
-            register32BitValues[address] = value;
+            if (register32BitValues[address] != value) { // Check if value has changed
+                register32BitValues[address] = value;
+                updateWaterMarks(address, value, is32Bit);
+            }
         } else {
-            // Log or handle the error if trying to write a 32-bit value to a non-32-bit register
             dbgln("Error: Attempt to write 32-bit value to non-32-bit register at address: " + String(address));
         }
     } else {
-        // For 16-bit registers, update normally
         if (is16BitRegister(address)) {
-            // Cast to 16-bit to ensure value fits into 16-bit register
-            register16BitValues[address] = static_cast<uint16_t>(value);
+            uint16_t newValue = static_cast<uint16_t>(value);
+            if (register16BitValues[address] != newValue) { // Check if value has changed
+                register16BitValues[address] = newValue;
+                updateWaterMarks(address, newValue, is32Bit);
+            }
         } else {
-            // Log or handle the error if trying to write to an address not designated for 16-bit values
             dbgln("Error: Attempt to write 16-bit value to non-16-bit register or 32-bit register at address: " + String(address));
         }
     }
@@ -533,69 +642,30 @@ ModbusClientTCPasync* ModbusCache::getModbusTCPClient() {
     return modbusTCPClient;
 }
 
-
-uint32_t ModbusCache::read32BitValue(uint16_t address) {
-    auto values = getRegisterValues(address, 2); // Fetch two 16-bit registers: MSW and LSW
-
-    if (values.size() < 2) {
-        // Error handling: not enough data returned
-        dbgln("Error: Expected 2 registers, received less.");
-        return 0;
-    }
-
-    // Assuming the first value is the MSW and the second is the LSW, maintaining endianness.
-    uint32_t highWord = static_cast<uint32_t>(values[0]);
-    uint32_t lowWord = static_cast<uint32_t>(values[1]);
-
-    // Correctly combine the words into a 32-bit value
-    return (highWord << 16) | lowWord;
-}
-
-
-int32_t ModbusCache::read32BitSignedValue(uint16_t address) {
-    // Fetch two consecutive 16-bit registers starting from the specified address.
-    auto values = getRegisterValues(address, 2); // Fetches two registers: high word and low word
-
-    if (values.size() < 2) {
-        // Error handling: not enough data returned
-        dbgln("Error: Expected 2 registers, received less.");
-        return 0; // or another appropriate error value
-    }
-
-    // Combine the high word and low word into a 32-bit unsigned integer
-    uint32_t combined = ((uint32_t)values[0] << 16) | (uint32_t)values[1];
-
-    // Interpret the combined value as a 32-bit signed integer
-    int32_t signedValue = static_cast<int32_t>(combined);
-    return signedValue;
-}
-
-float ModbusCache::getRegisterScaledValue(uint16_t address) {
-    auto it = registerDefinitions.find(address);
-    if (it == registerDefinitions.end()) {
-        return 0.0; // Register not found
-    }
-    const ModbusRegister& reg = it->second;
+float ModbusCache::getScaledValueFromRegister(const ModbusRegister& reg, uint32_t rawValue) {
     float value = 0.0;
 
-    if (is32BitRegister(address)) {
-        // For 32-bit registers, differentiate between signed and unsigned values
-        if (reg.type == RegisterType::UINT32) {
-            value = static_cast<float>(read32BitRegister(address));
-        } else if (reg.type == RegisterType::INT32) {
-            // Cast to int32_t before float to preserve sign
-            value = static_cast<float>(static_cast<int32_t>(read32BitRegister(address)));
-        }
-    } else if (is16BitRegister(address)) {
-        // For 16-bit registers, differentiate between signed and unsigned values
-        if (reg.type == RegisterType::UINT16) {
-            value = static_cast<float>(read16BitRegister(address));
-        } else if (reg.type == RegisterType::INT16) {
-            // Cast to int16_t before float to preserve sign
-            value = static_cast<float>(static_cast<int16_t>(read16BitRegister(address)));
-        }
+    // Use RegisterType to determine the appropriate conversion
+    switch (reg.type) {
+        case RegisterType::UINT32:
+            value = static_cast<float>(rawValue);
+            break;
+        case RegisterType::INT32:
+            value = static_cast<float>(static_cast<int32_t>(rawValue));
+            break;
+        case RegisterType::UINT16:
+            value = static_cast<float>(static_cast<uint16_t>(rawValue));
+            break;
+        case RegisterType::INT16:
+            value = static_cast<float>(static_cast<int16_t>(rawValue));
+            break;
+        // Add cases for other RegisterType enums if necessary
+        default:
+            // Handle unexpected register type or log an error
+            break;
     }
 
+    // Apply scaling factor if present
     if (reg.scalingFactor.has_value()) {
         value *= reg.scalingFactor.value();
     }
@@ -604,24 +674,38 @@ float ModbusCache::getRegisterScaledValue(uint16_t address) {
 }
 
 
-String ModbusCache::formatRegisterValue(uint16_t address, float value) {
+float ModbusCache::getRegisterScaledValue(uint16_t address) {
     auto it = registerDefinitions.find(address);
     if (it == registerDefinitions.end()) {
-        return "N/A"; // Register not found
+        return 0.0; // Register not found
     }
     const ModbusRegister& reg = it->second;
+    uint32_t rawValue = 0;
+
+    // Read the raw value based on the register's bit width
+    if (is32BitRegister(address)) {
+        rawValue = read32BitRegister(address);
+    } else if (is16BitRegister(address)) {
+        rawValue = static_cast<uint32_t>(read16BitRegister(address));
+    }
+
+    // Use the new function to get the scaled value
+    return getScaledValueFromRegister(reg, rawValue);
+}
+
+String ModbusCache::formatRegisterValue(const ModbusRegister& reg, float value) {
     char buffer[50];
     if (reg.unit.has_value()) {
         switch (reg.unit.value()) {
             case UnitType::V: snprintf(buffer, sizeof(buffer), "%.1f V", value); break;
             case UnitType::A: snprintf(buffer, sizeof(buffer), "%.3f A", value); break;
             case UnitType::W: snprintf(buffer, sizeof(buffer), "%.1f W", value); break;
-            case UnitType::PF: snprintf(buffer, sizeof(buffer),"%.3f", value); break;
-            case UnitType::Hz: snprintf(buffer, sizeof(buffer),"%.1f Hz", value); break;
-            case UnitType::KWh: snprintf(buffer, sizeof(buffer),"%.1f kWh", value); break;
-            case UnitType::KVarh: snprintf(buffer, sizeof(buffer),"%.1f kVARh", value); break;
-            case UnitType::VA: snprintf(buffer, sizeof(buffer),"%.1f VA", value); break;
-            case UnitType::var: snprintf(buffer, sizeof(buffer),"%.1f var", value); break;
+            case UnitType::PF: snprintf(buffer, sizeof(buffer), "%.3f", value); break;
+            case UnitType::Hz: snprintf(buffer, sizeof(buffer), "%.1f Hz", value); break;
+            case UnitType::KWh: snprintf(buffer, sizeof(buffer), "%.1f kWh", value); break;
+            case UnitType::KVarh: snprintf(buffer, sizeof(buffer), "%.1f kVARh", value); break;
+            case UnitType::VA: snprintf(buffer, sizeof(buffer), "%.1f VA", value); break;
+            case UnitType::var: snprintf(buffer, sizeof(buffer), "%.1f var", value); break;
             // Add more units as needed
             default: snprintf(buffer, sizeof(buffer), "%f", value);
         }
@@ -631,8 +715,58 @@ String ModbusCache::formatRegisterValue(uint16_t address, float value) {
     return String(buffer);
 }
 
+String ModbusCache::formatRegisterValue(uint16_t address, float value) {
+    auto it = registerDefinitions.find(address);
+    if (it == registerDefinitions.end()) {
+        return "N/A"; // Register not found
+    }
+    const ModbusRegister& reg = it->second;
+    return formatRegisterValue(reg, value); // Use the new function
+}
+
 // Now combine the two functions, and provide a formatted string for a given register address
 String ModbusCache::getFormattedRegisterValue(uint16_t address) {
     float value = getRegisterScaledValue(address);
     return formatRegisterValue(address, value);
+}
+
+ScaledWaterMarks ModbusCache::getRegisterWaterMarks(uint16_t address) {
+    ScaledWaterMarks waterMarks{0.0f, 0.0f}; // Initialize to default values
+
+    auto regIt = registerDefinitions.find(address);
+    if (regIt == registerDefinitions.end()) {
+        // Handle error: Register not found
+        return waterMarks;
+    }
+    const ModbusRegister& reg = regIt->second;
+
+    // Assuming highWaterMarks and lowWaterMarks store raw values
+    uint32_t rawHighMark = highWaterMarks.find(address) != highWaterMarks.end() ? highWaterMarks[address] : 0;
+    uint32_t rawLowMark = lowWaterMarks.find(address) != lowWaterMarks.end() ? lowWaterMarks[address] : 0;
+
+    // Scale the high and low water marks using the new function
+    waterMarks.highWaterMark = getScaledValueFromRegister(reg, rawHighMark);
+    waterMarks.lowWaterMark = getScaledValueFromRegister(reg, rawLowMark);
+
+    return waterMarks;
+}
+
+std::pair<String, String> ModbusCache::getFormattedWaterMarks(uint16_t address) {
+    // First, fetch the scaled water marks
+    ScaledWaterMarks waterMarks = getRegisterWaterMarks(address);
+
+    // Fetch the register definition to use in formatting
+    auto it = registerDefinitions.find(address);
+    if (it == registerDefinitions.end()) {
+        // If the register isn't found, return a default pair of empty strings
+        return std::make_pair(String(""), String(""));
+    }
+    const ModbusRegister& reg = it->second;
+
+    // Format the high and low water marks
+    String formattedHigh = formatRegisterValue(reg, waterMarks.highWaterMark);
+    String formattedLow = formatRegisterValue(reg, waterMarks.lowWaterMark);
+
+    // Return the formatted water marks as a pair of strings
+    return std::make_pair(formattedHigh, formattedLow);
 }

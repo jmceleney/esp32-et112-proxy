@@ -24,6 +24,11 @@ enum class RegisterType {
     INT32
 };
 
+struct Uint16Pair {
+    uint16_t highWord;
+    uint16_t lowWord;
+};
+
 enum class UnitType {
     V,
     A,
@@ -48,6 +53,11 @@ struct ModbusRegister {
         : address(addr), type(t), description(desc), scalingFactor(scale), unit(unitType) {}    
 };
 
+struct ScaledWaterMarks {
+    float highWaterMark;
+    float lowWaterMark;
+};
+
 class ModbusCache {
 public:
     ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters, 
@@ -60,6 +70,7 @@ public:
     std::vector<uint16_t> getRegisterValues(uint16_t startAddress, uint16_t count);
     //uint16_t getRegisterValue(uint16_t address);
     uint16_t update_interval = 500;
+    bool checkNewRegisterValue(uint16_t address, uint32_t proposedRawValue);
     void setRegisterValue(uint16_t address, uint32_t value, bool is32Bit = false);
     static ModbusMessage respondFromCache(ModbusMessage request);
     // Getter methods
@@ -80,6 +91,9 @@ public:
     std::set<uint16_t> getUnexpectedRegisters() const {
         return unexpectedRegisters;
     }
+    uint32_t getInsaneCounter() const {
+        return insaneCounter;
+    }
     std::optional<ModbusRegister> getRegisterDefinition(uint16_t address) const {
         auto it = registerDefinitions.find(address);
         if (it != registerDefinitions.end()) {
@@ -87,20 +101,29 @@ public:
         }
         return std::nullopt; // Register definition not found
     }
+    float getScaledValueFromRegister(const ModbusRegister& reg, uint32_t rawValue);
     float getRegisterScaledValue(uint16_t address);
+    ScaledWaterMarks getRegisterWaterMarks(uint16_t address);
+    String formatRegisterValue(const ModbusRegister& reg, float value);
     String formatRegisterValue(uint16_t address, float value);
     String getFormattedRegisterValue(uint16_t address);
+    std::pair<String, String> getFormattedWaterMarks(uint16_t address);
     
 
 private:
     std::vector<ModbusRegister> registers; // All registers
     std::map<uint16_t, uint16_t> register16BitValues; // Values for 16-bit registers
     std::map<uint16_t, uint32_t> register32BitValues; // Values for 32-bit registers
+    std::map<uint16_t, uint32_t> highWaterMarks; // Use uint32_t to accommodate 32-bit registers
+    std::map<uint16_t, uint32_t> lowWaterMarks; // Same as above
     std::set<uint16_t> dynamicRegisterAddresses; // Addresses of dynamic registers
     std::set<uint16_t> staticRegisterAddresses; // Addresses of static registers
     std::set<uint16_t> unexpectedRegisters; // Addresses of registers not defined in the cache
+    uint32_t insaneCounter = 0;
+
     std::map<uint16_t, const ModbusRegister> registerDefinitions;
 
+    void updateWaterMarks(uint16_t address, uint32_t value, bool is32Bit);
     bool isStaticRegister(uint16_t registerNumber) {
         // Check if the register number is in the staticRegisterAddresses set
         return staticRegisterAddresses.find(registerNumber) != staticRegisterAddresses.end();
@@ -136,7 +159,7 @@ private:
                                       const std::vector<ModbusRegister>& staticRegisters);
     void write16BitRegister(uint16_t address, uint16_t value);
     void write32BitRegister(uint16_t address, uint32_t value);
-    std::pair<uint16_t, uint16_t> split32BitRegister(uint32_t value);
+    Uint16Pair split32BitRegister(uint32_t value);
     String serverIPString;
     IPAddress currentIPAddress;
     unsigned long lastPollStart = 0;  // Time of the last poll start
@@ -159,10 +182,6 @@ private:
     unsigned long lastSuccessfulUpdate;
     bool isOperational;
     void updateServerStatus();
-    // Utility method to read a 32-bit value from two 16-bit registers
-    uint32_t read32BitValue(uint16_t address);
-    int32_t read32BitSignedValue(uint16_t address);
-
     std::unordered_set<uint16_t> fetchedStaticRegisters;
     std::unordered_set<uint16_t> fetchedDynamicRegisters;
     bool staticRegistersFetched = false; // Flag to indicate completion of static register fetching

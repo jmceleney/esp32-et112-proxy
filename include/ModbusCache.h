@@ -6,14 +6,18 @@
 #include "ModbusServerTCPasync.h"
 #include "config.h"
 #include <WiFi.h>
-//#include <ModbusClientTCP.h>
 #include <ModbusTCPWrapper.h>
+#include <ModbusRTUWrapper.h>
 #include <map>
 #include <set>
 #include <queue>
 #include <optional>
 #include <IPAddress.h>
 #include <unordered_set>
+//#include <SoftwareSerial.h>
+
+// tx 19
+// rx 18
 
 #define MAX_REGISTERS 400
 
@@ -21,7 +25,8 @@ enum class RegisterType {
     UINT16,
     INT16,
     UINT32,
-    INT32
+    INT32,
+    FLOAT
 };
 
 struct Uint16Pair {
@@ -47,10 +52,14 @@ struct ModbusRegister {
     RegisterType type;
     String description;
     std::optional<double> scalingFactor;
-    std::optional<UnitType> unit; // Now optional  
+    std::optional<UnitType> unit;
+    std::optional<uint16_t> backendAddress;
 
-    ModbusRegister(uint16_t addr, RegisterType t, const String& desc, std::optional<double> scale = std::nullopt, std::optional<UnitType> unitType = std::nullopt)
-        : address(addr), type(t), description(desc), scalingFactor(scale), unit(unitType) {}    
+    ModbusRegister(uint16_t addr, RegisterType t, const String& desc,
+                   std::optional<double> scale = std::nullopt,
+                   std::optional<UnitType> unitType = std::nullopt,
+                   std::optional<uint16_t> backendAddr = std::nullopt)
+        : address(addr), type(t), description(desc), scalingFactor(scale), unit(unitType), backendAddress(backendAddr) {}
 };
 
 struct ScaledWaterMarks {
@@ -75,6 +84,7 @@ public:
     static ModbusMessage respondFromCache(ModbusMessage request);
     // Getter methods
     ModbusServerRTU& getModbusRTUServer();
+    ModbusClientRTU* getModbusRTUClient();
     ModbusClientTCPasync* getModbusTCPClient();
     bool getIsOperational() const {
         return isOperational;
@@ -138,7 +148,7 @@ private:
         auto it = registerDefinitions.find(address);
         if (it != registerDefinitions.end()) {
             // Check if the register type is either UINT32 or INT32
-            return it->second.type == RegisterType::UINT32 || it->second.type == RegisterType::INT32;
+            return it->second.type == RegisterType::UINT32 || it->second.type == RegisterType::INT32 || it->second.type == RegisterType::FLOAT;
         }
         return false; // Address not found or not a 32-bit register
     }
@@ -167,6 +177,7 @@ private:
     uint16_t serverPort; // Port number of the Modbus TCP server
     ModbusServerRTU modbusRTUServer;
     ModbusServerTCPasync MBserver;
+    ModbusClientRTU* modbusRTUClient;
     ModbusClientTCPasync* modbusTCPClient;
     void fetchFromRemote(const std::set<uint16_t>& regAddresses);
     void sendModbusRequest(uint16_t startAddress, uint16_t regCount);

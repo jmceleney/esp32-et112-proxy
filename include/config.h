@@ -3,7 +3,8 @@
     #include <Arduino.h>
     #include <Preferences.h>
     #define debugSerial Serial
-    #define modbusSerial Serial2
+    #define modbusServerSerial Serial1
+    #define modbusClientSerial Serial2
     // Include the WiFi library
     #define DEBUG
 
@@ -23,6 +24,7 @@
             int8_t _modbusRtsPin2;
             unsigned long _serialBaudRate;
             uint32_t _serialConfig;
+            bool _clientIsRTU;
         public:
             Config();
             void begin(Preferences *prefs);
@@ -67,6 +69,8 @@
             void setSerialParity(uint8_t value);
             uint8_t getSerialStopBits();
             void setSerialStopBits(uint8_t value);
+            bool getClientIsRTU();
+            void setClientIsRTU(bool value);
     };
     #ifdef DEBUG
     #define dbg(x...) debugSerial.print(x);

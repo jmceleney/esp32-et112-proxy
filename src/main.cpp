@@ -4,8 +4,8 @@
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
 #include <Logging.h>
-#include <ModbusBridgeWiFi.h>
-#include <ModbusRTUWrapper.h>
+//#include <ModbusBridgeWiFi.h>
+
 #include "ModbusCache.h"
 #include "config.h"
 #include "pages.h"
@@ -27,8 +27,6 @@ extern "C" void app_error_handler(esp_err_t error)
 AsyncWebServer webServer(80);
 Config config;
 Preferences prefs;
-ModbusClientRTU *MBclient;
-ModbusBridgeWiFi MBbridge;
 WiFiManager wm;
 
 std::vector<ModbusRegister> dynamicRegisters = {
@@ -55,6 +53,7 @@ std::vector<ModbusRegister> staticRegisters = {
     {771, RegisterType::UINT16, "Revision"},
     {4112, RegisterType::UINT32, "Integration Time for dmd calc"},
     {4355, RegisterType::INT16, "Measurement mode"},
+    {8193,RegisterType::UINT16, "RS485 baud rate"},
     {20480, RegisterType::UINT16, "Serial number 1"},
     {20481, RegisterType::UINT16, "Serial number 2"},
     {20482, RegisterType::UINT16, "Serial number 3"},
@@ -64,6 +63,53 @@ std::vector<ModbusRegister> staticRegisters = {
     {20486, RegisterType::UINT16, "Serial number 7"},
 };
 
+/*
+Easton SDM120 registers
+Modicom, Parameter, Length(bytes), units, format, high, low
+30001,Voltage,4,V,Float,00,00
+30007,Current,4,A,Float,00,06
+30013,Active power,4,W,Float,00,0C
+30019,Apparent power,4,VA,Float,00,12
+30025,Reactive power,4,VAr,Float,00,18
+30031,Power factor,4,None,Float,00,1E
+30071,Frequency,4,Hz,Float,00,46
+30073,Import active energy,4,kWh,Float,00,48
+30075,Export active energy,4,kWh,Float,00,4A
+30077,Import reactive energy,4,kvarh,Float,00,4C
+30079,Export reactive energy,4,kvarh,Float,00,4E
+30085,Total system power demand,4,W,Float,00,54
+30087,Maximum total system power demand,4,W,Float,00,56
+30089,Import system power demand,4,W,Float,00,58
+30091,Maximum Import system power demand,4,W,Float,00,5A
+30093,Export system power demand,4,W,Float,00,5C
+30095,Maximum Export system power demand,4,W,Float,00,5E
+30259,current demand,4,A,Float,01,02
+30265,Maximum current demand,4,A,Float,01,08
+30343,Total active energy,4,kWh,Float,01,56
+30345,Total reactive energy,4,Kvarh,Float,01,58
+
+*/
+
+// Now we make a map from the SDM120 back to the main registers above
+
+std::vector<ModbusRegister> sdm120Registers = {
+  {0, RegisterType::FLOAT, "Volts", 1, UnitType::V, 0},
+  {6, RegisterType::FLOAT, "Amps", 1, UnitType::A, 2},
+  {12, RegisterType::FLOAT, "Watts", 1, UnitType::W, 4},
+  {18, RegisterType::FLOAT, "VA", 1, UnitType::VA, 6},
+  {24, RegisterType::FLOAT, "Volt Amp Reactive", 1, UnitType::var, 8},
+  {30, RegisterType::FLOAT, "Power Factor", 1, UnitType::PF, 14},
+  {70, RegisterType::FLOAT, "Frequency", 1, UnitType::Hz, 15},
+  {72, RegisterType::FLOAT, "Energy kWh (+)", 1, UnitType::KWh, 16},
+  {74, RegisterType::FLOAT, "Energy kWh (-)", 1, UnitType::KWh, 32},
+  {76, RegisterType::FLOAT, "Reactive Power Kvarh (+)", 1, UnitType::KVarh, 18},
+  {78, RegisterType::FLOAT, "Reactive Power Kvarh (-)", 1, UnitType::KVarh, 34},
+  {84, RegisterType::FLOAT, "W Demand", 1, UnitType::W, 10},
+  {86, RegisterType::FLOAT, "W Demand Peak", 1, UnitType::W, 12},
+  {88, RegisterType::FLOAT, "kWh (+) PARTIAL", 1, UnitType::KWh, 20},
+  {90, RegisterType::FLOAT, "Kvarh (+) PARTIAL", 1, UnitType::KVarh, 22},
+  {92, RegisterType::FLOAT, "kWh (-) PARTIAL", 1, UnitType::KWh, 34},
+};
 
 String serverIPStr;
 uint16_t serverPort;
@@ -92,30 +138,9 @@ void setup() {
     ESP.restart();
   }
   dbgln("[wifi] finished");
-  dbgln("[modbus bridge setup] start");
 
   MBUlogLvl = LOG_LEVEL_WARNING;
-  RTUutils::prepareHardwareSerial(modbusSerial);
-#if defined(RX_PIN) && defined(TX_PIN)
-  // use rx and tx-pins if defined in platformio.ini
-  modbusSerial.begin(config.getModbusBaudRate(), config.getModbusConfig(), RX_PIN, TX_PIN );
-  dbgln("Use user defined RX/TX pins");
-#else
-  // otherwise use default pins for hardware-serial2
-  modbusSerial.begin(config.getModbusBaudRate(), config.getModbusConfig());
-#endif
 
-  MBclient = new ModbusClientRTU(config.getModbusRtsPin(), 10); // queuelimit 10
-  MBclient->setTimeout(1000);
-  MBclient->begin(modbusSerial, 1);
-
-  for (uint8_t i = 1; i < 248; i++)
-  {
-    MBbridge.attachServer(i, i, ANY_FUNCTION_CODE, MBclient);
-  }
-
-  MBbridge.start(config.getTcpPort(), 20, config.getTcpTimeout());
-  dbgln("[modbus bridge setup] finished");
   dbgln("[modbusCache] begin");
 
   serverIPStr = config.getTargetIP();
@@ -127,7 +152,7 @@ void setup() {
   
   dbgln("[modbusCache] finished");
 
-  setupPages(&webServer, MBclient, modbusCache, &MBbridge, &config, &wm);
+  setupPages(&webServer, modbusCache, &config, &wm);
   webServer.begin();
   dbgln("[setup] finished");
 }

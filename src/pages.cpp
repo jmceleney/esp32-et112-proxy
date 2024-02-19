@@ -9,7 +9,7 @@ const char STATUS_HTML[] PROGMEM = R"rawliteral(
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-    <title>ESP32 Modbus Gateway - Status</title>
+    <title>ESP32 Modbus Cache - Status</title>
     <link rel="stylesheet" href="style.css"></head>
     <script>
     function fetchData() {
@@ -59,7 +59,7 @@ const char STATUS_HTML[] PROGMEM = R"rawliteral(
 
 </head>
 <body>
-    <h2>ESP32 Modbus Gateway</h2>
+    <h2>ESP32 Modbus Cache</h2>
     <h3>Status</h3>
     <div id="content">
     <table id="statusTable"></table>
@@ -70,7 +70,7 @@ const char STATUS_HTML[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbusCache, ModbusBridgeWiFi *bridge, Config *config, WiFiManager *wm){
+void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config, WiFiManager *wm){
   server->on("/", HTTP_GET, [](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /");
     auto *response = request->beginResponseStream("text/html");
@@ -85,13 +85,14 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
     request->send(response);
   });
 
-  server->on("/status", HTTP_GET, [rtu, modbusCache, bridge](AsyncWebServerRequest *request){
+  server->on("/status", HTTP_GET, [modbusCache](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /status");
     request->send_P(200, "text/html", STATUS_HTML);
   });
 
   // Endpoint to serve JSON data
-  server->on("/status.json", HTTP_GET, [rtu, modbusCache, bridge](AsyncWebServerRequest *request) {
+  server->on("/status.json", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
+    dbgln("[webserver] GET /status.json");
     DynamicJsonDocument doc(4096);
     JsonArray data = doc.createNestedArray("data");
 
@@ -118,15 +119,17 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
     addSystemInfo("ESP WiFi Quality", String(WiFiQuality(WiFi.RSSI())));
     addSystemInfo("ESP MAC", WiFi.macAddress());
     addSystemInfo("ESP IP", WiFi.localIP().toString());
+    ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
     addSystemInfo("Primary RTU Messages", String(rtu->getMessageCount()));
     addSystemInfo("Primary RTU Pending Messages", String(rtu->pendingRequests()));
     addSystemInfo("Primary RTU Errors", String(rtu->getErrorCount()));
-    addSystemInfo("Bridge Message", String(bridge->getMessageCount()));
-    addSystemInfo("Bridge Clients", String(bridge->activeClients()));
-    addSystemInfo("Bridge Errors", String(bridge->getErrorCount()));
+    // addSystemInfo("Bridge Message", String(bridge->getMessageCount()));
+    // addSystemInfo("Bridge Clients", String(bridge->activeClients()));
+    // addSystemInfo("Bridge Errors", String(bridge->getErrorCount()));
 
     // Add Modbus information as objects to the array
     ModbusClientTCPasync* modbusTCPClient = modbusCache->getModbusTCPClient();
+    
     addSystemInfo("Secondary TCP Messages", String(modbusTCPClient->getMessageCount()));
     addSystemInfo("Secondary TCP Errors", String(modbusTCPClient->getErrorCount()));
 
@@ -189,30 +192,19 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
     dbgln("[webserver] rebooted...")
   });
   server->on("/config", HTTP_GET, [config](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /config");
+      dbgln("[webserver] GET /config");
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Modbus Server TCP");
+    sendResponseHeader(response, "Modbus Client (master)");
     response->print("<form method=\"post\">");
-    response->print("<table>"
-      "<tr>"
-        "<td>"
-          "<label for=\"tp\">Local TCP Port</label>"
-        "</td>"
-        "<td>");
-    response->printf("<input type=\"number\" min=\"1\" max=\"65535\" id=\"tp\" name=\"tp\" value=\"%d\">", config->getTcpPort());
-    response->print("</td>"
-      "</tr>"
-      "<tr>"
-        "<td>"
-          "<label for=\"tt\">TCP Timeout (ms)</label>"
-        "</td>"
-        "<td>");
-    response->printf("<input type=\"number\" min=\"1\" id=\"tt\" name=\"tt\" value=\"%d\">", config->getTcpTimeout());
-    response->print("</td>"
-        "</tr>"
-        "</table>"
-        "<h3>Modbus Primary RTU</h3>"
-        "<table>"
+    // Checkbox for Modbus Client is RTU
+    response->print("<label for=\"clientIsRTU\">Modbus Client is RTU:</label>");
+    response->printf("<input type=\"checkbox\" id=\"clientIsRTU\" name=\"clientIsRTU\" %s><br/>",
+                     config->getClientIsRTU() ? "checked" : "");
+
+    // Modbus Primary RTU section
+    response->print("<div id=\"rtuSettings\" style=\"display:none;\">"
+      "<h3>Modbus RTU Client</h3>"
+      "<table>"
         "<tr>"
           "<td>"
             "<label for=\"mb\">Baud rate</label>"
@@ -276,9 +268,11 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
             "</select>"
           "</td>"
         "</tr>"
-        "</table>"
-        "<hr>"
-        "<h3>Modbus TCP Client Settings (loopback or remote)</h3>"
+      "</table>"
+    "</div>");
+    // TCP Settings section
+    response->print("<div id=\"tcpSettings\" style=\"display:none;\">"
+        "<h3>Modbus TCP Client Settings</h3>"
         "<table>"
         "<tr>"
           "<td>"
@@ -298,6 +292,7 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
     response->print("</td>"
         "</tr>"
         "</table>"
+        "</div>"
         "<h3>Modbus Secondary RTU (server/slave)</h3>"
         "<table>"
         "<tr>"
@@ -429,6 +424,15 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
         "for(d of s){"
           "d.querySelector(`option[value='${d.dataset.value}']`).selected=true"
       "}})();"
+      "document.addEventListener('DOMContentLoaded', function() {"
+      "  var checkbox = document.getElementById('clientIsRTU');"
+      "  var showRTU = function() {"
+      "    document.getElementById('rtuSettings').style.display = checkbox.checked ? 'block' : 'none';"
+      "    document.getElementById('tcpSettings').style.display = checkbox.checked ? 'none' : 'block';"
+      "  };"
+      "  checkbox.addEventListener('change', showRTU);"
+      "  showRTU();"
+      "});"
       "</script>");
     sendResponseTrailer(response);
     request->send(response);
@@ -550,19 +554,30 @@ void setupPages(AsyncWebServer *server, ModbusClientRTU *rtu, ModbusCache *modbu
         request->redirect("/config?error=invalidIP");
         // Then, on the GET handler for "/config", check for this error parameter and display a message if present
     }
+    // Handling new checkbox input for Modbus Client is RTU
+    if (request->hasParam("clientIsRTU", true)){
+      // If the parameter exists, the checkbox was checked
+      config->setClientIsRTU(true);
+      dbgln("[webserver] Modbus Client is RTU: true");
+    } else {
+      // Otherwise, it was not checked
+      config->setClientIsRTU(false);
+      dbgln("[webserver] Modbus Client is RTU: false");
+    }
     
   });
   server->on("/debug", HTTP_GET, [](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /debug");
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Debug");
+    sendResponseHeader(response, "Debug RTU Client");
     sendDebugForm(response, "1", "1", "3", "1");
     sendButton(response, "Back", "/");
     sendResponseTrailer(response);
     request->send(response);
   });
-  server->on("/debug", HTTP_POST, [rtu](AsyncWebServerRequest *request){
+  server->on("/debug", HTTP_POST, [modbusCache](AsyncWebServerRequest *request){
     dbgln("[webserver] POST /debug");
+    ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
     String slaveId = "1";
     if (request->hasParam("slave", true)){
       slaveId = request->getParam("slave", true)->value();
@@ -770,7 +785,7 @@ void sendResponseHeader(AsyncResponseStream *response, const char *title, bool i
       "<head>"
       "<meta charset='utf-8'>"
       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,user-scalable=no\"/>");
-    response->printf("<title>ESP32 Modbus Gateway - %s</title>", title);
+    response->printf("<title>ESP32 Modbus Cache - %s</title>", title);
     if (inlineStyle){
       response->print("<style>");
       sendMinCss(response);
@@ -782,7 +797,7 @@ void sendResponseHeader(AsyncResponseStream *response, const char *title, bool i
     response->print(
       "</head>"
       "<body>"
-      "<h2>ESP32 Modbus Gateway</h2>");
+      "<h2>ESP32 Modbus Cache</h2>");
     response->printf("<h3>%s</h3>", title);
     response->print("<div id=\"content\">");
 }

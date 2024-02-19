@@ -15,6 +15,7 @@ Config::Config()
     ,_modbusRtsPin2(-1)
     ,_serialBaudRate(115200)
     ,_serialConfig(SERIAL_8N1)
+    ,_clientIsRTU(true)
 {}
 
 void Config::begin(Preferences *prefs)
@@ -33,6 +34,7 @@ void Config::begin(Preferences *prefs)
     _modbusRtsPin2 = _prefs->getChar("modbusRtsPin2", _modbusRtsPin2);
     _serialBaudRate = _prefs->getULong("serialBaudRate", _serialBaudRate);
     _serialConfig = _prefs->getULong("serialConfig", _serialConfig);
+    _clientIsRTU = _prefs->getBool("clientIsRTU", _clientIsRTU);
 }
 
 uint16_t Config::getTcpPort(){
@@ -258,4 +260,14 @@ void Config::setSerialStopBits(uint8_t value){
     if (stopbits == value) return;
     _serialConfig = (_serialConfig & 0xffffffcf) | value;
     _prefs->putULong("serialConfig", _serialConfig);
+}
+
+void Config::setClientIsRTU(bool value){
+    if (_clientIsRTU == value) return;
+    _clientIsRTU = value;
+    _prefs->putBool("clientIsRTU", _clientIsRTU);
+}
+
+bool Config::getClientIsRTU(){
+    return _clientIsRTU;
 }

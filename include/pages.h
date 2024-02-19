@@ -2,15 +2,15 @@
     #define PAGES_H
 
     #include <WiFiManager.h>
+    #include <Logging.h>
     #include <ESPAsyncWebServer.h>
-    #include <ModbusBridgeWiFi.h>
     #include <ModbusClientRTU.h>
     #include <ModbusCache.h>
     #include <Update.h>
     #include "config.h"
     #include "debug.h"
 
-    void setupPages(AsyncWebServer* server, ModbusClientRTU *rtu, ModbusCache *modbusCache, ModbusBridgeWiFi *bridge, Config *config, WiFiManager *wm);
+    void setupPages(AsyncWebServer* server, ModbusCache *modbusCache, Config *config, WiFiManager *wm);
     void sendResponseHeader(AsyncResponseStream *response, const char *title, bool inlineStyle = false);
     void sendResponseTrailer(AsyncResponseStream *response);
     void sendButton(AsyncResponseStream *response, const char *title, const char *action, const char *css = "");

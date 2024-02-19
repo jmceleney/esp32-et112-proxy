@@ -30,8 +30,23 @@ ModbusCache::ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters,
       serverIPString(serverIPStr),
       serverPort(port),
       modbusRTUServer(2000, config.getModbusRtsPin2()),
+      modbusRTUClient(nullptr),
       modbusTCPClient(nullptr) //,10) // queueLimit 10
 {
+    RTUutils::prepareHardwareSerial(modbusClientSerial);
+    #if defined(RX_PIN) && defined(TX_PIN)
+        // use rx and tx-pins if defined in platformio.ini
+        modbusClientSerial.begin(config.getModbusBaudRate(), config.getModbusConfig(), RX_PIN, TX_PIN );
+        dbgln("Use user defined RX/TX pins");
+    #else
+        // otherwise use default pins for hardware-serial2
+        modbusClientSerial.begin(config.getModbusBaudRate(), config.getModbusConfig());
+    #endif
+
+    modbusRTUClient = new ModbusClientRTU(config.getModbusRtsPin(), 10); // queuelimit 10
+    modbusRTUClient->setTimeout(1000);
+    modbusRTUClient->begin(modbusClientSerial, 1);
+
     if (serverIPString == "127.0.0.1") {
         IPAddress newIP = WiFi.localIP();
         Serial.println("Server IP address is the loopback address (127.0.0.1).");
@@ -50,9 +65,7 @@ ModbusCache::ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters,
     instance = this; // Set the instance pointer to this object
 }
 
-void ModbusCache::begin()
-{
-    // Assuming Serial1 is the HardwareSerial object you want to use
+void ModbusCache::begin() {
     dbgln("Begin mosbusCache");
     
     mutex = xSemaphoreCreateMutex();
@@ -60,21 +73,24 @@ void ModbusCache::begin()
         dbgln("Failed to create mutex");
     }
     
-    RTUutils::prepareHardwareSerial(Serial1);
-    Serial1.begin(config.getModbusBaudRate2(), config.getModbusConfig2(), 25, 26); // Start the Serial communication
+    RTUutils::prepareHardwareSerial(modbusServerSerial);
+    modbusServerSerial.begin(config.getModbusBaudRate2(), config.getModbusConfig2(), 25, 26); // Start the Serial communication
 
     // Register worker function
     modbusRTUServer.registerWorker(1, ANY_FUNCTION_CODE, &ModbusCache::respondFromCache);
     MBserver.registerWorker(1, ANY_FUNCTION_CODE, &ModbusCache::respondFromCache);
 
     // Start the Modbus RTU server
-    modbusRTUServer.begin(Serial1); // or modbusRTUServer.begin(Serial1, -1) to specify coreID
+    modbusRTUServer.begin(modbusServerSerial); // or modbusRTUServer.begin(modbusServerSerial, -1) to specify coreID
     MBserver.start(config.getTcpPort3(), 20, config.getTcpTimeout());
 
     modbusTCPClient->setMaxInflightRequests(6);
     modbusTCPClient->connect(serverIP, serverPort);
     modbusTCPClient->onDataHandler(&ModbusCache::handleData);
     modbusTCPClient->onErrorHandler(&ModbusCache::handleError);
+
+    modbusRTUClient->onDataHandler(&ModbusCache::handleData);
+    modbusRTUClient->onErrorHandler(&ModbusCache::handleError);
 }
 
 void ModbusCache::initializeRegisters(const std::vector<ModbusRegister>& dynamicRegisters, 
@@ -172,7 +188,7 @@ void ModbusCache::update() {
 
         if (requestMap.size() > 2) {
             dbgln("Skipping update due to more than 2 pending requests");
-            yield();
+            //yield();
             return;
         }
 
@@ -408,8 +424,12 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
             }
             xSemaphoreGive(mutex); // Release the mutex
         }
-        //dbgln("[send:" + String(currentToken) + "] Queue size: " + String(instance->insertionOrder.size()) + ", map size: " + String(instance->requestMap.size()));
-        modbusTCPClient->addRequest(request, currentToken);
+        if(config.getClientIsRTU()) {
+            modbusRTUClient->addRequest(request, currentToken);
+        } else {
+            modbusTCPClient->addRequest(request, currentToken);
+        }
+        
     }
 }
 
@@ -429,7 +449,7 @@ void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
         dbgln("[handleData] Start address: " + String(startAddress) + ", register count: " + String(regCount));
         //printHex(response.data(), response.size());
 
-        instance->processResponsePayload(response, startAddress, regCount); // This is a new method to be implemented
+        instance->processResponsePayload(response, startAddress, regCount);
 
         instance->lastSuccessfulUpdate = millis();
         instance->purgeToken(token); // Cleanup the token now that the response has been processed
@@ -438,6 +458,7 @@ void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
     } else {
         dbgln("Token " + String(token) + " not found in map");
     }
+    yield();
 }
 
 void ModbusCache::handleError(Error error, uint32_t token) {
@@ -571,11 +592,6 @@ ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
     dbgln("Received request to local server:");
     printHex(request.data(), request.size());
 
-    if (!instance->isOperational) {
-        dbgln("Server is not operational, returning no response");
-        return ModbusMessage(); // Assuming an empty ModbusMessage indicates no response
-    }
-
     uint8_t slaveID = request[0];
     uint8_t functionCode = request[1];
     uint16_t address = (request[2] << 8) | request[3];
@@ -597,7 +613,14 @@ ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
 
         // Assuming a successful write is confirmed by echoing back the request or a specific success message.
         return forwardRequest; // Echo back the request for simplicity, adjust based on actual confirmation needed.
-    } else if (functionCode == 3 || functionCode == 4) { // Read Holding Registers or Read Input Registers
+    }
+
+    if (!instance->isOperational) {
+        dbgln("Server is not operational, returning no response");
+        return ModbusMessage(); // Assuming an empty ModbusMessage indicates no response
+    }
+
+    if (functionCode == 3 || functionCode == 4) { // Read Holding Registers or Read Input Registers
         dbgln("Read Registers - Slave ID: " + String(slaveID) + ", Address: " + String(address) + ", Quantity: " + String(valueOrWords));
         
         auto values = instance->getRegisterValues(address, valueOrWords); // Fetch requested values
@@ -642,6 +665,10 @@ ModbusClientTCPasync* ModbusCache::getModbusTCPClient() {
     return modbusTCPClient;
 }
 
+ModbusClientRTU* ModbusCache::getModbusRTUClient() {
+    return modbusRTUClient;
+}
+
 float ModbusCache::getScaledValueFromRegister(const ModbusRegister& reg, uint32_t rawValue) {
     float value = 0.0;
 
@@ -659,6 +686,8 @@ float ModbusCache::getScaledValueFromRegister(const ModbusRegister& reg, uint32_
         case RegisterType::INT16:
             value = static_cast<float>(static_cast<int16_t>(rawValue));
             break;
+        case RegisterType::FLOAT:
+            value = static_cast<float>(rawValue);
         // Add cases for other RegisterType enums if necessary
         default:
             // Handle unexpected register type or log an error

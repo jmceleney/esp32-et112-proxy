@@ -1,5 +1,6 @@
 #include "ModbusCache.h"
 #include <unordered_set>
+#include <functional>
 
 extern Config config;
 
@@ -30,23 +31,29 @@ ModbusCache::ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters,
       serverIPString(serverIPStr),
       serverPort(port),
       modbusRTUServer(2000, config.getModbusRtsPin2()),
+      modbusRTUEmulator(2000, -1),
       modbusRTUClient(nullptr),
       modbusTCPClient(nullptr) //,10) // queueLimit 10
 {
-    RTUutils::prepareHardwareSerial(modbusClientSerial);
-    #if defined(RX_PIN) && defined(TX_PIN)
-        // use rx and tx-pins if defined in platformio.ini
-        modbusClientSerial.begin(config.getModbusBaudRate(), config.getModbusConfig(), RX_PIN, TX_PIN );
-        dbgln("Use user defined RX/TX pins");
-    #else
-        // otherwise use default pins for hardware-serial2
-        modbusClientSerial.begin(config.getModbusBaudRate(), config.getModbusConfig());
-    #endif
-
+    initializeRegisters(dynamicRegisters, staticRegisters);
+    // We must define the client, even if we don't use it, to avoid a null pointer exception
     modbusRTUClient = new ModbusClientRTU(config.getModbusRtsPin(), 10); // queuelimit 10
     modbusRTUClient->setTimeout(1000);
-    modbusRTUClient->begin(modbusClientSerial, 1);
+    if(config.getClientIsRTU()) {
+        RTUutils::prepareHardwareSerial(modbusClientSerial);
+        #if defined(RX_PIN) && defined(TX_PIN)
+            // use rx and tx-pins if defined in platformio.ini
+            modbusClientSerial.begin(config.getModbusBaudRate(), config.getModbusConfig(), RX_PIN, TX_PIN );
+            dbgln("Use user defined RX/TX pins");
+        #else
+            // otherwise use default pins for hardware-serial2
+            modbusClientSerial.begin(config.getModbusBaudRate(), config.getModbusConfig());
+        #endif
 
+        
+        modbusRTUClient->begin(modbusClientSerial, 1);
+    }
+    
     if (serverIPString == "127.0.0.1") {
         IPAddress newIP = WiFi.localIP();
         Serial.println("Server IP address is the loopback address (127.0.0.1).");
@@ -58,15 +65,14 @@ ModbusCache::ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters,
         while (true) {
             delay(1000); // Halt operation
         }
-    }
-
-    initializeRegisters(dynamicRegisters, staticRegisters);
-    modbusTCPClient = new ModbusClientTCPasync(serverIP, serverPort, 10); // Dynamically allocate ModbusClientTCPasync
+    }    
+    modbusTCPClient = new ModbusClientTCPasync(serverIP, serverPort, 10); // Dynamically allocate ModbusClientTCPasync}
+    
     instance = this; // Set the instance pointer to this object
 }
 
 void ModbusCache::begin() {
-    dbgln("Begin mosbusCache");
+    dbgln("Begin modbusCache");
     
     mutex = xSemaphoreCreateMutex();
     if (mutex == NULL) {
@@ -84,13 +90,15 @@ void ModbusCache::begin() {
     modbusRTUServer.begin(modbusServerSerial); // or modbusRTUServer.begin(modbusServerSerial, -1) to specify coreID
     MBserver.start(config.getTcpPort3(), 20, config.getTcpTimeout());
 
-    modbusTCPClient->setMaxInflightRequests(6);
-    modbusTCPClient->connect(serverIP, serverPort);
-    modbusTCPClient->onDataHandler(&ModbusCache::handleData);
-    modbusTCPClient->onErrorHandler(&ModbusCache::handleError);
-
-    modbusRTUClient->onDataHandler(&ModbusCache::handleData);
-    modbusRTUClient->onErrorHandler(&ModbusCache::handleError);
+    if(config.getClientIsRTU()) {
+        modbusRTUClient->onDataHandler(&ModbusCache::handleData);
+        modbusRTUClient->onErrorHandler(&ModbusCache::handleError);
+    } else {
+        modbusTCPClient->setMaxInflightRequests(6);
+        modbusTCPClient->connect(serverIP, serverPort);
+        modbusTCPClient->onDataHandler(&ModbusCache::handleData);
+        modbusTCPClient->onErrorHandler(&ModbusCache::handleError);
+    }
 }
 
 void ModbusCache::initializeRegisters(const std::vector<ModbusRegister>& dynamicRegisters, 
@@ -101,7 +109,7 @@ void ModbusCache::initializeRegisters(const std::vector<ModbusRegister>& dynamic
         registers.push_back(reg);
         registerDefinitions.insert({reg.address, reg});
         
-        if (reg.type == RegisterType::UINT32 || reg.type == RegisterType::INT32) {
+        if (reg.type == RegisterType::UINT32 || reg.type == RegisterType::INT32 || reg.type == RegisterType::FLOAT) {
             register32BitValues[reg.address] = 0; // Initialize with default value
         } else {
             register16BitValues[reg.address] = 0; // Initialize with default value
@@ -587,6 +595,211 @@ void ModbusCache::processResponsePayload(ModbusMessage& response, uint16_t start
         } 
     }
 }
+
+#include <optional>
+#include <cstring> // For memcpy
+
+Uint16Pair ModbusCache::convertValue(const ModbusRegister& source, const ModbusRegister& destination, uint32_t value) {
+    dbgln("Converting value from " + typeString(source.type) + " to " + typeString(destination.type) + ": " + String(value));
+    
+    // The combined scaling factor is the source's scaling factor,
+    // as the destination's scaling factor is effectively 1 in this scenario.
+    double combinedScalingFactor = 1.0;
+
+    if (source.scalingFactor.has_value()) {
+        combinedScalingFactor = source.scalingFactor.value();
+    }
+    // log the scaling factor
+    dbgln("Combined scaling factor: " + String(combinedScalingFactor,4));
+    
+    float trueValue = 0;
+    uint32_t tempValue = 0;
+
+    if (source.type == RegisterType::FLOAT) {
+        // If source is FLOAT, interpret the input value directly as float
+        memcpy(&trueValue, &value, sizeof(float));
+        trueValue *= combinedScalingFactor; // Apply scaling factor
+    } else {
+        // If source is INT32, apply the scaling factor before conversion
+        int32_t intValue;
+        memcpy(&intValue, &value, sizeof(int32_t)); // Treat the value as int32_t for scaling
+        trueValue = static_cast<float>(intValue) * combinedScalingFactor;
+    }
+
+    // if destination.transformFunction is present, apply it to the trueValue
+    if (destination.transformFunction.has_value()) {
+        std::function<double(ModbusCache*, double)> transformFunction = destination.transformFunction.value();
+        dbgln("Applying transform function to trueValue with value: " + String(trueValue,3));
+        trueValue = static_cast<float>(transformFunction(this, static_cast<double>(trueValue)));
+        dbgln("Transformed value: " + String(trueValue,3));
+    }
+
+    // Convert trueValue to the destination type
+    if (destination.type == RegisterType::FLOAT) {
+        // If destination is FLOAT, no further conversion needed
+        memcpy(&tempValue, &trueValue, sizeof(float)); // Store the float value as uint32_t for return
+    } else {
+        // Handle conversion to other types if needed, though not required for this specific scenario
+    }
+
+    return split32BitRegister(tempValue);
+}
+
+
+void ModbusCache::createEmulatedServer(const std::vector<ModbusRegister>& registers) {
+    // make a pointer to a hardware serial device, and make it a null pointer
+    HardwareSerial* mySerial = nullptr;
+    int RX;
+    int TX;
+    if(config.getClientIsRTU()) {
+        // Change the pointer to the hardware serial device to emulatedSerial
+        mySerial = &Serial0;
+        RX=emulator_RX;
+        TX=emulator_TX;
+    } else {
+        // Change the pointer to the hardware serial device to modbusServerSerial
+        mySerial = &modbusClientSerial;
+        RX=16;
+        TX=17;
+    }
+    dbgln("Prepare hardware serial");
+    RTUutils::prepareHardwareSerial(*mySerial);
+    //Logi pin numbers
+    dbgln("Calling begin on hardware serial - RX: " + String(RX) + ", TX: " + String(TX) + ", Baud: " + String(config.getModbusBaudRate2()) + ", Config: " + String(config.getModbusConfig2()));
+    mySerial->begin(config.getModbusBaudRate2(), config.getModbusConfig2(), RX, TX);
+    dbgln("Calling begin on emulated RTU server");
+    modbusRTUEmulator.begin(*mySerial);
+
+    auto onData = [this, registers](ModbusMessage request) {
+        dbgln("[emulator] Received request to emulated server:");
+        printHex(request.data(), request.size());
+
+        uint8_t slaveID = request[0];
+        uint8_t functionCode = request[1];
+        uint16_t address = (request[2] << 8) | request[3];
+        uint16_t valueOrWords = (request[4] << 8) | request[5];
+
+        if (!instance->isOperational) {
+            dbgln("[emulator] Server is not operational, returning no response");
+            return ModbusMessage();
+        }
+
+        if (functionCode == 3 || functionCode == 4) {
+            ModbusMessage response;
+            response.add(slaveID); // Add slave ID
+            response.add(functionCode); // Add function code
+            response.add(static_cast<uint8_t>(valueOrWords * 2)); // Byte count
+            dbgln("[emulator] Function code: " + String(functionCode) + ", Address: " + String(address) + ", Value or Words: " + String(valueOrWords));
+
+            // for (auto it = values.rbegin(); it != values.rend(); ++it) { // reverse this to match the order of the request
+            int wordCount = 0;
+
+            // Now we loop through the addresses and determin which registers
+            // if any they match. A 32 bit register occupies two addresses
+            // Once we know whoch emaulated register is requested, we fetch the value
+            // from our backend, and add it to our response. Request addresses that
+            // do not exist will result in a 0 value in the response
+            //std::vector<uint16_t> values;
+            for (uint16_t i = 0; i < valueOrWords; ++i) {
+                uint16_t currentAddress = address + i;
+                // Log what we're doing
+                dbgln("[emulator] Fetching value for address: " + String(currentAddress));
+                // Now we need to find the register in "registers" that matches the currentAddress
+                // and determine (is32BitRegister) if it is a 16 or 32 bit register
+                // is32BitRegister take the register definition and checks if it is a 32 bit register
+                // Let's begin by getting the register definition
+                auto it = std::find_if(registers.begin(), registers.end(), [currentAddress](const ModbusRegister& reg) {
+                    return reg.address == currentAddress;
+                });
+                if (it != registers.end()) {
+                    // We found a register definition
+                    ModbusRegister destReg = *it;
+                    // Log what we know about the register, including the description and backend address
+                    
+
+                    // backendAddress is optional. If not present, then we need skip
+                    // If it is present, then assign it to a int32_t variable
+                    uint16_t backendAddress = UINT16_MAX; // Marker value indicating "undefined";
+                    if(destReg.backendAddress.has_value()) {
+                        backendAddress = destReg.backendAddress.value();
+                    }
+                    dbgln("[emulator] Register: " + String(destReg.address) + ", Description: " + destReg.description +
+                     ", Backend Address: " + String(backendAddress));
+                    if (backendAddress == UINT16_MAX) {
+                        dbgln("[emulator] No backend address found for address: " + String(currentAddress));
+                        if (this->is32BitRegisterType(destReg)) {
+                            response.add(0);
+                            response.add(0);
+                            i++;
+                            wordCount += 2;
+                        } else {
+                            // values.push_back(0);
+                            response.add(0);
+                            wordCount++;
+                        }
+                        continue;
+                    }
+                    auto iReg = registerDefinitions.find(backendAddress);
+                    if (iReg == registerDefinitions.end()) {
+                        dbgln("[emulator] No register definition found for backend address: " + String(backendAddress));
+                    }
+                    // Get a ModbusRegister reference from iReg->second
+                    const ModbusRegister& sourceReg = iReg->second;
+                    float scalingFactor = 1.0;
+                    if (sourceReg.scalingFactor.has_value()) {
+                        scalingFactor = sourceReg.scalingFactor.value();
+                    }
+
+                    uint32_t sourceValue;
+                    if(this->is32BitRegister(backendAddress)) {
+                        sourceValue = this->read32BitRegister(backendAddress);
+                    } else {
+                        sourceValue = static_cast<uint32_t>(this->read16BitRegister(backendAddress));
+                    }
+                    Uint16Pair pair = this->convertValue(sourceReg, destReg, sourceValue);
+                    if (this->is32BitRegisterType(destReg)) {
+                        dbgln("[emulator] 32-bit destination register: ");
+                        dbgln("[emulator] Source register: " + sourceReg.description + ", Scaling factor: " + String(scalingFactor,4) + ", Value: " + String(sourceValue));   
+                        response.add(pair.highWord);
+                        wordCount++;
+                        if (wordCount == valueOrWords) { // We might want word one of a 2 word register
+                              break;
+                        }
+                        response.add(pair.lowWord);
+                        i++;
+                        wordCount++;
+                    } else {
+                        // Log the name, value and scalingFactor of the source register
+                        dbgln("[emulator] 16-bit Source register: " + sourceReg.description + ", Value: " + String(sourceValue) + ", Scaling factor: " + String(scalingFactor,4) +
+                            ", sourveValue: " + String(sourceValue));
+
+                        response.add(pair.lowWord);
+                        wordCount++;
+                    }
+                } else {
+                    // We did not find a register definition
+                    // We add a 0 value to our response
+                    dbgln("[emulator] No register definition found for address: " + String(currentAddress));
+                    // values.push_back(0);
+                    response.add(0);
+                    wordCount++;
+                }
+
+                if (wordCount == valueOrWords) { // We might want word one of a 2 word register
+                   break;
+                }
+            }
+            dbgln("[emulator] Sending response from emulator:");
+            printHex(response.data(), response.size());
+            return response;
+        }
+
+        return ModbusMessage();
+    };
+    dbgln("Registering worker function for emulated server");
+    modbusRTUEmulator.registerWorker(1, ANY_FUNCTION_CODE, onData);
+}
+
 
 ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
     dbgln("Received request to local server:");

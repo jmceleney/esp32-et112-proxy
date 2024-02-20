@@ -4,11 +4,25 @@
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
 #include <Logging.h>
+
 //#include <ModbusBridgeWiFi.h>
 
 #include "ModbusCache.h"
 #include "config.h"
 #include "pages.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include <cmath> // Include cmath for acos
+
+#ifdef REROUTE_DEBUG
+    //SoftwareSerial debugSerial(SSERIAL_RX, SSERIAL_TX);
+    EspSoftwareSerial::UART debugSerial;
+    //#define Serial debugSerial
+# else
+    
+    #define debugSerial Serial
+    
+#endif
 
 
 /*
@@ -28,6 +42,23 @@ AsyncWebServer webServer(80);
 Config config;
 Preferences prefs;
 WiFiManager wm;
+
+void setup_uart() {
+    //uart_set_pin(UART_NUM_0, 18, 19, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    //uart_driver_install(UART_NUM_0, 2048, 0, 0, NULL, 0);
+        uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB,
+    };
+    // Configure UART parameters
+    uart_param_config(UART_NUM_0, &uart_config);
+    uart_set_pin(UART_NUM_0, 18, 19, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART_NUM_0, 2048, 0, 0, NULL, 0);
+}
 
 std::vector<ModbusRegister> dynamicRegisters = {
     {0, RegisterType::INT32, "Volts", 0.1, UnitType::V},
@@ -92,6 +123,28 @@ Modicom, Parameter, Length(bytes), units, format, high, low
 
 // Now we make a map from the SDM120 back to the main registers above
 
+std::function<double(ModbusCache*, double)> calc_angle = [](ModbusCache* modbusCache, double param){
+  dbgln("calc_angle for power factor: " + String(param,4));
+  return static_cast<double>(acos(param) * (180.0 / M_PI));
+};
+
+std::function<double(ModbusCache*, double)> calc_total_energy = [](ModbusCache* modbusCache, double param){
+  float totalImportEnergy = modbusCache->getRegisterScaledValue(16);
+  float totalExportEnergy = modbusCache->getRegisterScaledValue(32);
+  return static_cast<double>(totalImportEnergy + totalExportEnergy);
+};
+
+std::function<double(ModbusCache*, double)> calc_total_reactive = [](ModbusCache* modbusCache, double param){
+  float totalImport = modbusCache->getRegisterScaledValue(18);
+  float totalExport = modbusCache->getRegisterScaledValue(34);
+  return static_cast<double>(totalImport + totalExport);
+};
+
+std::function<double(ModbusCache*, double)> invert_sign = [](ModbusCache* modbusCache, double param){
+  return 0 - param;
+};
+
+
 std::vector<ModbusRegister> sdm120Registers = {
   {0, RegisterType::FLOAT, "Volts", 1, UnitType::V, 0},
   {6, RegisterType::FLOAT, "Amps", 1, UnitType::A, 2},
@@ -99,16 +152,19 @@ std::vector<ModbusRegister> sdm120Registers = {
   {18, RegisterType::FLOAT, "VA", 1, UnitType::VA, 6},
   {24, RegisterType::FLOAT, "Volt Amp Reactive", 1, UnitType::var, 8},
   {30, RegisterType::FLOAT, "Power Factor", 1, UnitType::PF, 14},
+  {36, RegisterType::FLOAT, "Phase Angle", 1, UnitType::PF, 14, calc_angle},
   {70, RegisterType::FLOAT, "Frequency", 1, UnitType::Hz, 15},
   {72, RegisterType::FLOAT, "Energy kWh (+)", 1, UnitType::KWh, 16},
-  {74, RegisterType::FLOAT, "Energy kWh (-)", 1, UnitType::KWh, 32},
+  {74, RegisterType::FLOAT, "Energy kWh (-)", 1, UnitType::KWh, 32, invert_sign},
   {76, RegisterType::FLOAT, "Reactive Power Kvarh (+)", 1, UnitType::KVarh, 18},
-  {78, RegisterType::FLOAT, "Reactive Power Kvarh (-)", 1, UnitType::KVarh, 34},
+  {78, RegisterType::FLOAT, "Reactive Power Kvarh (-)", 1, UnitType::KVarh, 34, invert_sign},
   {84, RegisterType::FLOAT, "W Demand", 1, UnitType::W, 10},
   {86, RegisterType::FLOAT, "W Demand Peak", 1, UnitType::W, 12},
   {88, RegisterType::FLOAT, "kWh (+) PARTIAL", 1, UnitType::KWh, 20},
   {90, RegisterType::FLOAT, "Kvarh (+) PARTIAL", 1, UnitType::KVarh, 22},
-  {92, RegisterType::FLOAT, "kWh (-) PARTIAL", 1, UnitType::KWh, 34},
+  {92, RegisterType::FLOAT, "kWh (-) PARTIAL", 1, UnitType::KWh, 34, invert_sign},
+  {342, RegisterType::FLOAT, "kWh Energy Total", 1, UnitType::KWh, 16, calc_total_energy},
+  {344, RegisterType::FLOAT, "Reactive Power Total", 1, UnitType::KVarh, 18, calc_total_reactive},
 };
 
 String serverIPStr;
@@ -117,13 +173,19 @@ uint16_t serverPort;
 ModbusCache* modbusCache = nullptr;
 
 void setup() {
+#ifdef REROUTE_DEBUG
+  setup_uart();
+  //esp_log_level_set("*", ESP_LOG_NONE);
+  debugSerial.begin(38400, EspSoftwareSerial::SWSERIAL_8N1, SSERIAL_RX, SSERIAL_TX, false, 256, 256);
+#else
   debugSerial.begin(115200);
+#endif
   dbgln();
   dbgln("[config] load")
   prefs.begin("modbusRtuGw");
   config.begin(&prefs);
-  debugSerial.end();
-  debugSerial.begin(config.getSerialBaudRate(), config.getSerialConfig());
+  //debugSerial.end();
+  //debugSerial.begin(config.getSerialBaudRate());
   dbgln("[wifi] start");
   WiFi.mode(WIFI_STA);
   wm.setClass("invert");
@@ -148,7 +210,12 @@ void setup() {
   modbusCache = new ModbusCache(dynamicRegisters, staticRegisters, serverIPStr, serverPort);
     //modbusAddressList, addressCount, modbusAddressListStatic, addressStaticCount, serverIPStr, serverPort);// Initialize ModbusCache if the configuration is valid
   
-  modbusCache->begin();    
+  modbusCache->begin();
+  
+  //if(!config.getClientIsRTU()) {
+    dbgln("[modbusCache] call createEmulatedServer");
+    modbusCache->createEmulatedServer(sdm120Registers);
+  //}
   
   dbgln("[modbusCache] finished");
 

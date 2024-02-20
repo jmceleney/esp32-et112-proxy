@@ -14,10 +14,7 @@
 #include <optional>
 #include <IPAddress.h>
 #include <unordered_set>
-//#include <SoftwareSerial.h>
-
-// tx 19
-// rx 18
+#include <SoftwareSerial.h>
 
 #define MAX_REGISTERS 400
 
@@ -27,6 +24,17 @@ enum class RegisterType {
     UINT32,
     INT32,
     FLOAT
+};
+
+static String typeString(RegisterType type) {
+    switch (type) {
+        case RegisterType::UINT16: return "UINT16";
+        case RegisterType::INT16: return "INT16";
+        case RegisterType::UINT32: return "UINT32";
+        case RegisterType::INT32: return "INT32";
+        case RegisterType::FLOAT: return "FLOAT";
+        default: return "Unknown RegisterType";
+    }
 };
 
 struct Uint16Pair {
@@ -47,19 +55,24 @@ enum class UnitType {
     // Add more units as needed
 };
 
+class ModbusCache; // Forward declaration
+
 struct ModbusRegister {
     uint16_t address;
     RegisterType type;
     String description;
-    std::optional<double> scalingFactor;
+    std::optional<float> scalingFactor;
     std::optional<UnitType> unit;
     std::optional<uint16_t> backendAddress;
+    std::optional<std::function<double(ModbusCache*, double)>> transformFunction;
 
     ModbusRegister(uint16_t addr, RegisterType t, const String& desc,
-                   std::optional<double> scale = std::nullopt,
+                   std::optional<float> scale = std::nullopt,
                    std::optional<UnitType> unitType = std::nullopt,
-                   std::optional<uint16_t> backendAddr = std::nullopt)
-        : address(addr), type(t), description(desc), scalingFactor(scale), unit(unitType), backendAddress(backendAddr) {}
+                   std::optional<uint16_t> backendAddr = std::nullopt,
+                   std::optional<std::function<double(ModbusCache*, double)>> transformFunc = std::nullopt)
+        : address(addr), type(t), description(desc), scalingFactor(scale),
+          unit(unitType), backendAddress(backendAddr), transformFunction(transformFunc) {}
 };
 
 struct ScaledWaterMarks {
@@ -118,7 +131,7 @@ public:
     String formatRegisterValue(uint16_t address, float value);
     String getFormattedRegisterValue(uint16_t address);
     std::pair<String, String> getFormattedWaterMarks(uint16_t address);
-    
+    void createEmulatedServer(const std::vector<ModbusRegister>& registers);
 
 private:
     std::vector<ModbusRegister> registers; // All registers
@@ -144,11 +157,15 @@ private:
         return dynamicRegisterAddresses.find(registerNumber) != dynamicRegisterAddresses.end();
     }
 
+    bool is32BitRegisterType(const ModbusRegister& reg) {
+        // Check if the register type is UINT32, INT32, or FLOAT
+        return reg.type == RegisterType::UINT32 || reg.type == RegisterType::INT32 || reg.type == RegisterType::FLOAT;
+    }
     bool is32BitRegister(uint16_t address) {
         auto it = registerDefinitions.find(address);
         if (it != registerDefinitions.end()) {
             // Check if the register type is either UINT32 or INT32
-            return it->second.type == RegisterType::UINT32 || it->second.type == RegisterType::INT32 || it->second.type == RegisterType::FLOAT;
+            return is32BitRegisterType(it->second);
         }
         return false; // Address not found or not a 32-bit register
     }
@@ -162,7 +179,10 @@ private:
         return false; // Address not found or not a 16-bit register
     }
 
+    // This next function take two RegisterType arguments (source, and destination), and a 32-bit value
+    // It returns a pair of 16-bit values in the correct order for modbus (low word first, high word second)
 
+    Uint16Pair convertValue(const ModbusRegister& source, const ModbusRegister& destination, uint32_t value);
     uint16_t read16BitRegister(uint16_t address);
     uint32_t read32BitRegister(uint16_t address);
     void initializeRegisters(const std::vector<ModbusRegister>& dynamicRegisters, 
@@ -176,6 +196,7 @@ private:
     IPAddress serverIP; // IP address of the Modbus TCP server
     uint16_t serverPort; // Port number of the Modbus TCP server
     ModbusServerRTU modbusRTUServer;
+    ModbusServerRTU modbusRTUEmulator;
     ModbusServerTCPasync MBserver;
     ModbusClientRTU* modbusRTUClient;
     ModbusClientTCPasync* modbusTCPClient;

@@ -1,13 +1,37 @@
+#include <SoftwareSerial.h>
+#include "driver/uart.h"
+
 #ifndef CONFIG_H
     #define CONFIG_H
     #include <Arduino.h>
     #include <Preferences.h>
-    #define debugSerial Serial
+    #define Serial0 Serial
     #define modbusServerSerial Serial1
     #define modbusClientSerial Serial2
+    
     // Include the WiFi library
     #define DEBUG
 
+    //# define REROUTE_DEBUG
+
+    #ifdef REROUTE_DEBUG
+        extern SoftwareSerial debugSerial; // Declare debugSerial as extern
+    #else
+        #define debugSerial Serial
+    #endif
+
+    
+    #define SSERIAL_RX 3 // GPIO3 (RX0)
+    #define SSERIAL_TX 1 // GPIO1 (TX0)
+   
+    #define emulator_RX 19
+    #define emulator_TX 18
+
+    //uart_set_pin(UART_NUM_0, 18, 19, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    //#define debugSerial mySerial
+
+    
     class Config{
         private:
             Preferences *_prefs;

@@ -9,10 +9,7 @@
     #define modbusServerSerial Serial1
     #define modbusClientSerial Serial2
     
-    // Include the WiFi library
-    #define DEBUG
-
-    //# define REROUTE_DEBUG
+    //#define REROUTE_DEBUG
 
     #ifdef REROUTE_DEBUG
         extern SoftwareSerial debugSerial; // Declare debugSerial as extern
@@ -21,16 +18,18 @@
     #endif
 
     
-    #define SSERIAL_RX 3 // GPIO3 (RX0)
-    #define SSERIAL_TX 1 // GPIO1 (TX0)
+    #define SSERIAL_RX 18
+    #define SSERIAL_TX 19
+
+    #define RTU_server_RX 25
+    #define RTU_server_TX 26
    
-    #define emulator_RX 19
-    #define emulator_TX 18
+    #define emulator_RX 3
+    #define emulator_TX 1
 
-    //uart_set_pin(UART_NUM_0, 18, 19, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    //#define debugSerial mySerial
-
+    #define RTU_client_core 0
+    #define RTU_server_core 1
+    #define RTU_emulator_core 1
     
     class Config{
         private:
@@ -49,6 +48,7 @@
             unsigned long _serialBaudRate;
             uint32_t _serialConfig;
             bool _clientIsRTU;
+            String _hostname;
         public:
             Config();
             void begin(Preferences *prefs);
@@ -95,7 +95,11 @@
             void setSerialStopBits(uint8_t value);
             bool getClientIsRTU();
             void setClientIsRTU(bool value);
+            String getHostname() const;
+            void setHostname(const String& hostname);
     };
+    #define logErr(x...) debugSerial.print(x);
+    #define logErrln(x...) debugSerial.println(x);
     #ifdef DEBUG
     #define dbg(x...) debugSerial.print(x);
     #define dbgln(x...) debugSerial.println(x);

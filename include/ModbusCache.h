@@ -87,11 +87,12 @@ public:
             const String& serverIPStr, 
             uint16_t port);
     void begin();
+    void resetConnection();
     void update();
     void addRegister(const ModbusRegister& reg); // Add a register to the cache
     std::vector<uint16_t> getRegisterValues(uint16_t startAddress, uint16_t count);
     //uint16_t getRegisterValue(uint16_t address);
-    uint16_t update_interval = 500;
+    uint16_t update_interval = 300;
     bool checkNewRegisterValue(uint16_t address, uint32_t proposedRawValue);
     void setRegisterValue(uint16_t address, uint32_t value, bool is32Bit = false);
     static ModbusMessage respondFromCache(ModbusMessage request);
@@ -130,6 +131,8 @@ public:
     String formatRegisterValue(const ModbusRegister& reg, float value);
     String formatRegisterValue(uint16_t address, float value);
     String getFormattedRegisterValue(uint16_t address);
+    String getCGBaudRate();
+    void setCGBaudRate(uint16_t baudRateValue);
     std::pair<String, String> getFormattedWaterMarks(uint16_t address);
     void createEmulatedServer(const std::vector<ModbusRegister>& registers);
 

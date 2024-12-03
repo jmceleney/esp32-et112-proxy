@@ -1,19 +1,130 @@
 #include "pages.h"
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
+
 
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
 
-const char STATUS_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-    <title>ESP32 Modbus Cache - Status</title>
-    <link rel="stylesheet" href="style.css"></head>
-    <script>
-    function fetchData() {
-        fetch('/status.json')
+void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config, WiFiManager *wm){
+    server->on("/metrics", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
+    dbgln("[webserver] GET /metrics");
+
+    String response;
+
+    // ESP specific metrics
+    unsigned long uptime = millis() / 1000;
+    response += String("esp_uptime_seconds ") + String(uptime) + "\n";
+    response += String("esp_rssi ") + String(WiFi.RSSI()) + "\n";
+    response += String("esp_heap_free_bytes ") + String(ESP.getFreeHeap()) + "\n";
+
+    // Modbus metrics
+    ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
+    response += String("modbus_primary_rtu_messages ") + String(rtu->getMessageCount()) + "\n";
+    response += String("modbus_primary_rtu_pending_messages ") + String(rtu->pendingRequests()) + "\n";
+    response += String("modbus_primary_rtu_errors ") + String(rtu->getErrorCount()) + "\n";
+
+    ModbusClientTCPasync* modbusTCPClient = modbusCache->getModbusTCPClient();
+    response += String("modbus_secondary_tcp_messages ") + String(modbusTCPClient->getMessageCount()) + "\n";
+    response += String("modbus_secondary_tcp_errors ") + String(modbusTCPClient->getErrorCount()) + "\n";
+
+    ModbusServerRTU& modbusRTUServer = modbusCache->getModbusRTUServer();
+    response += String("modbus_server_messages ") + String(modbusRTUServer.getMessageCount()) + "\n";
+    response += String("modbus_server_errors ") + String(modbusRTUServer.getErrorCount()) + "\n";
+    response += String("modbus_static_registers_fetched ") + String(modbusCache->getStaticRegistersFetched() ? 1 : 0) + "\n";
+    response += String("modbus_dynamic_registers_fetched ") + String(modbusCache->getDynamicRegistersFetched() ? 1 : 0) + "\n";
+    response += String("modbus_operational ") + String(modbusCache->getIsOperational() ? 1 : 0) + "\n";
+    response += String("modbus_bogus_register_count ") + String(modbusCache->getInsaneCounter()) + "\n";
+
+    // Add dynamic registers
+    for (auto& address : modbusCache->getDynamicRegisterAddresses()) {
+        String formattedValue = modbusCache->getFormattedRegisterValue(address);
+        auto regDef = modbusCache->getRegisterDefinition(address);
+        if (regDef.has_value()) {
+            String metricName = regDef->description;
+            metricName.replace("(", ""); // Remove parentheses
+            metricName.replace(")", ""); // Remove parentheses
+            metricName.replace("-", ""); // Remove hyphens
+            metricName.replace("+", ""); // Remove plus signs
+            metricName.trim();
+            metricName.replace(" ", "_"); // Replace spaces with underscores for Prometheus compliance
+            metricName.toLowerCase();
+
+            // Remove units from values
+            formattedValue.replace(" V", "");
+            formattedValue.replace(" A", "");
+
+            formattedValue.replace(" W", "");
+            formattedValue.replace(" VA", "");
+            formattedValue.replace(" var", "");
+            formattedValue.replace(" kWh", "");
+            formattedValue.replace(" kVARh", "");
+            formattedValue.replace(" Hz", "");
+            formattedValue.replace("A", "");
+
+            response += metricName + " " + formattedValue + "\n";
+        }
+    }
+
+    // Send the response to Prometheus
+    request->send(200, "text/plain", response);
+  });
+
+
+  server->on("/lookup", HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (!request->hasParam("bssid")) {
+          request->send(400, "application/json", "{\"error\":\"Missing BSSID parameter\"}");
+          return;
+      }
+
+      String bssid = request->getParam("bssid")->value();
+      WiFiClient client;
+      HTTPClient http;
+      String url = "http://api.maclookup.app/v2/macs/" + bssid;
+
+      if (http.begin(client, url)) {
+          int httpCode = http.GET();
+          if (httpCode == HTTP_CODE_OK) {
+              String payload = http.getString();
+              request->send(200, "application/json", payload);
+          } else {
+              request->send(500, "application/json", "{\"error\":\"API request failed\"}");
+          }
+          http.end();
+      } else {
+          request->send(500, "application/json", "{\"error\":\"HTTP connection failed\"}");
+      }
+  });
+  server->on("/", HTTP_GET, [config](AsyncWebServerRequest *request){
+    dbgln("[webserver] GET /");
+    const String &hostname = config->getHostname();
+    auto *response = request->beginResponseStream("text/html");
+    sendResponseHeader(response, "Main", false, hostname);
+    sendButton(response, "Status", "status");
+    sendButton(response, "Config", "config");
+    sendButton(response, "Debug", "debug");
+    sendButton(response, "Firmware update", "update");
+    sendButton(response, "WiFi reset", "wifi", "r");
+    sendButton(response, "Reboot", "reboot", "r");
+    sendResponseTrailer(response);
+    request->send(response);
+  });
+
+  server->on("/status", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
+    dbgln("[webserver] GET /status");
+
+    // Prepare to send an HTML response stream
+    AsyncResponseStream *response = request->beginResponseStream("text/html");
+
+    // Send the header with the hostname and title
+    String hostname = WiFi.getHostname();  // Fetch the hostname
+    sendResponseHeader(response, "Status", false, hostname);
+
+    // Send the content of the status page
+    response->print(
+      R"rawliteral(
+      <script>
+        function fetchData() {
+          fetch('/status.json')
             .then(response => response.json())
             .then(data => {
                 const table = document.getElementById('statusTable');
@@ -48,46 +159,61 @@ const char STATUS_HTML[] PROGMEM = R"rawliteral(
                     cellValue.textContent = item.value;
                     cellLow.textContent = item.low;
                     cellHigh.textContent = item.high;
+
+                    // Check if the current row is for the BSSID
+                    if (item.name === "ESP BSSID") {
+                        appendBssidCompany(cellValue, item.value);
+                    }
                 });
             })
             .catch(error => console.error('Error:', error));
-    }
+        }
 
-    setInterval(fetchData, 3000); // Refresh every 3 seconds
-    document.addEventListener('DOMContentLoaded', fetchData); // Initial fetch
-</script>
+        function appendBssidCompany(cell, bssid) {
+          // Check if the BSSID is already cached
+          const cachedData = localStorage.getItem(`bssid-${bssid}`);
+          if (cachedData) {
+              const company = JSON.parse(cachedData).company;
+              cell.textContent += ` (${company})`;
+              return;
+          }
 
-</head>
-<body>
-    <h2>ESP32 Modbus Cache</h2>
-    <h3>Status</h3>
-    <div id="content">
-    <table id="statusTable"></table>
-    <p></p>
-    <form method="get" action="/">
-    <button class="">Back</button></form><p></p></div>
-</body>
-</html>
-)rawliteral";
+          // Fetch the MAC lookup asynchronously
+          fetch(`/lookup?bssid=${bssid}`)
+              .then(response => response.json())
+              .then(data => {
+                  if (data.success && data.found) {
+                      const company = data.company;
+                      // Cache the result in localStorage
+                      localStorage.setItem(`bssid-${bssid}`, JSON.stringify({ company }));
 
-void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config, WiFiManager *wm){
-  server->on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /");
-    auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Main");
-    sendButton(response, "Status", "status");
-    sendButton(response, "Config", "config");
-    sendButton(response, "Debug", "debug");
-    sendButton(response, "Firmware update", "update");
-    sendButton(response, "WiFi reset", "wifi", "r");
-    sendButton(response, "Reboot", "reboot", "r");
+                      // Update the cell with the company name
+                      cell.textContent += ` (${company})`;
+                  } else {
+                      console.warn(`No data found for BSSID: ${bssid}`);
+                  }
+              })
+              .catch(error => console.error('MAC Lookup Error:', error));
+        }
+
+        setInterval(fetchData, 3000); // Refresh every 3 seconds
+        document.addEventListener('DOMContentLoaded', fetchData); // Initial fetch
+      </script>
+      <div id="content">
+        <table id="statusTable"></table>
+        <p></p>
+        <form method="get" action="/">
+          <button class="">Back</button>
+        </form>
+        <p></p>
+      )rawliteral"
+    );
+
+    // Send the response trailer (closing tags)
     sendResponseTrailer(response);
-    request->send(response);
-  });
 
-  server->on("/status", HTTP_GET, [modbusCache](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /status");
-    request->send_P(200, "text/html", STATUS_HTML);
+    // Send the final response
+    request->send(response);
   });
 
   // Endpoint to serve JSON data
@@ -119,6 +245,9 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     addSystemInfo("ESP WiFi Quality", String(WiFiQuality(WiFi.RSSI())));
     addSystemInfo("ESP MAC", WiFi.macAddress());
     addSystemInfo("ESP IP", WiFi.localIP().toString());
+    addSystemInfo("ESP Subnet Mask", WiFi.subnetMask().toString());
+    addSystemInfo("ESP Gateway", WiFi.gatewayIP().toString());
+    addSystemInfo("ESP BSSID", WiFi.BSSIDstr());
     ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
     addSystemInfo("Primary RTU Messages", String(rtu->getMessageCount()));
     addSystemInfo("Primary RTU Pending Messages", String(rtu->pendingRequests()));
@@ -139,6 +268,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     addSystemInfo("Server - Static Registers Fetched", modbusCache->getStaticRegistersFetched() ? "Yes" : "No");
     addSystemInfo("Server - Dynamic Registers Fetched", modbusCache->getDynamicRegistersFetched() ? "Yes" : "No");
     addSystemInfo("Server - Operational", modbusCache->getIsOperational() ? "Yes" : "No");
+    addSystemInfo("ET112 BAUD Rate", modbusCache->getCGBaudRate());
 
     // Add dynamic registers with low and high watermarks
     for (auto& address : modbusCache->getDynamicRegisterAddresses()) {
@@ -170,13 +300,68 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     String jsonResponse;
     serializeJson(doc, jsonResponse);
     request->send(200, "application/json", jsonResponse);
-});
+  });
 
-
-  server->on("/reboot", HTTP_GET, [](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /reboot");
+  server->on("/baudrate", HTTP_GET, [config,modbusCache](AsyncWebServerRequest *request) {
+    dbgln("[webserver] GET /baudrate");
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Really?");
+    const String &hostname = config->getHostname();
+
+    response->print("<p class=\"w\" style=\"color: red; font-weight: bold;\">"
+                    "WARNING: Changing the baud rate from 9.6 kbps can make it impossible to directly address the ET112 from a CerboGX. "
+                    "The CerboGX requires 9.6 kbps for direct Modbus RTU communication.<br>However, if you are using the ESP32 caching proxy, 38.4 kbps is recommended. "
+                    "<br />Please proceed at your own risk.<br /> You will need to manually change the RTU Client bps rate in the \"Config\" section "
+                    "after making this change.</p>");
+
+    sendResponseHeader(response, "Set Baud Rate", true, hostname);
+
+    response->print("<p class=\"e\">Select a new baud rate:</p>");
+    response->print("<form method=\"post\">"
+                    "<label><input type=\"radio\" name=\"baudrate\" value=\"1\"> 9.6 kbps</label><br>"
+                    "<label><input type=\"radio\" name=\"baudrate\" value=\"2\"> 19.2 kbps</label><br>"
+                    "<label><input type=\"radio\" name=\"baudrate\" value=\"3\"> 38.4 kbps</label><br>"
+                    "<label><input type=\"radio\" name=\"baudrate\" value=\"4\"> 57.6 kbps</label><br>"
+                    "<label><input type=\"radio\" name=\"baudrate\" value=\"5\"> 115.2 kbps</label><br><br>"
+                    "<button type=\"submit\" class=\"g\">Set Baud Rate</button>"
+                    "</form>"
+                    "<hr/>");
+    sendButton(response, "Back", "/");
+    sendResponseTrailer(response);
+    request->send(response);
+  });
+
+  server->on("/baudrate", HTTP_POST, [modbusCache](AsyncWebServerRequest *request) {
+    dbgln("[webserver] POST /baudrate");
+
+    if (!request->hasParam("baudrate", true)) {
+        dbgln("[webserver] Missing baudrate parameter");
+        request->send(400, "text/plain", "Missing baudrate parameter");
+        return;
+    }
+
+    // Retrieve the selected baud rate
+    String baudRateParam = request->getParam("baudrate", true)->value();
+    uint16_t baudRateValue = baudRateParam.toInt();
+
+    if (baudRateValue < 1 || baudRateValue > 5) {
+        dbgln("[webserver] Invalid baudrate value");
+        request->send(400, "text/plain", "Invalid baudrate value");
+        return;
+    }
+
+    // Set the baud rate using the ModbusCache function
+    modbusCache->setCGBaudRate(baudRateValue);
+    dbgln("[webserver] Baud rate set to " + String(baudRateValue));
+
+    // Redirect back to the GET page
+    request->redirect("/baudrate");
+  });
+
+  server->on("/reboot", HTTP_GET, [config](AsyncWebServerRequest *request){
+    dbgln("[webserver] GET /reboot");
+    const String &hostname = config->getHostname();
+    auto *response = request->beginResponseStream("text/html");
+    sendResponseHeader(response, "Really?", false, hostname);
     sendButton(response, "Back", "/");
     response->print("<form method=\"post\">"
         "<button class=\"r\">Yes, do it!</button>"
@@ -192,10 +377,14 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     dbgln("[webserver] rebooted...")
   });
   server->on("/config", HTTP_GET, [config](AsyncWebServerRequest *request){
-      dbgln("[webserver] GET /config");
+    dbgln("[webserver] GET /config");
+    const String &hostname = config->getHostname();
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Modbus Client (master)");
+    sendResponseHeader(response, "Modbus Client (master)", false, hostname);
     response->print("<form method=\"post\">");
+    response->print("<label for=\"hostname\">Hostname:</label>");
+    response->printf("<input type=\"text\" id=\"hostname\" name=\"hostname\" value=\"%s\"><br/>", config->getHostname().c_str());
+
     // Checkbox for Modbus Client is RTU
     response->print("<label for=\"clientIsRTU\">Modbus Client is RTU:</label>");
     response->printf("<input type=\"checkbox\" id=\"clientIsRTU\" name=\"clientIsRTU\" %s><br/>",
@@ -440,6 +629,11 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
   server->on("/config", HTTP_POST, [config](AsyncWebServerRequest *request){
     dbgln("[webserver] POST /config");
     bool validIP = true;
+    if (request->hasParam("hostname", true)) {
+        String hostname = request->getParam("hostname", true)->value();
+        config->setHostname(hostname);  // Save the hostname in preferences
+        dbgln("[webserver] saved hostname");
+    }
     if (request->hasParam("tp", true)){
       auto port = request->getParam("tp", true)->value().toInt();
       config->setTcpPort(port);
@@ -566,17 +760,20 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     }
     
   });
-  server->on("/debug", HTTP_GET, [](AsyncWebServerRequest *request){
+  server->on("/debug", HTTP_GET, [config](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /debug");
+    const String &hostname = config->getHostname();
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Debug RTU Client");
+    sendResponseHeader(response, "Debug RTU Client", false, hostname);
     sendDebugForm(response, "1", "1", "3", "1");
     sendButton(response, "Back", "/");
     sendResponseTrailer(response);
     request->send(response);
   });
-  server->on("/debug", HTTP_POST, [modbusCache](AsyncWebServerRequest *request){
+  server->on("/debug", HTTP_POST, [modbusCache, config](AsyncWebServerRequest *request){
     dbgln("[webserver] POST /debug");
+    const String &hostname = config->getHostname();
+
     ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
     String slaveId = "1";
     if (request->hasParam("slave", true)){
@@ -595,7 +792,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       count = request->getParam("count", true)->value();
     }
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Debug");
+    sendResponseHeader(response, "Debug", false, hostname);
     response->print("<pre>");
     auto previous = LOGDEVICE;
     auto previousLevel = MBUlogLvl;
@@ -624,10 +821,11 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     sendResponseTrailer(response);
     request->send(response);
   });
-  server->on("/update", HTTP_GET, [](AsyncWebServerRequest *request){
+  server->on("/update", HTTP_GET, [config](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /update");
+    const String &hostname = config->getHostname();
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Firmware Update");
+    sendResponseHeader(response, "Firmware Update", false, hostname);
     response->print("<form method=\"post\" enctype=\"multipart/form-data\">"
       "<input type=\"file\" name=\"file\" id=\"file\" required/>"
       "<p></p>"
@@ -638,7 +836,8 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     sendResponseTrailer(response);
     request->send(response);
   });
-  server->on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
+  server->on("/update", HTTP_POST, [config](AsyncWebServerRequest *request){
+    String hostname = config->getHostname();
     request->onDisconnect([](){
       ESP.restart();
     });
@@ -651,7 +850,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     else{
       auto *response = request->beginResponseStream("text/html");
       response->addHeader("Connection", "close");
-      sendResponseHeader(response, "Firmware Update", true);
+      sendResponseHeader(response, "Firmware Update", true, hostname);
       response->print("<p>Update successful.</p>");
       sendButton(response, "Back", "/");
       sendResponseTrailer(response);
@@ -682,10 +881,12 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       return;
     }
   });
-  server->on("/wifi", HTTP_GET, [](AsyncWebServerRequest *request){
+  server->on("/wifi", HTTP_GET, [config](AsyncWebServerRequest *request){
     dbgln("[webserver] GET /wifi");
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "WiFi reset");
+    const String &hostname = config->getHostname();
+
+    sendResponseHeader(response, "WiFi reset", true, hostname);
     response->print("<p class=\"e\">"
         "This will delete the stored WiFi config<br/>"
         "and restart the ESP in AP mode.<br/> Are you sure?"
@@ -779,13 +980,16 @@ void sendMinCss(AsyncResponseStream *response){
     "}");
 }
 
-void sendResponseHeader(AsyncResponseStream *response, const char *title, bool inlineStyle){
+void sendResponseHeader(AsyncResponseStream *response, const char *title, bool inlineStyle, const String &hostname){
+    // If hostname is not defined, use "ESP32 Modbus Cache"
     response->print("<!DOCTYPE html>"
       "<html lang=\"en\" class=\"\">"
       "<head>"
       "<meta charset='utf-8'>"
       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,user-scalable=no\"/>");
-    response->printf("<title>ESP32 Modbus Cache - %s</title>", title);
+    // The title should be "hostname - title"
+    response->printf("<title>%s - %s</title>", hostname.isEmpty() ? "ESP32 Modbus Cache" : hostname.c_str(), title);
+
     if (inlineStyle){
       response->print("<style>");
       sendMinCss(response);
@@ -794,10 +998,10 @@ void sendResponseHeader(AsyncResponseStream *response, const char *title, bool i
     else{
       response->print("<link rel=\"stylesheet\" href=\"style.css\">");
     }
-    response->print(
+    response->printf(
       "</head>"
       "<body>"
-      "<h2>ESP32 Modbus Cache</h2>");
+      "<h2>%s</h2>", hostname.isEmpty() ? "ESP32 Modbus Cache" : hostname.c_str());
     response->printf("<h3>%s</h3>", title);
     response->print("<div id=\"content\">");
 }

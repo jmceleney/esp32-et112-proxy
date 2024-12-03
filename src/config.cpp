@@ -1,4 +1,5 @@
 #include "config.h"
+#include <WiFi.h>
 
 Config::Config()
     :_prefs(NULL)
@@ -35,6 +36,13 @@ void Config::begin(Preferences *prefs)
     _serialBaudRate = _prefs->getULong("serialBaudRate", _serialBaudRate);
     _serialConfig = _prefs->getULong("serialConfig", _serialConfig);
     _clientIsRTU = _prefs->getBool("clientIsRTU", _clientIsRTU);
+    if (_prefs->isKey("hostname")) {
+        _hostname = _prefs->getString("hostname", "");  // Use stored hostname if present
+    } else {
+        uint8_t mac[6];
+        WiFi.macAddress(mac);
+        _hostname = "esp32-" + String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);  // Generate hostname from MAC
+    }
 }
 
 uint16_t Config::getTcpPort(){
@@ -270,4 +278,13 @@ void Config::setClientIsRTU(bool value){
 
 bool Config::getClientIsRTU(){
     return _clientIsRTU;
+}
+
+String Config::getHostname() const {
+    return _hostname;
+}
+
+void Config::setHostname(const String& hostname) {
+    _hostname = hostname;
+    _prefs->putString("hostname", _hostname); // Save hostname to preferences
 }

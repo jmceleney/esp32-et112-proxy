@@ -11,7 +11,7 @@
     #include "debug.h"
 
     void setupPages(AsyncWebServer* server, ModbusCache *modbusCache, Config *config, WiFiManager *wm);
-    void sendResponseHeader(AsyncResponseStream *response, const char *title, bool inlineStyle = false);
+    void sendResponseHeader(AsyncResponseStream *response, const char *title, bool inlineStyle = false, const String &hostname = "");
     void sendResponseTrailer(AsyncResponseStream *response);
     void sendButton(AsyncResponseStream *response, const char *title, const char *action, const char *css = "");
     void sendTableRow(AsyncResponseStream *response, const char *name, uint32_t value);

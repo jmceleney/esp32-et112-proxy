@@ -229,63 +229,82 @@ Uint16Pair ModbusCache::split32BitRegister(uint32_t value) {
 }
 
 void ModbusCache::update() {
-    if (millis() - lastPollStart >= update_interval) {
+    if (millis() - lastPollEnd >= update_interval) {
         lastPollStart = millis();
 
-        dbgln("\nUpdate Status:-");
-        dbgln("[update] Last successful update: " + String(instance->lastSuccessfulUpdate));
-        dbgln("Time since update recvd: " + String(millis() - instance->lastSuccessfulUpdate) + "ms");
-        dbgln("Pending reqs: " + String(requestMap.size()));
+        String statusMsg = "\nUpdate Status @ "+String(lastPollStart)+":-\n"
+                           "[update] Last successful update: " + String(instance->lastSuccessfulUpdate) + "\n"
+                           "[update] Time since update recvd: " + String(millis() - instance->lastSuccessfulUpdate) + "ms\n"
+                           "[update] Pending reqs: " + String(requestMap.size()) + "\n";
+
+        // Check for timed-out requests
+        std::vector<uint32_t> timedOutTokens;
+        if (xSemaphoreTake(mutex, portMAX_DELAY)) {
+            for (const auto& entry : requestMap) {
+                uint32_t token = entry.first;
+                unsigned long timestamp = std::get<2>(entry.second);
+                unsigned long now = millis();
+                if (now - timestamp > 5000) { // Timeout: 5 seconds
+                    //statusMsg += "[update] Request timed out. Token: " + String(token) + "\n";
+                    logErrln("[update] Request timed out. Token: " + String(token));
+                    timedOutTokens.push_back(token);
+                } else {
+                    // Log the token ID and time (second)
+                    statusMsg += "[update] Token NOT timed out: " + String(token) + ", Elapsed: " + String((now - timestamp) / 1000) + ", Now: " + String(now)+"\n";
+                }
+            }
+            xSemaphoreGive(mutex); // Release the mutex
+        }
 
         // Check if we have exceeded the no-update timeout
-        if (millis() - instance->lastSuccessfulUpdate > 30000) { // Timeout: 30 seconds
-            logErrln("No updates for 30 seconds. Restarting.");
+        unsigned long lastUpdate = instance->lastSuccessfulUpdate;
+        unsigned long now = millis();
+        unsigned long timeSinceLastUpdate = now - lastUpdate;
+        // We need to ensure that now is greater than lastSuccessfulUpdate to avoid underflow
+        if (timeSinceLastUpdate > 30000 && now > lastUpdate) {
+            logErr(statusMsg);
+            logErrln("No updates for " + String(timeSinceLastUpdate / 1000) + " seconds (" + String(now) + "-" +
+                     String(instance->lastSuccessfulUpdate) + "). Restarting.");
             //resetConnection();
-            delay(5000);
+            delay(2000);
             ESP.restart();
             return;
         }
 
-        // Check for timed-out requests
-        std::vector<uint32_t> timedOutTokens;
-        for (const auto& entry : requestMap) {
-            uint32_t token = entry.first;
-            unsigned long timestamp = std::get<2>(entry.second);
-            if (millis() - timestamp > 5000) { // Timeout: 5 seconds
-                dbgln("Request timed out. Token: " + String(token));
-                timedOutTokens.push_back(token);
-            }
-        }
+        dbg(statusMsg);
 
         // Purge timed-out tokens
         for (uint32_t token : timedOutTokens) {
+            dbgln("[update] Purging timed-out token: " + String(token));
             purgeToken(token);
+            dbgln("[update] Token purged");
         }
 
         // Skip updates if too many requests are still pending
         if (requestMap.size() > 2) {
-            dbgln("WARN: Skip update: " + String(requestMap.size()) + " pending reqs");
-            dbgln("Current requests in map:");
-            for (const auto& entry : requestMap) {
-                unsigned long age = millis() - std::get<2>(entry.second);
-                dbgln("Token: " + String(entry.first) + 
-                     ", Start Address: " + String(std::get<0>(entry.second)) + 
-                     ", Time: " + String(std::get<2>(entry.second)));
-            }
+            dbgln("[update] Too many requests pending. Skipping update.");
             return;
         }
 
-        dbgln("Update modbusCache");
+        dbgln("[update] Now we update modbusCache");
+        
+        // Log last poll start time
+        dbgln("[update] Last poll start: " + String(lastPollStart));
 
         if (!staticRegistersFetched) {
-            dbgln("Fetching static registers...");
+            dbgln("[update] Fetching static registers...");
             fetchFromRemote(staticRegisterAddresses);
         } else {
             fetchFromRemote(dynamicRegisterAddresses);
         }
+        lastPollEnd = millis();
 
         updateServerStatus();
+        dbgln("[update] Finished poll at: " + String(lastPollEnd));
 
+    } else {
+        // Log the time until the next update
+        dbgln("[update]Skip update. Time until next update: " + String(update_interval - (millis() - lastPollEnd)) + "ms");
     }
 }
 
@@ -505,9 +524,9 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
             if (requestMap.size() >= 200) {
                 // Remove the oldest entry
                 uint32_t oldestToken = insertionOrder.front();
-                dbgln("Removing oldest entry with token: " + String(oldestToken));
+                dbgln("[sendModbusRequest] Removing oldest entry with token: " + String(oldestToken));
                 requestMap.erase(oldestToken);
-                dbgln("Erasing token done");
+                dbgln("[sendModbusRequest] Erasing token done");
                 insertionOrder.pop();
             }
             xSemaphoreGive(mutex); // Release the mutex
@@ -520,7 +539,7 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
         }
 
         if (err != SUCCESS) {
-            logErrln("Error adding request: " + String((int)err));
+            logErrln("[sendModbusRequest] Error adding request: " + String((int)err));
         }
         
     }
@@ -528,7 +547,7 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
 
 // This function handles responses from the Modbus TCP client
 void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
-    dbgln("Received response for token: " + String(token));
+    dbgln("[handleData] Received response for token: " + String(token));
     printHex(response.data(), response.size());
     auto it = instance->requestMap.find(token);
     if (it != instance->requestMap.end()) {
@@ -537,7 +556,7 @@ void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
         unsigned long sentTimestamp = std::get<2>(it->second);
         
         unsigned long responseTime = millis() - sentTimestamp;
-        dbgln("Response time for token " + String(token) + ": " + String(responseTime) + " ms");
+        dbgln("[handleData] Response time for token " + String(token) + ": " + String(responseTime) + " ms");
 
         dbgln("[handleData] Start address: " + String(startAddress) + ", register count: " + String(regCount));
         printHex(response.data(), response.size());
@@ -547,25 +566,27 @@ void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
         instance->lastSuccessfulUpdate = millis();
         dbgln("[handleData] Current millis: " + String(millis()));
         dbgln("[handleData] Last successful update: " + String(instance->lastSuccessfulUpdate));
-        instance->purgeToken(token); // Cleanup the token now that the response has been processed
+        instance->purgeToken(token);
+        dbgln("[handleData] token purged");
         if(instance->insertionOrder.size() > 6) {
             dbgln("[rcpt:" + String(token) + "] Queue size: " + String(instance->insertionOrder.size()) + ", map size: " + String(instance->requestMap.size()));
         }
     } else {
-        logErrln("Token " + String(token) + " not found in map");
+        logErrln("[handleData] Token " + String(token) + " not found in map");
     }
+    dbgln("[handleData] Done");
     yield();
 }
 
 void ModbusCache::handleError(Error error, uint32_t token) {
     ModbusError me(error);
-    dbgln("\n=== Modbus Error ===");
-    dbgln("Error code: 0x" + String((int)error, HEX));
-    dbgln("Error message: " + String((const char *)me));
-    dbgln("Token: " + String(token));
+    logErrln("\n=== Modbus Error ===");
+    logErrln("[handleError] Error code: 0x" + String((int)error, HEX));
+    logErrln("[handleError] Error message: " + String((const char *)me));
+    logErrln("[handleError] Token (to purge): " + String(token));
     
     instance->purgeToken(token);
-    dbgln("Map size after purge: " + String(instance->requestMap.size()));
+    logErrln("[handleError] Map size after purge: " + String(instance->requestMap.size()));
 }
 
 void ModbusCache::purgeToken(uint32_t token) {
@@ -587,9 +608,9 @@ void ModbusCache::purgeToken(uint32_t token) {
 
         // Remove tokens from the map
         for (uint32_t purgeToken : tokensToPurge) {
-            dbgln("Erasing token " + String(purgeToken) + " from map");
+            dbgln("[purgeToken] Erasing token " + String(purgeToken) + " from map");
             requestMap.erase(purgeToken);
-            dbgln("Erasing token done");
+            dbgln("[purgeToken] Erasing token done");
         }
 
         // Efficiently process the queue
@@ -606,7 +627,7 @@ void ModbusCache::purgeToken(uint32_t token) {
         //dbgln("Swapping done");
         xSemaphoreGive(mutex); // Release the mutex
     }
-    dbgln("Erasing tokens done");
+    dbgln("[purgeToken] Erasing tokens done");
 }
 
 uint32_t extract32BitValue(const uint8_t* buffer, size_t index) {
@@ -661,7 +682,7 @@ void ModbusCache::processResponsePayload(ModbusMessage& response, uint16_t start
             setRegisterValue(currentAddress, value); // Default is 16-bit operation
             payloadIndex += 2; // Move past the 16-bit value in the payload
         } else {
-            dbgln("Address " + String(currentAddress) + " not defined as 16 or 32 bit. Skipping...");
+            dbgln("[processResponsePayload] Address " + String(currentAddress) + " not defined as 16 or 32 bit. Skipping...");
             continue; // Skip processing this address if it doesn't match known types
         }
 
@@ -675,17 +696,18 @@ void ModbusCache::processResponsePayload(ModbusMessage& response, uint16_t start
 
     // Efficiently set completion booleans
     if (!staticRegistersFetched) {
-        dbgln("staticRegistersFetched: " + String(staticRegistersFetched) + ", staticRegisterAddresses.size(): " + String(staticRegisterAddresses.size()) + ", fetchedStaticRegisters.size(): " + String(fetchedStaticRegisters.size()));
+        dbgln("[processResponsePayload] staticRegistersFetched: " + String(staticRegistersFetched) + ", staticRegisterAddresses.size(): " + String(staticRegisterAddresses.size()) + ", fetchedStaticRegisters.size(): " + String(fetchedStaticRegisters.size()));
         if (staticRegisterAddresses.size() == fetchedStaticRegisters.size()) {
             staticRegistersFetched = true;
         }
     }
     if (!dynamicRegistersFetched) {
-        dbgln("dynamicRegistersFetched: " + String(dynamicRegistersFetched) + ", dynamicRegisterAddresses.size(): " + String(dynamicRegisterAddresses.size()) + ", fetchedDynamicRegisters.size(): " + String(fetchedDynamicRegisters.size()));
+        dbgln("[processResponsePayload]  dynamicRegistersFetched: " + String(dynamicRegistersFetched) + ", dynamicRegisterAddresses.size(): " + String(dynamicRegisterAddresses.size()) + ", fetchedDynamicRegisters.size(): " + String(fetchedDynamicRegisters.size()));
         if (dynamicRegisterAddresses.size() == fetchedDynamicRegisters.size()) {
             dynamicRegistersFetched = true;
         } 
     }
+    dbgln("[processResponsePayload] Done processing payload");
 }
 
 #include <optional>

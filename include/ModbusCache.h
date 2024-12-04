@@ -196,6 +196,7 @@ private:
     String serverIPString;
     IPAddress currentIPAddress;
     unsigned long lastPollStart = 0;  // Time of the last poll start
+    unsigned long lastPollEnd = 0;
     IPAddress serverIP; // IP address of the Modbus TCP server
     uint16_t serverPort; // Port number of the Modbus TCP server
     ModbusServerRTU modbusRTUServer;
@@ -214,7 +215,7 @@ private:
     void purgeToken(uint32_t token);
     std::map<uint32_t, std::tuple<uint16_t, uint16_t, unsigned long>> requestMap; // Map to store token -> (startAddress, regCount, timestamp)
     std::queue<uint32_t> insertionOrder; // Queue to store the order in which requests were made
-    unsigned long lastSuccessfulUpdate;
+    unsigned long lastSuccessfulUpdate = 0;
     bool isOperational;
     void updateServerStatus();
     std::unordered_set<uint16_t> fetchedStaticRegisters;

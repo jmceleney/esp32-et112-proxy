@@ -15,6 +15,9 @@
 #include <IPAddress.h>
 #include <unordered_set>
 #include <SoftwareSerial.h>
+#include <deque> // Required for std::deque
+#include <algorithm> // For std::min and std::max
+#include <cmath> // For sqrtf
 
 #define MAX_REGISTERS 400
 
@@ -92,7 +95,7 @@ public:
     void addRegister(const ModbusRegister& reg); // Add a register to the cache
     std::vector<uint16_t> getRegisterValues(uint16_t startAddress, uint16_t count);
     //uint16_t getRegisterValue(uint16_t address);
-    uint16_t update_interval = 300;
+    uint16_t update_interval = 500;
     bool checkNewRegisterValue(uint16_t address, uint32_t proposedRawValue);
     void setRegisterValue(uint16_t address, uint32_t value, bool is32Bit = false);
     static ModbusMessage respondFromCache(ModbusMessage request);
@@ -135,6 +138,20 @@ public:
     void setCGBaudRate(uint16_t baudRateValue);
     std::pair<String, String> getFormattedWaterMarks(uint16_t address);
     void createEmulatedServer(const std::vector<ModbusRegister>& registers);
+    // Getters for the metrics
+    unsigned long getMinLatency() const { return minLatency; }
+    unsigned long getMaxLatency() const { return maxLatency; }
+    float getAverageLatency() const { return averageLatency; }
+    float getStdDeviation() const {
+        if (latencies.size() < 2) {
+            return 0.0f; // Return 0 if no data is available
+        }
+        size_t sampleCount = latencies.size(); // Use the actual number of samples
+
+        float variance = (sumLatencySquared / sampleCount) - (averageLatency * averageLatency);
+        return variance > 0 ? sqrtf(variance) : 0.0f;
+    }
+    void updateLatencyStats(unsigned long latency);
 
 private:
     std::vector<ModbusRegister> registers; // All registers
@@ -222,8 +239,14 @@ private:
     std::unordered_set<uint16_t> fetchedDynamicRegisters;
     bool staticRegistersFetched = false; // Flag to indicate completion of static register fetching
     bool dynamicRegistersFetched = false; // Flag to indicate completion of dynamic register fetching
- 
     SemaphoreHandle_t mutex;
+
+    std::deque<unsigned long> latencies; // Sliding window to store recent latencies
+    size_t maxLatencySamples = 100;     // Maximum number of latency samples to track
+    unsigned long minLatency = ULONG_MAX; // Minimum latency (in milliseconds)
+    unsigned long maxLatency = 0;         // Maximum latency (in milliseconds)
+    float averageLatency = 0.0f;          // Average latency (as a float for efficiency)
+    float sumLatencySquared = 0.0f;       // Sum of squared latencies (for variance and std dev)
 };
 
 #endif // MODBUSCACHE_H

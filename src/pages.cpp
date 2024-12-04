@@ -34,6 +34,10 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     response += String("modbus_dynamic_registers_fetched ") + String(modbusCache->getDynamicRegistersFetched() ? 1 : 0) + "\n";
     response += String("modbus_operational ") + String(modbusCache->getIsOperational() ? 1 : 0) + "\n";
     response += String("modbus_bogus_register_count ") + String(modbusCache->getInsaneCounter()) + "\n";
+    response += String("min_latency_ms ") + String(modbusCache->getMinLatency()) + "\n";
+    response += String("max_latency_ms ") + String(modbusCache->getMaxLatency()) + "\n";
+    response += String("average_latency_ms ") + String(modbusCache->getAverageLatency()) + "\n";
+    response += String("std_deviation_latency_ms ") + String(modbusCache->getStdDeviation()) + "\n";
 
     // Add dynamic registers
     for (auto& address : modbusCache->getDynamicRegisterAddresses()) {
@@ -252,6 +256,10 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     addSystemInfo("Primary RTU Messages", String(rtu->getMessageCount()));
     addSystemInfo("Primary RTU Pending Messages", String(rtu->pendingRequests()));
     addSystemInfo("Primary RTU Errors", String(rtu->getErrorCount()));
+    addSystemInfo("Min Latency (ms)", String(modbusCache->getMinLatency()));
+    addSystemInfo("Max Latency (ms)", String(modbusCache->getMaxLatency()));
+    addSystemInfo("Average Latency (ms)", String(modbusCache->getAverageLatency()));
+    addSystemInfo("Standard Deviation Latency (ms)", String(modbusCache->getStdDeviation()));
     // addSystemInfo("Bridge Message", String(bridge->getMessageCount()));
     // addSystemInfo("Bridge Clients", String(bridge->activeClients()));
     // addSystemInfo("Bridge Errors", String(bridge->getErrorCount()));
@@ -380,20 +388,36 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     dbgln("[webserver] GET /config");
     const String &hostname = config->getHostname();
     auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Modbus Client (master)", false, hostname);
+    sendResponseHeader(response, "Configuration", false, hostname);
     response->print("<form method=\"post\">");
-    response->print("<label for=\"hostname\">Hostname:</label>");
-    response->printf("<input type=\"text\" id=\"hostname\" name=\"hostname\" value=\"%s\"><br/>", config->getHostname().c_str());
-
+    response->printf("<table>"
+                      "<tr>"
+                        "<td>"
+                          "<label for=\"hostname\">Hostname</label>"
+                        "</td>"
+                        "<td>"
+                          "<input type=\"text\" id=\"hostname\" name=\"hostname\" value=\"%s\"><br/>", config->getHostname().c_str());
+    response->print("</td></tr>");
+    response->printf("<tr>"
+                      "<td>"
+                        "<label for=\"pi\">Modbus Client Polling Interval (ms)&nbsp;</label>"
+                      "</td>"
+                      "<td>"
+                        "<input type=\"number\" min=\"0\" id=\"pi\" name=\"pi\" value=\"%lu\">", config->getPollingInterval());
+    response->print("</td></tr>");
     // Checkbox for Modbus Client is RTU
-    response->print("<label for=\"clientIsRTU\">Modbus Client is RTU:</label>");
-    response->printf("<input type=\"checkbox\" id=\"clientIsRTU\" name=\"clientIsRTU\" %s><br/>",
-                     config->getClientIsRTU() ? "checked" : "");
-
+    response->printf("<tr>"
+                      "<td>"
+                        "<label for=\"clientIsRTU\">Modbus Client is RTU</label>"
+                      "</td>"
+                      "<td>"
+                        "<input type=\"checkbox\" id=\"clientIsRTU\" name=\"clientIsRTU\" %s><br/>", config->getClientIsRTU() ? "checked" : "");
+    response->print("</td></tr></table>");
     // Modbus Primary RTU section
     response->print("<div id=\"rtuSettings\" style=\"display:none;\">"
       "<h3>Modbus RTU Client</h3>"
-      "<table>"
+      "<table>");
+    response->print(
         "<tr>"
           "<td>"
             "<label for=\"mb\">Baud rate</label>"
@@ -401,8 +425,8 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
           "<td>");
     response->printf("<input type=\"number\" min=\"0\" id=\"mb\" name=\"mb\" value=\"%lu\">", config->getModbusBaudRate());
     response->print("</td>"
-        "</tr>"
-        "<tr>"
+        "</tr>");
+    response->printf("<tr>"
           "<td>"
             "<label for=\"md\">Data bits</label>"
           "</td>"
@@ -601,8 +625,8 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
               "<option value=\"3\">2 bits</option>"
             "</select>"
           "</td>"
-        "</tr>"
-        "</table>");
+          "</tr>");
+    response->printf("</table>");
     response->print("<button class=\"r\">Save</button>"
       "</form>"
       "<p></p>");
@@ -737,6 +761,11 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       auto stop = request->getParam("ss", true)->value().toInt();
       config->setSerialStopBits(stop);
       dbgln("[webserver] saved serial stop bits");
+    }
+    if (request->hasParam("pi", true)){
+      auto pollingInterval = request->getParam("pi", true)->value().toInt();
+      config->setPollingInterval(pollingInterval);
+      dbgln("[webserver] saved polling interval");
     }
     // Redirect logic with error handling
     if (validIP) {

@@ -17,6 +17,7 @@ Config::Config()
     ,_serialBaudRate(115200)
     ,_serialConfig(SERIAL_8N1)
     ,_clientIsRTU(true)
+    ,_pollingInterval(500)
 {}
 
 void Config::begin(Preferences *prefs)
@@ -36,6 +37,7 @@ void Config::begin(Preferences *prefs)
     _serialBaudRate = _prefs->getULong("serialBaudRate", _serialBaudRate);
     _serialConfig = _prefs->getULong("serialConfig", _serialConfig);
     _clientIsRTU = _prefs->getBool("clientIsRTU", _clientIsRTU);
+    _pollingInterval = _prefs->getULong("pollingInterval", _pollingInterval);
     if (_prefs->isKey("hostname")) {
         _hostname = _prefs->getString("hostname", "");  // Use stored hostname if present
     } else {
@@ -279,6 +281,17 @@ void Config::setClientIsRTU(bool value){
 bool Config::getClientIsRTU(){
     return _clientIsRTU;
 }
+
+unsigned long Config::getPollingInterval(){
+    return _pollingInterval;
+}
+
+void Config::setPollingInterval(unsigned long value){
+    if (_pollingInterval == value) return;
+    _pollingInterval = value;
+    _prefs->putULong("pollingInterval", _pollingInterval);
+}
+
 
 String Config::getHostname() const {
     return _hostname;

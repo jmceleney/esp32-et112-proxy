@@ -89,6 +89,9 @@ void ModbusCache::begin() {
     modbusRTUServer.begin(modbusServerSerial, RTU_server_core); // or modbusRTUServer.begin(modbusServerSerial, -1) to specify coreID
     MBserver.start(config.getTcpPort3(), 20, config.getTcpTimeout());
 
+    // Set update_interval from config
+    update_interval = config.getPollingInterval();
+
     if(config.getClientIsRTU()) {
         modbusRTUClient->onDataHandler(&ModbusCache::handleData);
         modbusRTUClient->onErrorHandler(&ModbusCache::handleError);
@@ -497,7 +500,7 @@ void ModbusCache::fetchFromRemote(const std::set<uint16_t>& regAddresses) {
 
 
 void ModbusCache::updateServerStatus() {
-    if (millis() - instance->lastSuccessfulUpdate > (update_interval + 6000)) {
+    if (millis() - instance->lastSuccessfulUpdate > (update_interval + 2000)) {
         isOperational = false;
     } else if(staticRegistersFetched && dynamicRegistersFetched) {
         isOperational = true;
@@ -545,6 +548,37 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
     }
 }
 
+void ModbusCache::updateLatencyStats(unsigned long latency) {
+    // Update min and max latencies
+    if (latencies.empty()) {
+        minLatency = maxLatency = latency;
+    } else {
+        minLatency = std::min(minLatency, latency);
+        maxLatency = std::max(maxLatency, latency);
+    }
+
+    // Handle rolling window when full
+    if (latencies.size() == maxLatencySamples) {
+        unsigned long oldest = latencies.front();
+        latencies.pop_front();
+        
+        // Recalculate rolling average properly
+        averageLatency = averageLatency + (static_cast<double>(latency) - oldest) / maxLatencySamples;
+        
+        // Update sum of squares correctly
+        sumLatencySquared = sumLatencySquared + 
+            static_cast<double>(latency) * latency - 
+            static_cast<double>(oldest) * oldest;
+    } else {
+        // Update running average for non-full window
+        size_t newSize = latencies.size() + 1;
+        averageLatency = (averageLatency * latencies.size() + latency) / newSize;
+        sumLatencySquared += static_cast<double>(latency) * latency;
+    }
+
+    latencies.push_back(latency);
+}
+
 // This function handles responses from the Modbus TCP client
 void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
     dbgln("[handleData] Received response for token: " + String(token));
@@ -557,6 +591,8 @@ void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
         
         unsigned long responseTime = millis() - sentTimestamp;
         dbgln("[handleData] Response time for token " + String(token) + ": " + String(responseTime) + " ms");
+        // Update latency stats
+        instance->updateLatencyStats(responseTime);
 
         dbgln("[handleData] Start address: " + String(startAddress) + ", register count: " + String(regCount));
         printHex(response.data(), response.size());

@@ -48,6 +48,7 @@
             unsigned long _serialBaudRate;
             uint32_t _serialConfig;
             bool _clientIsRTU;
+            unsigned long _pollingInterval;
             String _hostname;
         public:
             Config();
@@ -95,6 +96,8 @@
             void setSerialStopBits(uint8_t value);
             bool getClientIsRTU();
             void setClientIsRTU(bool value);
+            unsigned long getPollingInterval();
+            void setPollingInterval(unsigned long value);
             String getHostname() const;
             void setHostname(const String& hostname);
     };

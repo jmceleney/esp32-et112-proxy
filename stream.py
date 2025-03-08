@@ -1,3 +1,4 @@
+#!/bin/env python3
 import socket
 import sys
 from pymodbus.constants import Endian

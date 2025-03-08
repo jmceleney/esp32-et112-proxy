@@ -10,6 +10,7 @@
 #include "pages.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_wifi.h"  // For esp_wifi_restore()
 #include <cmath> // Include cmath for acos
 
 #ifdef REROUTE_DEBUG
@@ -137,6 +138,51 @@ String serverIPStr;
 uint16_t serverPort;
 ModbusCache *modbusCache = nullptr;
 int wattsRegisterAddress = -1;
+volatile int displayMode = 0;
+const int buttonPin = 13;
+// Debounce variables
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50; // 50ms debounce delay
+int lastButtonState = HIGH; // Assume button not pressed at start
+int buttonState;
+
+#define WIFI_RSSI_THRESHOLD -80  // RSSI threshold to trigger reconnection (dBm)
+#define WIFI_CHECK_INTERVAL 300000 // Check WiFi signal strength every 5 minutes
+#define WIFI_CONNECTION_VERIFY_COUNT 3 // Number of times to verify WiFi is actually disconnected
+
+// Add WiFi event handler to track connection status
+bool wifiConnected = false;
+bool wifiDisconnectDetected = false;
+unsigned long lastWiFiConnectionTime = 0; // Track when WiFi was last connected
+
+void WiFiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            dbgln("[WiFi] Connected to AP");
+            wifiConnected = true;
+            wifiDisconnectDetected = false;
+            lastWiFiConnectionTime = millis(); // Record connection time
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            dbgln("[WiFi] Disconnected from AP");
+            wifiDisconnectDetected = true;
+            wifiConnected = false;
+            lastWiFiConnectionTime = 0; // Reset connection time on disconnection
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            dbgln("[WiFi] Got IP: " + WiFi.localIP().toString());
+            wifiConnected = true;
+            if (lastWiFiConnectionTime == 0) { // If not set by CONNECTED event
+                lastWiFiConnectionTime = millis(); // Record connection time
+            }
+            break;
+        case ARDUINO_EVENT_WIFI_SCAN_DONE:
+            dbgln("[WiFi] Scan completed");
+            break;
+        default:
+            break;
+    }
+}
 
 // Callback for when we enter Access Point mode
 void configModeCallback(WiFiManager *myWiFiManager) {
@@ -148,6 +194,37 @@ void configModeCallback(WiFiManager *myWiFiManager) {
     u8g2.setFont(u8g2_font_ncenB10_tr);  // Slightly smaller
     u8g2.drawStr(0, 32, "Setup Wifi");
     u8g2.sendBuffer();
+}
+
+void handleButton() {
+  // Read the button state
+  int reading = digitalRead(buttonPin);
+
+  // Check if the button state has changed
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis(); // Reset the debounce timer
+  }
+
+  // If the debounce delay has passed and the state is stable
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // If the state is different from the previous stable state
+    if (reading != buttonState) {
+      buttonState = reading;
+
+      // Only act on the falling edge (button pressed)
+      if (buttonState == LOW) {
+        // Increment mode and wrap around
+        displayMode = (displayMode + 1) % 4;
+
+        // Print the current mode for debugging
+        Serial.print("displayMode changed to: ");
+        Serial.println(displayMode);
+      }
+    }
+  }
+
+  // Save the reading for next loop
+  lastButtonState = reading;
 }
 
 void updateDisplay() {
@@ -180,6 +257,263 @@ void updateDisplay() {
     }
 }
 
+// Function to completely reset WiFi configuration and connect to the strongest AP
+bool forceWiFiReset() {
+    dbgln("[WiFi] Performing WiFi reset due to connection issues...");
+    
+    // Disconnect from current network
+    WiFi.disconnect(true);  // true = disable and clear credentials
+    delay(500);
+    
+    // Clear WiFi settings from NVS to avoid BSSID fixation
+    // This is only done when there's an actual connection issue
+    esp_wifi_restore();
+    delay(500);
+    
+    // Set WiFi mode to STA
+    WiFi.mode(WIFI_STA);
+    delay(500);
+    
+    // Get SSID and password from WiFiManager
+    String ssid = wm.getWiFiSSID();
+    String password = wm.getWiFiPass();
+    
+    if (ssid.length() == 0 || password.length() == 0) {
+        dbgln("[WiFi] No SSID or password available, cannot reset WiFi");
+        return false;
+    }
+    
+    // Try direct connection first without scanning
+    dbgln("[WiFi] Attempting direct connection to " + ssid);
+    WiFi.begin(ssid.c_str(), password.c_str());
+    
+    // Wait briefly for connection
+    int quickAttempts = 0;
+    while (WiFi.status() != WL_CONNECTED && quickAttempts < 10) {
+        delay(300);
+        dbg(".");
+        quickAttempts++;
+    }
+    
+    // If direct connection succeeded, return success
+    if (WiFi.status() == WL_CONNECTED) {
+        dbgln("\n[WiFi] Successfully connected to " + WiFi.SSID() + 
+              " with RSSI " + String(WiFi.RSSI()) + "dBm");
+        return true;
+    }
+    
+    // Only scan if direct connection failed
+    dbgln("\n[WiFi] Direct connection failed, scanning for networks...");
+    int numNetworks = WiFi.scanNetworks(false, true);  // async=false, show_hidden=true
+    
+    if (numNetworks <= 0) {
+        dbgln("[WiFi] No networks found or scan failed");
+        // Try a standard connection again as last resort
+        WiFi.begin(ssid.c_str(), password.c_str());
+        return false;
+    }
+    
+    // Find the strongest AP with our SSID
+    int strongestRSSI = -100;
+    int strongestIndex = -1;
+    
+    for (int i = 0; i < numNetworks; i++) {
+        if (WiFi.SSID(i) == ssid) {
+            int rssi = WiFi.RSSI(i);
+            String bssid = WiFi.BSSIDstr(i);
+            int channel = WiFi.channel(i);
+            
+            dbgln("[WiFi] Found " + ssid + " with BSSID " + bssid + 
+                  " on channel " + String(channel) + 
+                  " with RSSI " + String(rssi) + "dBm");
+            
+            if (rssi > strongestRSSI) {
+                strongestRSSI = rssi;
+                strongestIndex = i;
+            }
+        }
+    }
+    
+    if (strongestIndex == -1) {
+        dbgln("[WiFi] No APs with SSID " + ssid + " found");
+        // Try a standard connection
+        WiFi.begin(ssid.c_str(), password.c_str());
+        return false;
+    }
+    
+    // Get the strongest AP's details
+    String bssid = WiFi.BSSIDstr(strongestIndex);
+    int channel = WiFi.channel(strongestIndex);
+    
+    dbgln("[WiFi] Connecting to strongest AP: " + bssid + 
+          " on channel " + String(channel) + 
+          " with RSSI " + String(strongestRSSI) + "dBm");
+    
+    // Convert string BSSID to uint8_t array
+    uint8_t bssidBytes[6];
+    sscanf(bssid.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
+           &bssidBytes[0], &bssidBytes[1], &bssidBytes[2], 
+           &bssidBytes[3], &bssidBytes[4], &bssidBytes[5]);
+    
+    // Connect to the specific BSSID and channel
+    WiFi.begin(ssid.c_str(), password.c_str(), channel, bssidBytes);
+    
+    // Wait for connection
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) { // Reduced from 30 to 20
+        delay(300); // Reduced from 500 to 300
+        dbg(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        dbgln("\n[WiFi] Successfully connected to " + WiFi.SSID() + 
+              " with BSSID " + WiFi.BSSIDstr() + 
+              " on channel " + String(WiFi.channel()) + 
+              " with RSSI " + String(WiFi.RSSI()) + "dBm");
+        
+        return true;
+    } else {
+        dbgln("\n[WiFi] Failed to connect to the strongest AP");
+        // Try a standard connection as a last resort
+        WiFi.begin(ssid.c_str(), password.c_str());
+        return false;
+    }
+}
+
+// Function to scan for the strongest AP with the same SSID and connect to it
+bool connectToStrongestAP() {
+    dbgln("[WiFi] Scanning for the strongest AP due to poor signal...");
+    
+    String currentSSID = WiFi.SSID();
+    if (currentSSID.length() == 0) {
+        currentSSID = wm.getWiFiSSID();
+    }
+    
+    if (currentSSID.length() == 0) {
+        dbgln("[WiFi] No SSID configured, cannot scan for strongest AP");
+        return false;
+    }
+    
+    // Check current signal strength first
+    int currentRSSI = WiFi.RSSI();
+    
+    // Only proceed with scanning if signal is below threshold
+    if (currentRSSI > WIFI_RSSI_THRESHOLD && WiFi.status() == WL_CONNECTED) {
+        dbgln("[WiFi] Current signal strength (" + String(currentRSSI) + "dBm) is acceptable, skipping scan");
+        return true;
+    }
+    
+    // Use synchronous scan instead of async
+    int numNetworks = WiFi.scanNetworks(false, true);  // async=false, show_hidden=true
+    
+    if (numNetworks <= 0) {
+        dbgln("[WiFi] No networks found or scan failed");
+        return false;
+    }
+    
+    int strongestRSSI = -100;
+    int strongestIndex = -1;
+    
+    for (int i = 0; i < numNetworks; i++) {
+        if (WiFi.SSID(i) == currentSSID) {
+            int rssi = WiFi.RSSI(i);
+            String bssid = WiFi.BSSIDstr(i);
+            int channel = WiFi.channel(i);
+            
+            dbgln("[WiFi] Found " + currentSSID + " with BSSID " + bssid + 
+                  " on channel " + String(channel) + 
+                  " with RSSI " + String(rssi) + "dBm");
+            
+            if (rssi > strongestRSSI) {
+                strongestRSSI = rssi;
+                strongestIndex = i;
+            }
+        }
+    }
+    
+    if (strongestIndex == -1) {
+        dbgln("[WiFi] No APs with SSID " + currentSSID + " found");
+        return false;
+    }
+    
+    // If we're already connected to the strongest AP, no need to reconnect
+    if (WiFi.status() == WL_CONNECTED && WiFi.BSSIDstr() == WiFi.BSSIDstr(strongestIndex)) {
+        dbgln("[WiFi] Already connected to the strongest AP");
+        return true;
+    }
+    
+    // Only reconnect if the strongest AP has significantly better signal (at least 10dBm better)
+    if (WiFi.status() == WL_CONNECTED && (strongestRSSI - currentRSSI < 10)) {
+        dbgln("[WiFi] Strongest AP signal (" + String(strongestRSSI) + "dBm) not significantly better than current (" + 
+              String(currentRSSI) + "dBm), staying connected");
+        return true;
+    }
+    
+    // Connect to the strongest AP
+    String password = wm.getWiFiPass();
+    String bssid = WiFi.BSSIDstr(strongestIndex);
+    int channel = WiFi.channel(strongestIndex);
+    
+    dbgln("[WiFi] Connecting to the strongest AP with BSSID " + bssid + 
+          " on channel " + String(channel) + 
+          " with RSSI " + String(strongestRSSI) + "dBm");
+    
+    // Convert string BSSID to uint8_t array
+    uint8_t bssidBytes[6];
+    sscanf(bssid.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
+           &bssidBytes[0], &bssidBytes[1], &bssidBytes[2], 
+           &bssidBytes[3], &bssidBytes[4], &bssidBytes[5]);
+    
+    // Connect to the specific BSSID and channel
+    WiFi.begin(currentSSID.c_str(), password.c_str(), channel, bssidBytes);
+    
+    // Wait for connection
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) { // Reduced from 30 to 20
+        delay(300); // Reduced from 500 to 300
+        dbg(".");
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        dbgln("\n[WiFi] Connected to " + WiFi.SSID() + 
+              " with BSSID " + WiFi.BSSIDstr() + 
+              " on channel " + String(WiFi.channel()) + 
+              " with RSSI " + String(WiFi.RSSI()) + "dBm");
+        
+        return true;
+    } else {
+        dbgln("\n[WiFi] Failed to connect to the strongest AP, falling back to normal connection");
+        WiFi.begin(currentSSID.c_str(), password.c_str());
+        return false;
+    }
+}
+
+// Function to verify WiFi is actually disconnected by checking multiple times
+bool isWiFiActuallyDisconnected() {
+    if (wifiDisconnectDetected) {
+        // If we detected a disconnect event, trust it
+        return true;
+    }
+    
+    // First quick check
+    if (WiFi.status() == WL_CONNECTED) {
+        return false;
+    }
+    
+    // Check multiple times to confirm disconnection, but with shorter delays
+    int disconnectedCount = 0;
+    for (int i = 0; i < WIFI_CONNECTION_VERIFY_COUNT; i++) {
+        if (WiFi.status() != WL_CONNECTED) {
+            disconnectedCount++;
+        }
+        delay(50); // Reduced from 100ms to 50ms
+    }
+    
+    // Only consider disconnected if all checks failed
+    return disconnectedCount == WIFI_CONNECTION_VERIFY_COUNT;
+}
 
 void setup() {
 #ifdef REROUTE_DEBUG
@@ -191,6 +525,7 @@ void setup() {
     dbgln("[config] load");
     prefs.begin("modbusRtuGw");
     config.begin(&prefs);
+    pinMode(buttonPin, INPUT_PULLUP); // Use internal pull-up resistor
 
     u8g2.begin();
     u8g2.clearBuffer();
@@ -200,8 +535,18 @@ void setup() {
 
     dbgln("[wifi] start");
 
+    // Register WiFi event handler
+    WiFi.onEvent(WiFiEventHandler);
+
+    // Prevent BSSID fixation
+    WiFi.setAutoConnect(false);
+    WiFi.setAutoReconnect(true);
+    
     String hostname = config.getHostname();
     WiFi.setHostname(hostname.c_str());
+    
+    // Set clean connect to prevent BSSID fixation
+    wm.setCleanConnect(true);
 
     wm.setAPCallback(configModeCallback); // Set callback for AP mode
     wm.setClass("invert");
@@ -211,11 +556,31 @@ void setup() {
     wm.setConfigPortalTimeout(180); 
     wm.setBreakAfterConfig(true); // Ensure we save config after portal use
 
-    // Attempt to connect or start the config portal
-    if (!wm.autoConnect()) {
-        dbgln("[WiFiManager] Failed to connect, starting captive portal...");
-        wm.startConfigPortal("ESP32_AP");
-        ESP.restart(); // Optionally restart after config portal closes
+    // First, try a complete WiFi reset and connect to the strongest AP
+    bool connected = forceWiFiReset();
+    
+    // If that fails, fall back to WiFiManager
+    if (!connected) {
+        dbgln("[WiFi] Force reset failed, falling back to WiFiManager");
+        
+        // Attempt to connect or start the config portal
+        if (!wm.autoConnect("ESP32_AP")) {
+            dbgln("[WiFiManager] Failed to connect, starting captive portal...");
+            wm.startConfigPortal("ESP32_AP");
+            ESP.restart(); // Optionally restart after config portal closes
+        }
+        
+        // After connecting with WiFiManager, try to find and connect to the strongest AP
+        if (WiFi.status() == WL_CONNECTED) {
+            dbgln("[WiFi] Connected via WiFiManager, now finding the strongest AP");
+            connectToStrongestAP();
+            
+            // Initialize WiFi connection time if not already set by event handler
+            if (lastWiFiConnectionTime == 0) {
+                lastWiFiConnectionTime = millis();
+                dbgln("[WiFi] Initialized connection time: " + String(lastWiFiConnectionTime));
+            }
+        }
     }
 
     dbgln("[wifi] finished");
@@ -253,7 +618,13 @@ void setup() {
 
 void loop() {
     static unsigned long lastUpdateTime = 0;
+    static unsigned long lastWiFiCheckTime = 0;
     static bool inAPMode = false;
+    static unsigned long lastDisconnectionCheckTime = 0;
+    static int reconnectionAttempts = 0;
+    const int maxReconnectionAttempts = 3;
+    static unsigned long reconnectionBackoff = 5000; // Start with 5 seconds
+    unsigned long currentTime = millis();
 
     // Update the Modbus Cache
     if (modbusCache) {
@@ -261,21 +632,67 @@ void loop() {
     }
 
     // Check WiFi connection status and manage AP mode
-    if (WiFi.status() != WL_CONNECTED && !inAPMode) {
-        dbgln("[WiFi] Not connected. Switching to AP mode.");
-        wm.startWebPortal();
-        inAPMode = true;
+    if (currentTime - lastDisconnectionCheckTime >= 10000) {
+        lastDisconnectionCheckTime = currentTime;
+        
+        if (isWiFiActuallyDisconnected() && !inAPMode) {
+            reconnectionAttempts++;
+            dbgln("[WiFi] Not connected. Attempt " + String(reconnectionAttempts) + " of " + String(maxReconnectionAttempts));
+            
+            if (reconnectionAttempts <= maxReconnectionAttempts) {
+                // Try a complete WiFi reset
+                bool connected = forceWiFiReset();
+                
+                if (connected) {
+                    reconnectionAttempts = 0;
+                    reconnectionBackoff = 5000; // Reset on success
+                } else {
+                    // Increase backoff time for next attempt (cap at 2 minutes)
+                    reconnectionBackoff = min(reconnectionBackoff * 2, 120000UL);
+                }
+            } else {
+                // After max attempts, switch to AP mode
+                dbgln("[WiFi] Max reconnection attempts reached, switching to AP mode");
+                wm.startWebPortal();
+                inAPMode = true;
+                reconnectionAttempts = 0;
+            }
+        } else if (WiFi.status() == WL_CONNECTED) {
+            // Reset counter if we're connected
+            reconnectionAttempts = 0;
+        }
     }
 
     // If the WiFi is connected and we were in AP mode, switch to STA mode
     if (WiFi.status() == WL_CONNECTED && inAPMode) {
         dbgln("[WiFi] Connected to WiFi. Switching to STA mode.");
         inAPMode = false;
+        
+        // Reset the WiFi check times
+        lastWiFiCheckTime = currentTime;
+        wifiDisconnectDetected = false;
     }
 
-    // Update the OLED display every 2 seconds
-    unsigned long currentTime = millis();
-    if (currentTime - lastUpdateTime >= 500) {
+    // Get current time
+    currentTime = millis();
+    
+    // Only check WiFi signal strength if we're connected
+    if (WiFi.status() == WL_CONNECTED && currentTime - lastWiFiCheckTime >= WIFI_CHECK_INTERVAL) {
+        lastWiFiCheckTime = currentTime;
+        int rssi = WiFi.RSSI();
+        dbgln("[WiFi] Current RSSI: " + String(rssi) + "dBm, BSSID: " + WiFi.BSSIDstr() + 
+              ", Channel: " + String(WiFi.channel()));
+        
+        // Only take action if signal is critically weak
+        if (rssi < WIFI_RSSI_THRESHOLD) {
+            dbgln("[WiFi] Signal strength critically low, scanning for stronger AP");
+            connectToStrongestAP();
+        }
+    }
+
+    handleButton();
+    // Update the OLED
+    if (currentTime - lastUpdateTime >= 200) {
         lastUpdateTime = currentTime;
         updateDisplay();
     }

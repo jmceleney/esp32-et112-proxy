@@ -267,10 +267,11 @@ void ModbusCache::update() {
         if (timeSinceLastUpdate > 30000 && now > lastUpdate) {
             logErr(statusMsg);
             logErrln("No updates for " + String(timeSinceLastUpdate / 1000) + " seconds (" + String(now) + "-" +
-                     String(instance->lastSuccessfulUpdate) + "). Restarting.");
-            //resetConnection();
-            delay(2000);
-            ESP.restart();
+                     String(instance->lastSuccessfulUpdate) + "). Resetting connection.");
+            resetConnection();
+            // Don't restart the ESP32, just reset the connection
+            // delay(2000);
+            // ESP.restart();
             return;
         }
 
@@ -307,7 +308,12 @@ void ModbusCache::update() {
 
     } else {
         // Log the time until the next update
-        dbgln("[update]Skip update. Time until next update: " + String(update_interval - (millis() - lastPollEnd)) + "ms");
+        static unsigned long lastSkipLogTime = 0;
+        unsigned long currentTime = millis();
+        if (currentTime - lastSkipLogTime > 500) {
+            dbgln("[update]Skip update. Time until next update: " + String(update_interval - (currentTime - lastPollEnd)) + "ms");
+            lastSkipLogTime = currentTime;
+        }
     }
 }
 
@@ -561,13 +567,13 @@ void ModbusCache::updateLatencyStats(unsigned long latency) {
     if (latencies.size() == maxLatencySamples) {
         unsigned long oldest = latencies.front();
         latencies.pop_front();
-        
+
         // Recalculate rolling average properly
         averageLatency = averageLatency + (static_cast<double>(latency) - oldest) / maxLatencySamples;
-        
+
         // Update sum of squares correctly
-        sumLatencySquared = sumLatencySquared + 
-            static_cast<double>(latency) * latency - 
+        sumLatencySquared = sumLatencySquared +
+            static_cast<double>(latency) * latency -
             static_cast<double>(oldest) * oldest;
     } else {
         // Update running average for non-full window

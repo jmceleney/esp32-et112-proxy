@@ -5,6 +5,9 @@
 
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
 
+// External variable declaration for WiFi connection time
+extern unsigned long lastWiFiConnectionTime;
+
 void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config, WiFiManager *wm){
     server->on("/metrics", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
     dbgln("[webserver] GET /metrics");
@@ -244,6 +247,23 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     sprintf(uptimeStr, "%lu days, %02lu:%02lu:%02lu", days, hours, minutes, seconds);
 
     addSystemInfo("ESP Uptime", uptimeStr);
+    
+    // Calculate WiFi uptime (time since last connection)
+    if (lastWiFiConnectionTime > 0 && WiFi.status() == WL_CONNECTED) {
+        unsigned long wifiUptime = (millis() - lastWiFiConnectionTime) / 1000;
+        unsigned long wifiDays = wifiUptime / 86400;
+        wifiUptime %= 86400;
+        unsigned long wifiHours = wifiUptime / 3600;
+        wifiUptime %= 3600;
+        unsigned long wifiMinutes = wifiUptime / 60;
+        unsigned long wifiSeconds = wifiUptime % 60;
+        char wifiUptimeStr[50];
+        sprintf(wifiUptimeStr, "%lu days, %02lu:%02lu:%02lu", wifiDays, wifiHours, wifiMinutes, wifiSeconds);
+        addSystemInfo("WiFi Uptime", wifiUptimeStr);
+    } else {
+        addSystemInfo("WiFi Uptime", "Not connected");
+    }
+    
     addSystemInfo("ESP SSID", WiFi.SSID());
     addSystemInfo("ESP RSSI", String(WiFi.RSSI()));
     addSystemInfo("ESP WiFi Quality", String(WiFiQuality(WiFi.RSSI())));

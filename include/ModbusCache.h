@@ -18,6 +18,7 @@
 #include <deque> // Required for std::deque
 #include <algorithm> // For std::min and std::max
 #include <cmath> // For sqrtf
+#include <atomic> // For std::atomic
 
 #define MAX_REGISTERS 400
 
@@ -113,7 +114,7 @@ public:
     ModbusClientRTU* getModbusRTUClient();
     ModbusClientTCPasync* getModbusTCPClient();
     bool getIsOperational() const {
-        return isOperational;
+        return isOperational.load();
     }
     bool getDynamicRegistersFetched() const {
         return dynamicRegistersFetched;
@@ -292,7 +293,7 @@ private:
     std::map<uint32_t, std::tuple<uint16_t, uint16_t, unsigned long>> requestMap; // Map to store token -> (startAddress, regCount, timestamp)
     std::vector<uint32_t> insertionOrder; // Vector to store the order in which requests were made
     unsigned long lastSuccessfulUpdate = 0; // Initialize to 0, will be set to current time in begin()
-    bool isOperational;
+    std::atomic<bool> isOperational;
     void updateServerStatus();
     std::unordered_set<uint16_t> fetchedStaticRegisters;
     std::unordered_set<uint16_t> fetchedDynamicRegisters;

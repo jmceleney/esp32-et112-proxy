@@ -1,6 +1,8 @@
 #include "pages.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <atomic>
+#include <map>
 
 
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
@@ -27,12 +29,13 @@
 extern unsigned long lastWiFiConnectionTime;
 
 // Variables for connection handling
-static int activeConnections = 0;
+static std::atomic<int> activeConnections{0};
 static const int MAX_CONNECTIONS = 10; // Maximum concurrent connections
 
-// Static cache variables for BSSID lookup
-static String cachedBSSID;
-static String cachedPayload;
+// BSSID cache with expiry and size limits
+static std::map<String, std::pair<String, unsigned long>> bssidCache;
+static const unsigned long BSSID_CACHE_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours
+static const size_t MAX_BSSID_CACHE_SIZE = 50;
 
 // Helper function to log heap memory at the start of each page request
 void logHeapMemory(const char* route) {
@@ -42,18 +45,33 @@ void logHeapMemory(const char* route) {
 
 // Helper function for handling connection limits
 bool canAcceptConnection() {
-  if (activeConnections >= MAX_CONNECTIONS) {
-    dbgln("[webserver] Too many active connections: " + String(activeConnections) + " - Rejecting new connection");
+  int currentConnections = activeConnections.load();
+  if (currentConnections >= MAX_CONNECTIONS) {
+    dbgln("[webserver] Too many active connections: " + String(currentConnections) + " - Rejecting new connection");
     return false;
   }
-  activeConnections++;
+  activeConnections.fetch_add(1);
   return true;
 }
 
 // Helper function to release connection count
 void releaseConnection() {
-  if (activeConnections > 0) {
-    activeConnections--;
+  int currentConnections = activeConnections.load();
+  if (currentConnections > 0) {
+    activeConnections.fetch_sub(1);
+  }
+}
+
+// Helper function to clean up expired BSSID cache entries
+void cleanupBssidCache() {
+  unsigned long currentTime = millis();
+  auto it = bssidCache.begin();
+  while (it != bssidCache.end()) {
+    if (currentTime - it->second.second > BSSID_CACHE_EXPIRY) {
+      it = bssidCache.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
@@ -134,11 +152,21 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       }
 
       String bssid = request->getParam("bssid")->value();
+      unsigned long currentTime = millis();
       
-      // Check if we have a cached result for this BSSID
-      if (bssid == cachedBSSID && cachedPayload.length() > 0) {
+      // Clean up expired cache entries periodically
+      static unsigned long lastCleanup = 0;
+      if (currentTime - lastCleanup > 300000) { // Every 5 minutes
+          cleanupBssidCache();
+          lastCleanup = currentTime;
+      }
+      
+      // Check if we have a valid cached result for this BSSID
+      auto it = bssidCache.find(bssid);
+      if (it != bssidCache.end() && 
+          currentTime - it->second.second < BSSID_CACHE_EXPIRY) {
           dbgln("[BSSID] Cache hit for " + bssid);
-          request->send(200, "application/json", cachedPayload);
+          request->send(200, "application/json", it->second.first);
           return;
       }
 
@@ -148,28 +176,46 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       String url = "http://api.maclookup.app/v2/macs/" + bssid;
 
       if (http.begin(client, url)) {
+          http.setTimeout(5000); // 5 second timeout
           int httpCode = http.GET();
           if (httpCode == HTTP_CODE_OK) {
               String payload = http.getString();
-              // Update cache
-              cachedBSSID = bssid;
-              cachedPayload = payload;
+              
+              // Manage cache size - remove oldest entries if needed
+              if (bssidCache.size() >= MAX_BSSID_CACHE_SIZE) {
+                  // Find and remove the oldest entry
+                  auto oldestIt = bssidCache.begin();
+                  unsigned long oldestTime = oldestIt->second.second;
+                  for (auto cacheIt = bssidCache.begin(); cacheIt != bssidCache.end(); ++cacheIt) {
+                      if (cacheIt->second.second < oldestTime) {
+                          oldestTime = cacheIt->second.second;
+                          oldestIt = cacheIt;
+                      }
+                  }
+                  bssidCache.erase(oldestIt);
+                  dbgln("[BSSID] Cache full, removed oldest entry");
+              }
+              
+              // Update cache with new data
+              bssidCache[bssid] = std::make_pair(payload, currentTime);
               request->send(200, "application/json", payload);
           } else {
-              // On error, try to use cached data if available
-              if (cachedPayload.length() > 0) {
-                  dbgln("[BSSID] API request failed, using cached data");
-                  request->send(200, "application/json", cachedPayload);
+              // On error, try to use any cached data if available (even expired)
+              auto fallbackIt = bssidCache.find(bssid);
+              if (fallbackIt != bssidCache.end()) {
+                  dbgln("[BSSID] API request failed, using cached data (possibly expired)");
+                  request->send(200, "application/json", fallbackIt->second.first);
               } else {
                   request->send(500, "application/json", "{\"error\":\"API request failed\"}");
               }
           }
           http.end();
       } else {
-          // On connection failure, try to use cached data if available
-          if (cachedPayload.length() > 0) {
+          // On connection failure, try to use any cached data if available
+          auto fallbackIt = bssidCache.find(bssid);
+          if (fallbackIt != bssidCache.end()) {
               dbgln("[BSSID] HTTP connection failed, using cached data");
-              request->send(200, "application/json", cachedPayload);
+              request->send(200, "application/json", fallbackIt->second.first);
           } else {
               request->send(500, "application/json", "{\"error\":\"HTTP connection failed\"}");
           }
@@ -349,34 +395,66 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
             .catch(error => console.error('Error:', error));
         }
 
+        // Debouncing for BSSID requests
+        const bssidRequestQueue = new Map();
+        let bssidRequestTimer = null;
+        
         function appendBssidCompany(cell, bssid) {
-          // Check if the BSSID is already cached
+          // Check if the BSSID is already cached with expiry
           const cachedData = localStorage.getItem(`bssid-${bssid}`);
           if (cachedData) {
-              const company = JSON.parse(cachedData).company;
-              cell.textContent += ` (${company})`;
-              return;
+              try {
+                  const data = JSON.parse(cachedData);
+                  const cacheAge = Date.now() - (data.timestamp || 0);
+                  // Use cached data if less than 24 hours old
+                  if (cacheAge < 24 * 60 * 60 * 1000) {
+                      cell.textContent += ` (${data.company})`;
+                      return;
+                  }
+              } catch (e) {
+                  // Invalid cache data, remove it
+                  localStorage.removeItem(`bssid-${bssid}`);
+              }
           }
 
-          // Fetch the MAC lookup asynchronously
-          fetch(`/lookup?bssid=${bssid}`)
-              .then(response => response.json())
-              .then(data => {
-                  if (data.success && data.found) {
-                      const company = data.company;
-                      // Cache the result in localStorage
-                      localStorage.setItem(`bssid-${bssid}`, JSON.stringify({ company }));
+          // Add to request queue for debouncing
+          bssidRequestQueue.set(bssid, cell);
+          
+          // Clear existing timer and set new one
+          if (bssidRequestTimer) clearTimeout(bssidRequestTimer);
+          bssidRequestTimer = setTimeout(processBssidRequests, 500); // 500ms debounce
+        }
+        
+        function processBssidRequests() {
+          // Process all queued BSSID requests
+          const requests = Array.from(bssidRequestQueue.entries());
+          bssidRequestQueue.clear();
+          
+          requests.forEach(([bssid, cell]) => {
+              // Fetch the MAC lookup asynchronously
+              fetch(`/lookup?bssid=${bssid}`)
+                  .then(response => response.json())
+                  .then(data => {
+                      if (data.success && data.found) {
+                          const company = data.company;
+                          // Cache the result in localStorage with timestamp
+                          localStorage.setItem(`bssid-${bssid}`, JSON.stringify({ 
+                              company: company,
+                              timestamp: Date.now()
+                          }));
 
-                      // Update the cell with the company name
-                      cell.textContent += ` (${company})`;
-                  } else {
-                      console.warn(`No data found for BSSID: ${bssid}`);
-                  }
-              })
-              .catch(error => console.error('MAC Lookup Error:', error));
+                          // Update the cell with the company name
+                          cell.textContent += ` (${company})`;
+                      } else {
+                          console.warn(`No data found for BSSID: ${bssid}`);
+                      }
+                  })
+                  .catch(error => console.error('MAC Lookup Error:', error));
+          });
         }
 
-        setInterval(fetchData, 3000); // Refresh every 3 seconds
+        // Optimized refresh interval - reduced from 3 to 5 seconds
+        setInterval(fetchData, 5000); // Refresh every 5 seconds
         document.addEventListener('DOMContentLoaded', fetchData); // Initial fetch
       </script>
       <div id="content">

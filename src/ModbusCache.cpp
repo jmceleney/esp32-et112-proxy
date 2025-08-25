@@ -173,7 +173,7 @@ void ModbusCache::begin() {
 }
 
 void ModbusCache::resetConnection() {
-    if (xSemaphoreTakeRecursive(mutex, portMAX_DELAY)) {
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(100))) {
         // Purge all tokens
         requestMap.clear();
         insertionOrder.clear(); // Simply clear the vector instead of using std::swap
@@ -485,11 +485,20 @@ void ModbusCache::initializeRegisterRanges() {
 void ModbusCache::processRegisterRange(RegisterRange& range) {
     unsigned long currentTime = millis();
     
-    // Skip if request is in flight and we haven't timed out
+    // Check if request is in flight
     if (range.inFlight) {
         unsigned long inFlightTime = currentTime - range.lastRequestTime;
-        dbgln("[processRegisterRange] Request in flight for " + String(inFlightTime) + "ms, skipping");
-        return;
+        
+        // Clear the inFlight flag if request has timed out
+        if (inFlightTime > REQUEST_TIMEOUT_MS) {
+            logErrln("[processRegisterRange] Request timed out after " + String(inFlightTime) + 
+                    "ms, clearing inFlight flag and retrying");
+            range.inFlight = false;
+            // Don't return - continue to send new request
+        } else {
+            dbgln("[processRegisterRange] Request in flight for " + String(inFlightTime) + "ms, skipping");
+            return;
+        }
     }
     
     // If this is a static range that's already been fetched, skip it
@@ -515,7 +524,7 @@ void ModbusCache::processRegisterRange(RegisterRange& range) {
     ModbusMessage request = ModbusMessage(1, 3, range.startAddress, range.regCount);
     uint32_t currentToken = globalToken++;
     
-    if (xSemaphoreTakeRecursive(mutex, portMAX_DELAY)) {
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(100))) {
         requestMap[currentToken] = std::make_tuple(range.startAddress, range.regCount, currentTime);
         xSemaphoreGiveRecursive(mutex);
     }
@@ -688,7 +697,7 @@ void ModbusCache::updateServerStatus() {
         shouldBeOperational = !timeout && completed;
         
         // Only log and update if there's a state change
-        if (shouldBeOperational != instance->isOperational) {
+        if (shouldBeOperational != instance->isOperational.load()) {
             if (!shouldBeOperational) {
                 // Transitioning to non-operational state
                 dbgln("[updateServerStatus] No updates for " + String(timeSinceUpdate / 1000) + 
@@ -699,8 +708,8 @@ void ModbusCache::updateServerStatus() {
                 dbgln("[updateServerStatus] Server is now operational");
             }
             
-            // Update the state
-            instance->isOperational = shouldBeOperational;
+            // Update the state atomically
+            instance->isOperational.store(shouldBeOperational);
         }
         
         xSemaphoreGiveRecursive(instance->mutex);
@@ -908,25 +917,34 @@ void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
     // Yield at the beginning of processing
     yield();
     
+    // Variables to collect data under mutex
+    bool requestFound = false;
+    uint16_t startAddress = 0;
+    uint16_t regCount = 0;
+    unsigned long sentTimestamp = 0;
+    unsigned long responseTime = 0;
+    String statusReport;
+    
     // Record mutex timing
     unsigned long mutexWaitStartTime = millis();
     bool mutexAcquired = false;
     
-    if (xSemaphoreTakeRecursive(instance->mutex, pdMS_TO_TICKS(100))) {
+    if (xSemaphoreTakeRecursive(instance->mutex, pdMS_TO_TICKS(50))) { // Reduced timeout
         mutexAcquired = true;
         unsigned long mutexAcquiredTime = millis();
         instance->mutexWaitingTime += (mutexAcquiredTime - mutexWaitStartTime);
         instance->mutexAcquisitionAttempts++;
         
+        // Quickly extract request data and clean up
         auto it = instance->requestMap.find(token);
         if (it != instance->requestMap.end()) {
-            uint16_t startAddress = std::get<0>(it->second);
-            uint16_t regCount = std::get<1>(it->second);
-            unsigned long sentTimestamp = std::get<2>(it->second);
+            requestFound = true;
+            startAddress = std::get<0>(it->second);
+            regCount = std::get<1>(it->second);
+            sentTimestamp = std::get<2>(it->second);
             
-            // Calculate response time
-            unsigned long responseTime = millis() - sentTimestamp;
-            dbgln("[handleData] Response time for token " + String(token) + ": " + String(responseTime) + " ms");
+            // Calculate response time with fresh millis() call
+            responseTime = millis() - sentTimestamp;
             
             // Find and mark the range as not in flight
             for (auto& range : instance->registerRanges) {
@@ -936,35 +954,36 @@ void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
                 }
             }
             
-            // Process the response payload
+            // Process the response payload (this is the heavy operation)
             instance->processResponsePayload(response, startAddress, regCount);
             instance->lastSuccessfulUpdate = millis();
             
-            // Update latency statistics
+            // Update latency statistics  
             instance->updateLatencyStats(responseTime);
             
             // Clean up the request from the map
             instance->requestMap.erase(token);
             
-            // Get status report while mutex is still held
-            String statusReport = instance->getRequestMapStatus();
-            
-            // Record mutex hold time
-            unsigned long mutexReleaseTime = millis();
-            instance->mutexHoldingTime += (mutexReleaseTime - mutexAcquiredTime);
-            instance->maxMutexHoldTime = max(instance->maxMutexHoldTime, 
-                                           mutexReleaseTime - mutexAcquiredTime);
-            
-            xSemaphoreGiveRecursive(instance->mutex);
-            
-            // Log the status report after releasing the mutex
-            dbgln(statusReport);
-        } else {
-            xSemaphoreGiveRecursive(instance->mutex);
+            // Get status report - keep this brief
+            statusReport = instance->getRequestMapStatus();
         }
+        
+        // Record mutex hold time
+        unsigned long mutexReleaseTime = millis();
+        instance->mutexHoldingTime += (mutexReleaseTime - mutexAcquiredTime);
+        instance->maxMutexHoldTime = max(instance->maxMutexHoldTime, 
+                                       mutexReleaseTime - mutexAcquiredTime);
+        
+        xSemaphoreGiveRecursive(instance->mutex);
     } else {
         // Failed to acquire mutex
         instance->mutexAcquisitionFailures++;
+    }
+    
+    // Do all logging outside the mutex to avoid holding it during I/O
+    if (requestFound) {
+        dbgln("[handleData] Response time for token " + String(token) + ": " + String(responseTime) + " ms");
+        dbgln(statusReport);
     }
     
     yield();
@@ -1007,7 +1026,7 @@ void ModbusCache::handleError(Error error, uint32_t token) {
         }
         
         // Clean up the request from the map
-        if (xSemaphoreTakeRecursive(instance->mutex, portMAX_DELAY)) {
+        if (xSemaphoreTakeRecursive(instance->mutex, pdMS_TO_TICKS(100))) {
             instance->requestMap.erase(token);
             xSemaphoreGiveRecursive(instance->mutex);
         }
@@ -1555,14 +1574,16 @@ void ModbusCache::createEmulatedServer(const std::vector<ModbusRegister>& regist
 
 
 ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
-    // Yield at start to allow other tasks to run
-    yield();
-
     // Extract request parameters once
     const uint8_t slaveID = request[0];
     const uint8_t functionCode = request[1];
     const uint16_t address = extract16BitValue(request.data(), 2);
     const uint16_t valueOrWords = extract16BitValue(request.data(), 4);
+
+    // Early exit for non-operational state (atomic check, no mutex needed)
+    if (!instance->isOperational.load()) {
+        return ModbusMessage();
+    }
 
     // Pre-allocate response buffer
     ModbusMessage response;
@@ -1572,8 +1593,8 @@ ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
     
     // Take mutex with a shorter timeout to prevent blocking too long
     if (xSemaphoreTakeRecursive(instance->mutex, pdMS_TO_TICKS(50))) {
-        // Fast path for non-operational state
-        if (!instance->isOperational) {
+        // Double-check operational state after acquiring mutex
+        if (!instance->isOperational.load()) {
             xSemaphoreGiveRecursive(instance->mutex);
             return ModbusMessage();
         }
@@ -1596,23 +1617,17 @@ ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
 
         // Handle read holding registers or read input registers (function codes 3 or 4)
         if (functionCode == 3 || functionCode == 4) {
-            // Add header information
-            response.add(slaveID);
-            response.add(functionCode);
-            response.add(static_cast<uint8_t>(valueOrWords * 2));
+            // Pre-allocate vector to collect values within critical section
+            std::vector<uint16_t> values;
+            values.reserve(valueOrWords * 2); // Reserve space for worst case
             
             uint16_t i = 0;
             uint16_t currentAddress = address;
             
-            // Calculate maximum time we should spend in this operation
-            const unsigned long MAX_PROCESSING_TIME = 200; // ms
-            
+            // Collect all values quickly without yields
             while (i < valueOrWords) {
-                // Yield every iteration to prevent WiFi starvation
-                yield();
-                
-                // Check processing time with much shorter timeout
-                if (millis() - startTime > 50) { // Reduced from 200ms to 50ms
+                // Check processing time to prevent holding mutex too long
+                if (millis() - startTime > 30) { // Reduced timeout
                     xSemaphoreGiveRecursive(instance->mutex);
                     return ModbusMessage(); // Return empty response if taking too long
                 }
@@ -1621,33 +1636,45 @@ ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
                     uint32_t value32 = instance->read32BitRegister(currentAddress);
                     Uint16Pair pair = instance->split32BitRegister(value32);
                     
-                    response.add(pair.lowWord);
+                    values.push_back(pair.lowWord);
                     if (i + 1 < valueOrWords) {
-                        response.add(pair.highWord);
+                        values.push_back(pair.highWord);
                         i++;
                     }
                     currentAddress += 2;
                 } else {
-                    response.add(instance->read16BitRegister(currentAddress));
+                    values.push_back(instance->read16BitRegister(currentAddress));
                     currentAddress++;
                 }
                 i++;
             }
+            
+            // Release mutex before building response
+            xSemaphoreGiveRecursive(instance->mutex);
+            
+            // Build response outside critical section
+            response.add(slaveID);
+            response.add(functionCode);
+            response.add(static_cast<uint8_t>(values.size() * 2));
+            
+            for (uint16_t val : values) {
+                response.add(val);
+            }
+            
+            // Log if operation took unusually long
+            unsigned long duration = millis() - startTime;
+            if (duration > 50) {
+                logErrln("[respondFromCache] Long operation: " + String(duration) + "ms for " + String(valueOrWords) + " registers");
+            }
+            
+            return response;
         }
         
+        // For any other function codes, release mutex and return empty
         xSemaphoreGiveRecursive(instance->mutex);
     } else {
         // If we couldn't acquire the mutex quickly, return empty response
         return ModbusMessage();
-    }
-    
-    // Final yield before returning
-    yield();
-    
-    // Log if this operation took unusually long
-    unsigned long duration = millis() - startTime;
-    if (duration > 100) {
-        logErrln("[respondFromCache] Long operation: " + String(duration) + "ms for " + String(valueOrWords) + " registers");
     }
     
     return response;
@@ -1818,7 +1845,7 @@ void ModbusCache::setCGBaudRate(uint16_t baudRateValue) {
     uint32_t currentToken = globalToken++;
 
     // Mutex protection for request map and queue
-    if (xSemaphoreTakeRecursive(mutex, portMAX_DELAY)) {
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(100))) {
         unsigned long timestamp = millis();
         requestMap[currentToken] = std::make_tuple(startAddress, 1, timestamp); // Register count is 1
         insertionOrder.push_back(currentToken);
@@ -1890,66 +1917,102 @@ std::pair<String, String> ModbusCache::getFormattedWaterMarks(uint16_t address) 
 ModbusCache::SystemSnapshot ModbusCache::fetchSystemSnapshot(const std::set<uint16_t>& addresses) {
     SystemSnapshot snapshot;
     
-    // Acquire mutex once for the entire operation
-    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(100))) {
+    // Structure to hold raw data collected under mutex
+    struct RawRegisterData {
+        ModbusRegister definition;
+        uint32_t rawValue;
+        uint32_t rawHighMark;
+        uint32_t rawLowMark;
+        bool is32Bit;
+        
+        // Constructor to initialize properly
+        RawRegisterData(const ModbusRegister& def) 
+            : definition(def), rawValue(0), rawHighMark(0), rawLowMark(0), is32Bit(false) {}
+    };
+    
+    std::map<uint16_t, RawRegisterData> rawData;
+    float baudRateValue = 0;
+    
+    // Acquire mutex for minimum time - collect only raw data
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(50))) { // Reduced timeout to 50ms
         // Fetch the insane counter
         snapshot.insaneCounter = insaneCounter;
         
         // Copy the unexpected registers set
         snapshot.unexpectedRegisters = unexpectedRegisters;
         
-        // Get CG Baud Rate (register 8193)
-        float baudRateValue = getRegisterScaledValue(8193);
-        switch (static_cast<int>(baudRateValue)) {
-            case 1: snapshot.cgBaudRate = "9.6 kbps"; break;
-            case 2: snapshot.cgBaudRate = "19.2 kbps"; break;
-            case 3: snapshot.cgBaudRate = "38.4 kbps"; break;
-            case 4: snapshot.cgBaudRate = "57.6 kbps"; break;
-            case 5: snapshot.cgBaudRate = "115.2 kbps"; break;
-            default: snapshot.cgBaudRate = "Unknown"; break;
+        // Get CG Baud Rate (register 8193) - get raw value only
+        auto baudIt = registerDefinitions.find(8193);
+        if (baudIt != registerDefinitions.end()) {
+            uint32_t rawBaudValue = 0;
+            if (is32BitRegister(8193)) {
+                rawBaudValue = read32BitRegister(8193);
+            } else if (is16BitRegister(8193)) {
+                rawBaudValue = static_cast<uint32_t>(read16BitRegister(8193));
+            }
+            baudRateValue = getScaledValueFromRegister(baudIt->second, rawBaudValue);
         }
         
-        // Process each register address
+        // Process each register address - collect raw data only
         for (const auto& address : addresses) {
-            RegisterSnapshot regSnapshot;
-            
-            // Get register definition
             auto defIt = registerDefinitions.find(address);
             if (defIt != registerDefinitions.end()) {
-                regSnapshot.definition = defIt->second;
+                RawRegisterData regData(defIt->second);
+                regData.is32Bit = is32BitRegister(address);
                 
                 // Get raw value based on register type
-                uint32_t rawValue = 0;
-                if (is32BitRegister(address)) {
-                    rawValue = read32BitRegister(address);
+                if (regData.is32Bit) {
+                    regData.rawValue = read32BitRegister(address);
                 } else if (is16BitRegister(address)) {
-                    rawValue = static_cast<uint32_t>(read16BitRegister(address));
+                    regData.rawValue = static_cast<uint32_t>(read16BitRegister(address));
+                } else {
+                    regData.rawValue = 0;
                 }
                 
-                // Get formatted value
-                float scaledValue = getScaledValueFromRegister(defIt->second, rawValue);
-                regSnapshot.formattedValue = formatRegisterValue(defIt->second, scaledValue);
+                // Get raw water marks
+                regData.rawHighMark = highWaterMarks.find(address) != highWaterMarks.end() ? highWaterMarks[address] : 0;
+                regData.rawLowMark = lowWaterMarks.find(address) != lowWaterMarks.end() ? lowWaterMarks[address] : 0;
                 
-                // Get water marks
-                uint32_t rawHighMark = highWaterMarks.find(address) != highWaterMarks.end() ? highWaterMarks[address] : 0;
-                uint32_t rawLowMark = lowWaterMarks.find(address) != lowWaterMarks.end() ? lowWaterMarks[address] : 0;
-                
-                float highMarkScaled = getScaledValueFromRegister(defIt->second, rawHighMark);
-                float lowMarkScaled = getScaledValueFromRegister(defIt->second, rawLowMark);
-                
-                String formattedHigh = formatRegisterValue(defIt->second, highMarkScaled);
-                String formattedLow = formatRegisterValue(defIt->second, lowMarkScaled);
-                
-                regSnapshot.waterMarks = std::make_pair(formattedHigh, formattedLow);
+                rawData.emplace(address, std::move(regData));
             }
-            
-            // Add to result map
-            snapshot.registers[address] = regSnapshot;
         }
         
         xSemaphoreGiveRecursive(mutex);
     } else {
         logErrln("[fetchSystemSnapshot] Failed to acquire mutex within timeout");
+        return snapshot; // Return early with empty snapshot
+    }
+    
+    // Process baud rate outside mutex
+    switch (static_cast<int>(baudRateValue)) {
+        case 1: snapshot.cgBaudRate = "9.6 kbps"; break;
+        case 2: snapshot.cgBaudRate = "19.2 kbps"; break;
+        case 3: snapshot.cgBaudRate = "38.4 kbps"; break;
+        case 4: snapshot.cgBaudRate = "57.6 kbps"; break;
+        case 5: snapshot.cgBaudRate = "115.2 kbps"; break;
+        default: snapshot.cgBaudRate = "Unknown"; break;
+    }
+    
+    // Process all formatting outside mutex to avoid deadlock
+    for (const auto& [address, regData] : rawData) {
+        RegisterSnapshot regSnapshot;
+        regSnapshot.definition = regData.definition;
+        
+        // Format value outside mutex
+        float scaledValue = getScaledValueFromRegister(regData.definition, regData.rawValue);
+        regSnapshot.formattedValue = formatRegisterValue(regData.definition, scaledValue);
+        
+        // Format water marks outside mutex
+        float highMarkScaled = getScaledValueFromRegister(regData.definition, regData.rawHighMark);
+        float lowMarkScaled = getScaledValueFromRegister(regData.definition, regData.rawLowMark);
+        
+        String formattedHigh = formatRegisterValue(regData.definition, highMarkScaled);
+        String formattedLow = formatRegisterValue(regData.definition, lowMarkScaled);
+        
+        regSnapshot.waterMarks = std::make_pair(formattedHigh, formattedLow);
+        
+        // Add to result map
+        snapshot.registers[address] = regSnapshot;
     }
     
     return snapshot;

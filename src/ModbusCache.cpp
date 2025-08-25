@@ -1608,13 +1608,13 @@ ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
             const unsigned long MAX_PROCESSING_TIME = 200; // ms
             
             while (i < valueOrWords) {
-                // Check processing time more frequently
-                if (i % 3 == 0) {
-                    // Check if we're taking too long
-                    if (millis() - startTime > MAX_PROCESSING_TIME) {
-                        xSemaphoreGiveRecursive(instance->mutex);
-                        return ModbusMessage(); // Return empty response if taking too long
-                    }
+                // Yield every iteration to prevent WiFi starvation
+                yield();
+                
+                // Check processing time with much shorter timeout
+                if (millis() - startTime > 50) { // Reduced from 200ms to 50ms
+                    xSemaphoreGiveRecursive(instance->mutex);
+                    return ModbusMessage(); // Return empty response if taking too long
                 }
                 
                 if (instance->is32BitRegister(currentAddress)) {

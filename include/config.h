@@ -1,5 +1,6 @@
 #include <SoftwareSerial.h>
 #include "driver/uart.h"
+#include "debug_buffer.h"
 
 #ifndef CONFIG_H
     #define CONFIG_H
@@ -27,7 +28,7 @@
     #define emulator_RX 3
     #define emulator_TX 1
 
-    #define RTU_client_core 0
+    #define RTU_client_core 1
     #define RTU_server_core 1
     #define RTU_emulator_core 1
     
@@ -50,6 +51,10 @@
             bool _clientIsRTU;
             unsigned long _pollingInterval;
             String _hostname;
+            String _staticIP;
+            String _staticGateway;
+            String _staticSubnet;
+            bool _useStaticIP;
         public:
             Config();
             void begin(Preferences *prefs);
@@ -100,12 +105,56 @@
             void setPollingInterval(unsigned long value);
             String getHostname() const;
             void setHostname(const String& hostname);
+            void setStaticIP(const String& ip);
+            String getStaticIP() const;
+            void setStaticGateway(const String& gateway);
+            String getStaticGateway() const;
+            void setStaticSubnet(const String& subnet);
+            String getStaticSubnet() const;
+            void setUseStaticIP(bool useStatic);
+            bool getUseStaticIP() const;
     };
-    #define logErr(x...) debugSerial.print(x);
-    #define logErrln(x...) debugSerial.println(x);
+    
+    // Forward declaration of DebugRingBuffer
+    class DebugRingBuffer;
+    extern DebugRingBuffer debugBuffer;
+    
+    // Helper function to handle binary data properly
+    inline String formatBinaryData(const char* data) {
+        // Check if this is likely binary data (contains control characters)
+        bool isBinary = false;
+        const char* p = data;
+        while (*p && !isBinary) {
+            if (*p < 32 && *p != '\n' && *p != '\r' && *p != '\t') {
+                isBinary = true;
+            }
+            p++;
+        }
+        
+        // If it's binary data, format it as hex
+        if (isBinary) {
+            String result;
+            p = data;
+            while (*p) {
+                if (*p < 16) {
+                    result += "0";
+                }
+                result += String(*p, HEX);
+                result += " ";
+                p++;
+            }
+            return result;
+        }
+        
+        // Otherwise, return as is
+        return String(data);
+    }
+    
+    #define logErr(x...) do { debugSerial.print(x); String _msg = String(x); debugBuffer.add(_msg); } while(0);
+    #define logErrln(x...) do { debugSerial.println(x); String _msg = String(x); debugBuffer.add(_msg); } while(0);
     #ifdef DEBUG
-    #define dbg(x...) debugSerial.print(x);
-    #define dbgln(x...) debugSerial.println(x);
+    #define dbg(x...) do { debugSerial.print(x); String _msg = String(x); debugBuffer.add(_msg); } while(0);
+    #define dbgln(x...) do { debugSerial.println(x); String _msg = String(x); debugBuffer.add(_msg); } while(0);
     #else /* DEBUG */
     #define dbg(x...) ;
     #define dbgln(x...) ;

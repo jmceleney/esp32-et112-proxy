@@ -1,2 +1,46 @@
+# PlatformIO
 .pio
+.pioenvs
+.piolibdeps
+.clang_complete
+.gcc-flags.json
+
+# IDE
 .vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Build outputs
+*.bin
+*.elf
+*.hex
+
+# Backup files
+*.bak
+*.orig
+*.old
+*.backup
+
+# Debug/log files
+*.log
+debug.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Test/temporary files
+test.js
+stream*.py
+
+# Tool directories
+.serena/
+tools/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -12,6 +12,14 @@
 #include "esp_log.h"
 #include "esp_wifi.h"  // For esp_wifi_restore()
 #include <cmath> // Include cmath for acos
+#include <Arduino.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include <ModbusClientTCPasync.h>
+#include "debug.h"
+#include "wifi_utils.h"
+#include "esp_task_wdt.h" // Include ESP task watchdog header
 
 #ifdef REROUTE_DEBUG
 EspSoftwareSerial::UART debugSerial;
@@ -154,33 +162,39 @@ int buttonState;
 bool wifiConnected = false;
 bool wifiDisconnectDetected = false;
 unsigned long lastWiFiConnectionTime = 0; // Track when WiFi was last connected
+SemaphoreHandle_t wifiMutex = NULL; // Add mutex for WiFi state
 
 void WiFiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
-    switch (event) {
-        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-            dbgln("[WiFi] Connected to AP");
-            wifiConnected = true;
-            wifiDisconnectDetected = false;
-            lastWiFiConnectionTime = millis(); // Record connection time
-            break;
-        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-            dbgln("[WiFi] Disconnected from AP");
-            wifiDisconnectDetected = true;
-            wifiConnected = false;
-            lastWiFiConnectionTime = 0; // Reset connection time on disconnection
-            break;
-        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-            dbgln("[WiFi] Got IP: " + WiFi.localIP().toString());
-            wifiConnected = true;
-            if (lastWiFiConnectionTime == 0) { // If not set by CONNECTED event
+    if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        switch (event) {
+            case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+                dbgln("[WiFi] Connected to AP");
+                wifiConnected = true;
+                wifiDisconnectDetected = false;
                 lastWiFiConnectionTime = millis(); // Record connection time
-            }
-            break;
-        case ARDUINO_EVENT_WIFI_SCAN_DONE:
-            dbgln("[WiFi] Scan completed");
-            break;
-        default:
-            break;
+                break;
+            case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+                dbgln("[WiFi] Disconnected from AP");
+                wifiDisconnectDetected = true;
+                wifiConnected = false;
+                lastWiFiConnectionTime = 0; // Reset connection time on disconnection
+                break;
+            case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+                dbgln("[WiFi] Got IP: " + WiFi.localIP().toString());
+                wifiConnected = true;
+                if (lastWiFiConnectionTime == 0) { // If not set by CONNECTED event
+                    lastWiFiConnectionTime = millis(); // Record connection time
+                }
+                break;
+            case ARDUINO_EVENT_WIFI_SCAN_DONE:
+                dbgln("[WiFi] Scan completed");
+                break;
+            default:
+                break;
+        }
+        xSemaphoreGive(wifiMutex);
+    } else {
+        dbgln("[WiFi] Failed to acquire mutex in event handler");
     }
 }
 
@@ -257,18 +271,22 @@ void updateDisplay() {
     }
 }
 
-// Function to completely reset WiFi configuration and connect to the strongest AP
+// Declare these functions as non-static so they can be accessed from other files
 bool forceWiFiReset() {
     dbgln("[WiFi] Performing WiFi reset due to connection issues...");
     
-    // Disconnect from current network
-    WiFi.disconnect(true);  // true = disable and clear credentials
-    delay(500);
+    // Disconnect from current network but don't clear credentials
+    WiFi.disconnect();  // Changed from disconnect(true) to preserve credentials
+    delay(1000);  // Give it time to disconnect
     
-    // Clear WiFi settings from NVS to avoid BSSID fixation
-    // This is only done when there's an actual connection issue
-    esp_wifi_restore();
-    delay(500);
+    // Only restore WiFi settings if we've had persistent issues
+    static int resetCount = 0;
+    if (++resetCount >= 3) {
+        dbgln("[WiFi] Multiple reset attempts, performing full WiFi restore");
+        esp_wifi_restore();
+        resetCount = 0;
+        delay(1000);
+    }
     
     // Set WiFi mode to STA
     WiFi.mode(WIFI_STA);
@@ -283,214 +301,29 @@ bool forceWiFiReset() {
         return false;
     }
     
-    // Try direct connection first without scanning
-    dbgln("[WiFi] Attempting direct connection to " + ssid);
+    // Simple connection attempt without scanning
+    dbgln("[WiFi] Attempting connection to " + ssid);
     WiFi.begin(ssid.c_str(), password.c_str());
     
-    // Wait briefly for connection
-    int quickAttempts = 0;
-    while (WiFi.status() != WL_CONNECTED && quickAttempts < 10) {
-        delay(300);
-        dbg(".");
-        quickAttempts++;
-    }
-    
-    // If direct connection succeeded, return success
-    if (WiFi.status() == WL_CONNECTED) {
-        dbgln("\n[WiFi] Successfully connected to " + WiFi.SSID() + 
-              " with RSSI " + String(WiFi.RSSI()) + "dBm");
-        return true;
-    }
-    
-    // Only scan if direct connection failed
-    dbgln("\n[WiFi] Direct connection failed, scanning for networks...");
-    int numNetworks = WiFi.scanNetworks(false, true);  // async=false, show_hidden=true
-    
-    if (numNetworks <= 0) {
-        dbgln("[WiFi] No networks found or scan failed");
-        // Try a standard connection again as last resort
-        WiFi.begin(ssid.c_str(), password.c_str());
-        return false;
-    }
-    
-    // Find the strongest AP with our SSID
-    int strongestRSSI = -100;
-    int strongestIndex = -1;
-    
-    for (int i = 0; i < numNetworks; i++) {
-        if (WiFi.SSID(i) == ssid) {
-            int rssi = WiFi.RSSI(i);
-            String bssid = WiFi.BSSIDstr(i);
-            int channel = WiFi.channel(i);
-            
-            dbgln("[WiFi] Found " + ssid + " with BSSID " + bssid + 
-                  " on channel " + String(channel) + 
-                  " with RSSI " + String(rssi) + "dBm");
-            
-            if (rssi > strongestRSSI) {
-                strongestRSSI = rssi;
-                strongestIndex = i;
-            }
-        }
-    }
-    
-    if (strongestIndex == -1) {
-        dbgln("[WiFi] No APs with SSID " + ssid + " found");
-        // Try a standard connection
-        WiFi.begin(ssid.c_str(), password.c_str());
-        return false;
-    }
-    
-    // Get the strongest AP's details
-    String bssid = WiFi.BSSIDstr(strongestIndex);
-    int channel = WiFi.channel(strongestIndex);
-    
-    dbgln("[WiFi] Connecting to strongest AP: " + bssid + 
-          " on channel " + String(channel) + 
-          " with RSSI " + String(strongestRSSI) + "dBm");
-    
-    // Convert string BSSID to uint8_t array
-    uint8_t bssidBytes[6];
-    sscanf(bssid.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
-           &bssidBytes[0], &bssidBytes[1], &bssidBytes[2], 
-           &bssidBytes[3], &bssidBytes[4], &bssidBytes[5]);
-    
-    // Connect to the specific BSSID and channel
-    WiFi.begin(ssid.c_str(), password.c_str(), channel, bssidBytes);
-    
     // Wait for connection
     int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) { // Reduced from 30 to 20
-        delay(300); // Reduced from 500 to 300
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
         dbg(".");
         attempts++;
     }
     
     if (WiFi.status() == WL_CONNECTED) {
         dbgln("\n[WiFi] Successfully connected to " + WiFi.SSID() + 
-              " with BSSID " + WiFi.BSSIDstr() + 
-              " on channel " + String(WiFi.channel()) + 
               " with RSSI " + String(WiFi.RSSI()) + "dBm");
-        
+        resetCount = 0;  // Reset counter on successful connection
         return true;
     } else {
-        dbgln("\n[WiFi] Failed to connect to the strongest AP");
-        // Try a standard connection as a last resort
-        WiFi.begin(ssid.c_str(), password.c_str());
+        dbgln("\n[WiFi] Failed to connect");
         return false;
     }
 }
 
-// Function to scan for the strongest AP with the same SSID and connect to it
-bool connectToStrongestAP() {
-    dbgln("[WiFi] Scanning for the strongest AP due to poor signal...");
-    
-    String currentSSID = WiFi.SSID();
-    if (currentSSID.length() == 0) {
-        currentSSID = wm.getWiFiSSID();
-    }
-    
-    if (currentSSID.length() == 0) {
-        dbgln("[WiFi] No SSID configured, cannot scan for strongest AP");
-        return false;
-    }
-    
-    // Check current signal strength first
-    int currentRSSI = WiFi.RSSI();
-    
-    // Only proceed with scanning if signal is below threshold
-    if (currentRSSI > WIFI_RSSI_THRESHOLD && WiFi.status() == WL_CONNECTED) {
-        dbgln("[WiFi] Current signal strength (" + String(currentRSSI) + "dBm) is acceptable, skipping scan");
-        return true;
-    }
-    
-    // Use synchronous scan instead of async
-    int numNetworks = WiFi.scanNetworks(false, true);  // async=false, show_hidden=true
-    
-    if (numNetworks <= 0) {
-        dbgln("[WiFi] No networks found or scan failed");
-        return false;
-    }
-    
-    int strongestRSSI = -100;
-    int strongestIndex = -1;
-    
-    for (int i = 0; i < numNetworks; i++) {
-        if (WiFi.SSID(i) == currentSSID) {
-            int rssi = WiFi.RSSI(i);
-            String bssid = WiFi.BSSIDstr(i);
-            int channel = WiFi.channel(i);
-            
-            dbgln("[WiFi] Found " + currentSSID + " with BSSID " + bssid + 
-                  " on channel " + String(channel) + 
-                  " with RSSI " + String(rssi) + "dBm");
-            
-            if (rssi > strongestRSSI) {
-                strongestRSSI = rssi;
-                strongestIndex = i;
-            }
-        }
-    }
-    
-    if (strongestIndex == -1) {
-        dbgln("[WiFi] No APs with SSID " + currentSSID + " found");
-        return false;
-    }
-    
-    // If we're already connected to the strongest AP, no need to reconnect
-    if (WiFi.status() == WL_CONNECTED && WiFi.BSSIDstr() == WiFi.BSSIDstr(strongestIndex)) {
-        dbgln("[WiFi] Already connected to the strongest AP");
-        return true;
-    }
-    
-    // Only reconnect if the strongest AP has significantly better signal (at least 10dBm better)
-    if (WiFi.status() == WL_CONNECTED && (strongestRSSI - currentRSSI < 10)) {
-        dbgln("[WiFi] Strongest AP signal (" + String(strongestRSSI) + "dBm) not significantly better than current (" + 
-              String(currentRSSI) + "dBm), staying connected");
-        return true;
-    }
-    
-    // Connect to the strongest AP
-    String password = wm.getWiFiPass();
-    String bssid = WiFi.BSSIDstr(strongestIndex);
-    int channel = WiFi.channel(strongestIndex);
-    
-    dbgln("[WiFi] Connecting to the strongest AP with BSSID " + bssid + 
-          " on channel " + String(channel) + 
-          " with RSSI " + String(strongestRSSI) + "dBm");
-    
-    // Convert string BSSID to uint8_t array
-    uint8_t bssidBytes[6];
-    sscanf(bssid.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
-           &bssidBytes[0], &bssidBytes[1], &bssidBytes[2], 
-           &bssidBytes[3], &bssidBytes[4], &bssidBytes[5]);
-    
-    // Connect to the specific BSSID and channel
-    WiFi.begin(currentSSID.c_str(), password.c_str(), channel, bssidBytes);
-    
-    // Wait for connection
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) { // Reduced from 30 to 20
-        delay(300); // Reduced from 500 to 300
-        dbg(".");
-        attempts++;
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        dbgln("\n[WiFi] Connected to " + WiFi.SSID() + 
-              " with BSSID " + WiFi.BSSIDstr() + 
-              " on channel " + String(WiFi.channel()) + 
-              " with RSSI " + String(WiFi.RSSI()) + "dBm");
-        
-        return true;
-    } else {
-        dbgln("\n[WiFi] Failed to connect to the strongest AP, falling back to normal connection");
-        WiFi.begin(currentSSID.c_str(), password.c_str());
-        return false;
-    }
-}
-
-// Function to verify WiFi is actually disconnected by checking multiple times
 bool isWiFiActuallyDisconnected() {
     if (wifiDisconnectDetected) {
         // If we detected a disconnect event, trust it
@@ -522,6 +355,19 @@ void setup() {
 #else
     debugSerial.begin(115200);
 #endif
+
+    // Configure ESP Task Watchdog
+    dbgln("[setup] Configuring task watchdog");
+    // Increase timeout to 20 seconds and disable panic
+    esp_task_wdt_init(20, false); // 20 second timeout, don't panic on timeout
+    esp_task_wdt_delete(NULL); // Remove current task (setup/loop) from watchdog monitoring
+    
+    // Initialize WiFi mutex
+    wifiMutex = xSemaphoreCreateMutex();
+    if (wifiMutex == NULL) {
+        dbgln("[setup] Failed to create WiFi mutex!");
+    }
+    
     dbgln("[config] load");
     prefs.begin("modbusRtuGw");
     config.begin(&prefs);
@@ -538,8 +384,8 @@ void setup() {
     // Register WiFi event handler
     WiFi.onEvent(WiFiEventHandler);
 
-    // Prevent BSSID fixation
-    WiFi.setAutoConnect(false);
+    // Configure WiFi settings
+    WiFi.setAutoConnect(true);
     WiFi.setAutoReconnect(true);
     
     String hostname = config.getHostname();
@@ -573,7 +419,7 @@ void setup() {
         // After connecting with WiFiManager, try to find and connect to the strongest AP
         if (WiFi.status() == WL_CONNECTED) {
             dbgln("[WiFi] Connected via WiFiManager, now finding the strongest AP");
-            connectToStrongestAP();
+            // connectToStrongestAP();
             
             // Initialize WiFi connection time if not already set by event handler
             if (lastWiFiConnectionTime == 0) {
@@ -624,73 +470,163 @@ void loop() {
     static int reconnectionAttempts = 0;
     const int maxReconnectionAttempts = 3;
     static unsigned long reconnectionBackoff = 5000; // Start with 5 seconds
+    static unsigned long lastScanTime = 0;
+    static unsigned long lastHeapCheck = 0;
     unsigned long currentTime = millis();
+    
+    // Check heap memory every 30 seconds
+    if (currentTime - lastHeapCheck >= 30000) {
+        lastHeapCheck = currentTime;
+        dbgln("[main] Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+    }
+    
+    // Add explicit WiFi reconnection handling with mutex protection
+    if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (wifiDisconnectDetected || WiFi.status() != WL_CONNECTED) {
+            // Only attempt reconnection every 5 seconds initially, then back off
+            if (currentTime - lastDisconnectionCheckTime >= reconnectionBackoff) {
+                lastDisconnectionCheckTime = currentTime;
+                
+                dbgln("[WiFi] Connection lost, attempting reconnection...");
+                
+                // Try to reconnect
+                if (reconnectionAttempts < maxReconnectionAttempts) {
+                    WiFi.disconnect();
+                    delay(100);
+                    String ssid = wm.getWiFiSSID();
+                    String password = wm.getWiFiPass();
+                    
+                    if (ssid.length() > 0 && password.length() > 0) {
+                        WiFi.begin(ssid.c_str(), password.c_str());
+                        reconnectionAttempts++;
+                        dbgln("[WiFi] Reconnection attempt " + String(reconnectionAttempts));
+                        
+                        // Increase backoff time for next attempt (exponential backoff)
+                        reconnectionBackoff = min(reconnectionBackoff * 2, 300000UL); // Max 5 minutes
+                    }
+                } else {
+                    // If we've failed multiple times, try a full reset
+                    dbgln("[WiFi] Multiple reconnection attempts failed, trying full reset");
+                    forceWiFiReset();
+                    reconnectionAttempts = 0;
+                    reconnectionBackoff = 5000; // Reset backoff time
+                }
+            }
+        } else if (WiFi.status() == WL_CONNECTED && wifiDisconnectDetected) {
+            // We've successfully reconnected
+            wifiDisconnectDetected = false;
+            reconnectionAttempts = 0;
+            reconnectionBackoff = 5000; // Reset backoff time
+            dbgln("[WiFi] Successfully reconnected to " + WiFi.SSID());
+        }
+        xSemaphoreGive(wifiMutex);
+    }
+    
+    // Check if we need to reboot due to no data for 60 seconds
+    if (modbusCache) {
+        // Get current timestamp
+        currentTime = millis();
+        
+        // Get last update time safely
+        unsigned long lastUpdate = modbusCache->getLastSuccessfulUpdate();
+        
+        // Track connection problems across multiple loop iterations
+        static unsigned long noUpdatesSince = 0;
+        static unsigned long lastStatusCheck = 0;
+        static int connectionProblemCounter = 0;
+        
+        // Handle uint32_t overflow/underflow conditions safely
+        unsigned long timeSinceLastUpdate;
+        if (currentTime >= lastUpdate) {
+            timeSinceLastUpdate = currentTime - lastUpdate;
+        } else {
+            // This case handles millis() overflow or lastUpdate being incorrectly set to a future time
+            logErrln("[main] Time calculation error: current=" + String(currentTime) + 
+                    ", lastUpdate=" + String(lastUpdate));
+            // Use a more reasonable value instead of overflowing
+            timeSinceLastUpdate = 0;
+        }
+        
+        // Debug log status every 10 seconds
+        if (currentTime - lastStatusCheck > 10000) {
+            lastStatusCheck = currentTime;
+            // This call is thread-safe as it uses proper getters
+            bool isOp = modbusCache->getIsOperational();
+            dbgln("[main] Server operational: " + String(isOp ? "YES" : "NO") + 
+                  ", Time since last update: " + String(timeSinceLastUpdate / 1000) + " seconds" +
+                  ", current: " + String(currentTime) + ", lastUpdate: " + String(lastUpdate) +
+                  ", connection problem counter: " + String(connectionProblemCounter));
+            
+            // If the server is non-operational, increment our problem counter
+            if (!isOp) {
+                connectionProblemCounter++;
+                
+                // If this is the first detection of a problem, note the time
+                if (connectionProblemCounter == 1) {
+                    noUpdatesSince = currentTime;
+                }
+                
+                // Check if we've had sustained problems
+                unsigned long sustainedProblemTime = 0;
+                if (currentTime >= noUpdatesSince) {
+                    sustainedProblemTime = currentTime - noUpdatesSince;
+                }
+                
+                // Log the sustained problem duration
+                if (connectionProblemCounter > 1) {
+                    logErrln("[main] Non-operational state for " + 
+                           String(sustainedProblemTime / 1000) + " seconds, counter: " + 
+                           String(connectionProblemCounter));
+                }
+                
+                // Force reboot after 6 consecutive non-operational checks (approximately 60 seconds)
+                // or if we've been non-operational for more than 60 seconds absolute time
+                if (connectionProblemCounter >= 6 || sustainedProblemTime > 60000) {
+                    logErrln("[main] Persistent connection problems detected. Rebooting device...");
+                    delay(100);
+                    ESP.restart();
+                }
+            } else {
+                // Reset the counter if the server becomes operational again
+                connectionProblemCounter = 0;
+                noUpdatesSince = 0;
+            }
+        }
+        
+        // Original reboot logic - keep as a failsafe
+        // If it's been more than 60 seconds with no data, reboot the device
+        if (timeSinceLastUpdate > 60000 && timeSinceLastUpdate < 3600000) { // Between 1 minute and 1 hour
+            logErrln("[main] No data received for " + String(timeSinceLastUpdate / 1000) + 
+                   " seconds. Rebooting device...");
+            delay(200); // Short delay to allow log message to be sent
+            ESP.restart();
+        }
+    }
 
     // Update the Modbus Cache
     if (modbusCache) {
         modbusCache->update();
     }
-
-    // Check WiFi connection status and manage AP mode
-    if (currentTime - lastDisconnectionCheckTime >= 10000) {
-        lastDisconnectionCheckTime = currentTime;
-        
-        if (isWiFiActuallyDisconnected() && !inAPMode) {
-            reconnectionAttempts++;
-            dbgln("[WiFi] Not connected. Attempt " + String(reconnectionAttempts) + " of " + String(maxReconnectionAttempts));
-            
-            if (reconnectionAttempts <= maxReconnectionAttempts) {
-                // Try a complete WiFi reset
-                bool connected = forceWiFiReset();
-                
-                if (connected) {
-                    reconnectionAttempts = 0;
-                    reconnectionBackoff = 5000; // Reset on success
-                } else {
-                    // Increase backoff time for next attempt (cap at 2 minutes)
-                    reconnectionBackoff = min(reconnectionBackoff * 2, 120000UL);
-                }
-            } else {
-                // After max attempts, switch to AP mode
-                dbgln("[WiFi] Max reconnection attempts reached, switching to AP mode");
-                wm.startWebPortal();
-                inAPMode = true;
-                reconnectionAttempts = 0;
-            }
-        } else if (WiFi.status() == WL_CONNECTED) {
-            // Reset counter if we're connected
-            reconnectionAttempts = 0;
-        }
-    }
-
-    // If the WiFi is connected and we were in AP mode, switch to STA mode
-    if (WiFi.status() == WL_CONNECTED && inAPMode) {
-        dbgln("[WiFi] Connected to WiFi. Switching to STA mode.");
-        inAPMode = false;
-        
-        // Reset the WiFi check times
-        lastWiFiCheckTime = currentTime;
-        wifiDisconnectDetected = false;
-    }
-
+    
     // Get current time
     currentTime = millis();
     
-    // Only check WiFi signal strength if we're connected
+    // Reduce frequency of WiFi checks
     if (WiFi.status() == WL_CONNECTED && currentTime - lastWiFiCheckTime >= WIFI_CHECK_INTERVAL) {
         lastWiFiCheckTime = currentTime;
         int rssi = WiFi.RSSI();
-        dbgln("[WiFi] Current RSSI: " + String(rssi) + "dBm, BSSID: " + WiFi.BSSIDstr() + 
-              ", Channel: " + String(WiFi.channel()));
         
-        // Only take action if signal is critically weak
-        if (rssi < WIFI_RSSI_THRESHOLD) {
+        // Only log periodically to reduce serial noise
+        dbgln("[WiFi] Current RSSI: " + String(rssi) + "dBm");
+        
+        // Only scan for better AP if signal is very weak and we haven't scanned recently
+        if (rssi < WIFI_RSSI_THRESHOLD && currentTime - lastScanTime >= 300000) { // 5 minutes between scans
+            lastScanTime = currentTime;
             dbgln("[WiFi] Signal strength critically low, scanning for stronger AP");
-            connectToStrongestAP();
+            // connectToStrongestAP();
         }
     }
 
-    handleButton();
     // Update the OLED
     if (currentTime - lastUpdateTime >= 200) {
         lastUpdateTime = currentTime;
@@ -698,5 +634,6 @@ void loop() {
     }
 
     wm.process(); // Non-blocking WiFiManager process
+    
     yield();
 }

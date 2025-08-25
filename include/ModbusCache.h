@@ -83,6 +83,14 @@ struct ScaledWaterMarks {
     float lowWaterMark;
 };
 
+struct RegisterRange {
+    uint16_t startAddress;
+    uint16_t regCount;
+    bool isStatic;
+    unsigned long lastRequestTime;
+    bool inFlight;
+};
+
 class ModbusCache {
 public:
     ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters, 
@@ -92,10 +100,11 @@ public:
     void begin();
     void resetConnection();
     void update();
+    void resetAllPendingRequests();
     void addRegister(const ModbusRegister& reg); // Add a register to the cache
     std::vector<uint16_t> getRegisterValues(uint16_t startAddress, uint16_t count);
     //uint16_t getRegisterValue(uint16_t address);
-    uint16_t update_interval = 500;
+    uint16_t update_interval = 50;
     bool checkNewRegisterValue(uint16_t address, uint32_t proposedRawValue);
     void setRegisterValue(uint16_t address, uint32_t value, bool is32Bit = false);
     static ModbusMessage respondFromCache(ModbusMessage request);
@@ -143,15 +152,63 @@ public:
     unsigned long getMaxLatency() const { return maxLatency; }
     float getAverageLatency() const { return averageLatency; }
     float getStdDeviation() const {
-        if (latencies.size() < 2) {
-            return 0.0f; // Return 0 if no data is available
-        }
-        size_t sampleCount = latencies.size(); // Use the actual number of samples
-
-        float variance = (sumLatencySquared / sampleCount) - (averageLatency * averageLatency);
-        return variance > 0 ? sqrtf(variance) : 0.0f;
+        if (latencies.size() <= 1) return 0.0f;
+        
+        float variance = sumLatencySquared / static_cast<float>(latencies.size()) - 
+                         averageLatency * averageLatency;
+        return sqrt(variance);
     }
     void updateLatencyStats(unsigned long latency);
+
+    // New structs and methods for round-robin polling
+    struct PollGroup {
+        std::vector<uint16_t> addresses;     // Addresses in this poll group
+        unsigned long lastPollTime = 0;      // Time this group was last polled
+        uint16_t pollInterval;               // How often to poll this group (ms)
+        bool isStatic;                       // Whether this is a static group
+        bool completed = false;              // Whether polling is completed for this group
+    };
+
+    // New method for reconnection handling
+    void scheduleReconnect();
+
+    // Add getter for lastSuccessfulUpdate timestamp
+    unsigned long getLastSuccessfulUpdate() const { return lastSuccessfulUpdate; }
+
+    // New method to fetch multiple register values in a single atomic operation
+    struct RegisterSnapshot {
+        String formattedValue;
+        std::pair<String, String> waterMarks;
+        std::optional<ModbusRegister> definition;
+    };
+    
+    // Updated struct for complete system snapshot
+    struct SystemSnapshot {
+        std::map<uint16_t, RegisterSnapshot> registers;
+        std::set<uint16_t> unexpectedRegisters;
+        uint32_t insaneCounter;
+        String cgBaudRate;
+    };
+    
+    // Updated method to fetch all system data in a single atomic operation
+    SystemSnapshot fetchSystemSnapshot(const std::set<uint16_t>& addresses);
+
+    // Mutex statistics getters
+    unsigned long getMutexWaitingTime() const { return mutexWaitingTime; }
+    unsigned long getMutexHoldingTime() const { return mutexHoldingTime; }
+    unsigned long getMutexAcquisitionAttempts() const { return mutexAcquisitionAttempts; }
+    unsigned long getMutexAcquisitionFailures() const { return mutexAcquisitionFailures; }
+    unsigned long getMaxMutexHoldTime() const { return maxMutexHoldTime; }
+    float getAverageMutexWaitTime() const { 
+        return mutexAcquisitionAttempts > 0 ? 
+            static_cast<float>(mutexWaitingTime) / mutexAcquisitionAttempts : 0.0f; 
+    }
+    float getAverageMutexHoldTime() const { 
+        return mutexAcquisitionAttempts - mutexAcquisitionFailures > 0 ? 
+            static_cast<float>(mutexHoldingTime) / (mutexAcquisitionAttempts - mutexAcquisitionFailures) : 0.0f; 
+    }
+
+    String getRequestMapStatus();  // Add this line
 
 private:
     std::vector<ModbusRegister> registers; // All registers
@@ -163,6 +220,8 @@ private:
     std::set<uint16_t> staticRegisterAddresses; // Addresses of static registers
     std::set<uint16_t> unexpectedRegisters; // Addresses of registers not defined in the cache
     uint32_t insaneCounter = 0;
+    unsigned long lastRequestTimeout = 0; // Timestamp of the last request timeout
+    bool shouldThrottleRequests(); // Method to check if we should throttle requests
 
     std::map<uint16_t, const ModbusRegister> registerDefinitions;
 
@@ -225,14 +284,14 @@ private:
     void sendModbusRequest(uint16_t startAddress, uint16_t regCount);
     static ModbusCache* instance;
     WiFiClient wifiClient;
-    void ensureTCPConnection();
     static void handleData(ModbusMessage response, uint32_t token);
     void processResponsePayload(ModbusMessage& response, uint16_t startAddress, uint16_t regCount);
     static void handleError(Error error, uint32_t token);// Static instance pointer
-    void purgeToken(uint32_t token);
+    void purgeToken(uint32_t token, bool mutexAlreadyHeld = false);
+    void purgeAgedTokens(); // New method to purge aged tokens periodically
     std::map<uint32_t, std::tuple<uint16_t, uint16_t, unsigned long>> requestMap; // Map to store token -> (startAddress, regCount, timestamp)
-    std::queue<uint32_t> insertionOrder; // Queue to store the order in which requests were made
-    unsigned long lastSuccessfulUpdate = 0;
+    std::vector<uint32_t> insertionOrder; // Vector to store the order in which requests were made
+    unsigned long lastSuccessfulUpdate = 0; // Initialize to 0, will be set to current time in begin()
     bool isOperational;
     void updateServerStatus();
     std::unordered_set<uint16_t> fetchedStaticRegisters;
@@ -240,13 +299,53 @@ private:
     bool staticRegistersFetched = false; // Flag to indicate completion of static register fetching
     bool dynamicRegistersFetched = false; // Flag to indicate completion of dynamic register fetching
     SemaphoreHandle_t mutex;
+    
+    // Mutex statistics for debugging
+    unsigned long mutexWaitingTime = 0;   // Total time spent waiting for mutex
+    unsigned long mutexHoldingTime = 0;   // Total time the mutex was held 
+    unsigned long mutexAcquisitionAttempts = 0; // Number of attempts to acquire mutex
+    unsigned long mutexAcquisitionFailures = 0; // Number of failures to acquire mutex
+    unsigned long maxMutexHoldTime = 0;   // Maximum time the mutex was held
 
     std::deque<unsigned long> latencies; // Sliding window to store recent latencies
     size_t maxLatencySamples = 100;     // Maximum number of latency samples to track
-    unsigned long minLatency = ULONG_MAX; // Minimum latency (in milliseconds)
-    unsigned long maxLatency = 0;         // Maximum latency (in milliseconds)
-    float averageLatency = 0.0f;          // Average latency (as a float for efficiency)
-    float sumLatencySquared = 0.0f;       // Sum of squared latencies (for variance and std dev)
+    unsigned long minLatency = ULONG_MAX; // Initialize to max value so first real value will be smaller
+    unsigned long maxLatency = 0;         // Initialize to 0 so first real value will be larger
+    float averageLatency = 0.0f;         // Average latency (as a float for efficiency)
+    float sumLatencySquared = 0.0f;      // Sum of squared latencies (for variance and std dev)
+
+    // Message tracking for log collapsing
+    String lastLogMessage;
+    unsigned int repeatCount;
+    unsigned long lastLogTime;
+    
+    // Helper method to log messages with collapsing
+    void logWithCollapsing(const String& message);
+
+    // New members for round-robin polling
+    std::vector<PollGroup> pollGroups;       // Groups of registers to poll together
+    size_t currentGroupIndex = 0;            // Current group in the round-robin
+    bool staticGroupsCompleted = false;      // Whether all static groups have been polled
+    unsigned long lastRoundRobinTime = 0;    // Last time the round-robin was processed
+    
+    // New methods for round-robin polling
+    void initializePollGroups();
+    void processNextPollGroup();
+    void optimizePollGroups(std::vector<PollGroup>& groups);
+    void createOptimalRegisterBatches(const std::vector<uint16_t>& addresses, bool isStatic);
+
+    // New members for connection management
+    unsigned long lastConnectionError = 0;     // Last time we had a connection error
+    unsigned long lastConnectionCheck = 0;     // Last time we checked connection
+    unsigned long lastReconnectAttempt = 0;    // Last time we attempted reconnection
+    
+    // New methods for connection management
+    void ensureTCPConnection();
+
+    std::vector<RegisterRange> registerRanges;  // Stores the ranges of adjacent registers
+    void initializeRegisterRanges();  // Creates the initial ranges from register definitions
+    void processRegisterRange(RegisterRange& range);  // Process a single range
+    static const unsigned long RETRY_DELAY_MS = 50;  // Delay between retries
 };
 
 #endif // MODBUSCACHE_H

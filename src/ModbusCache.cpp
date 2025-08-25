@@ -1,39 +1,75 @@
 #include "ModbusCache.h"
+#include "debug.h"
+#include "wifi_utils.h"
 #include <unordered_set>
 #include <functional>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
+#include <esp_wifi.h>  // Add this at the top with other includes
 
 extern Config config;
 
 // Global variables for token and response handling
 uint32_t globalToken = 0;
 
+// Constants for request management 
+#define MAX_PENDING_REQUESTS 20  // Maximum number of pending requests allowed
+#define REQUEST_TIMEOUT_MS 5000  // Timeout for requests in milliseconds
+#define BACKOFF_TIME_MS 2000     // Time to wait after a timeout before sending new requests
+
+// Queue management flags
+static bool queueWasFull = false;
+static unsigned long queueFullStartTime = 0;
+static unsigned long lastQueueStatusLog = 0;
+
 void printHex(const uint8_t *buffer, size_t length) {
-    for (size_t i = 0; i < length; ++i)
-    {
-        char hexString[3];                     // Two characters for the byte and one for the null terminator
-        sprintf(hexString, "%02X", buffer[i]); // Format the byte as a two-digit hexadecimal
-        dbg(hexString);                        // Send to debug
-        if (i < length - 1)
-        {
-            dbg(" "); // Space between bytes for readability
+    String hexOutput;
+    hexOutput.reserve(length * 3); // Each byte takes 2 chars + 1 space
+    
+    for (size_t i = 0; i < length; ++i) {
+        if (buffer[i] < 16) {
+            hexOutput += "0"; // Add leading zero for values less than 16
+        }
+        hexOutput += String(buffer[i], HEX);
+        
+        if (i < length - 1) {
+            hexOutput += " "; // Space between bytes for readability
         }
     }
-    dbgln(); // New line after printing the array
+    
+    // Print the entire hex string at once
+    dbgln(hexOutput);
 }
 
 // Initialize static instance pointer
 ModbusCache *ModbusCache::instance = nullptr;
 
+// Add this function before the ModbusCache constructor
+void configAmazonFreeRTOS() {
+    // Ensure WiFi task has higher priority on Core 0
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    // Set Modbus task priority lower than WiFi
+    vTaskPrioritySet(NULL, tskIDLE_PRIORITY + 1);
+}
+
 ModbusCache::ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters, 
                          const std::vector<ModbusRegister>& staticRegisters, 
                          const String& serverIPStr, 
                          uint16_t port) :
-      serverIPString(serverIPStr),
-      serverPort(port),
-      modbusRTUServer(2000, config.getModbusRtsPin2()),
-      modbusRTUEmulator(2000, -1),
-      modbusRTUClient(nullptr),
-      modbusTCPClient(nullptr) //,10) // queueLimit 10
+    serverIPString(serverIPStr),
+    serverPort(port),
+    modbusRTUServer(2000, config.getModbusRtsPin2()),
+    modbusRTUEmulator(2000, -1),
+    modbusRTUClient(nullptr),
+    modbusTCPClient(nullptr), //,10) // queueLimit 10
+    MBserver(),
+    isOperational(false),
+    lastLogMessage(""),
+    repeatCount(0),
+    lastLogTime(0),
+    lastRequestTimeout(0)
 {
     initializeRegisters(dynamicRegisters, staticRegisters);
     // We must define the client, even if we don't use it, to avoid a null pointer exception
@@ -49,8 +85,9 @@ ModbusCache::ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters,
             // otherwise use default pins for hardware-serial2
             modbusClientSerial.begin(config.getModbusBaudRate(), config.getModbusConfig());
         #endif
-
         
+        // Running the RTU client on Core 1 (separate from WiFi on Core 0)
+        // to reduce interference between UART and WiFi operations
         modbusRTUClient->begin(modbusClientSerial, RTU_client_core);
     }
     
@@ -73,21 +110,39 @@ ModbusCache::ModbusCache(const std::vector<ModbusRegister>& dynamicRegisters,
 void ModbusCache::begin() {
     dbgln("Begin modbusCache");
     
-    mutex = xSemaphoreCreateMutex();
+    // Configure FreeRTOS settings for optimal WiFi performance
+    configAmazonFreeRTOS();
+    
+    // Replace standard mutex with recursive mutex
+    mutex = xSemaphoreCreateRecursiveMutex();
     if (mutex == NULL) {
-        logErrln("Failed to create mutex");
+        logErrln("Failed to create recursive mutex");
     }
+    
+    // Add a counter for mutex time statistics
+    mutexWaitingTime = 0;
+    mutexHoldingTime = 0;
+    mutexAcquisitionAttempts = 0;
+    mutexAcquisitionFailures = 0;
+    maxMutexHoldTime = 0;
     
     RTUutils::prepareHardwareSerial(modbusServerSerial);
     modbusServerSerial.begin(config.getModbusBaudRate2(), config.getModbusConfig2(), RTU_server_RX, RTU_server_TX); // Start the Serial communication
-
+    
+    // Modbus RTU server will run on Core 1 (separate from WiFi on Core 0)
+    // This separation helps prevent WiFi disconnections caused by UART operations
+    
     // Register worker function
     modbusRTUServer.registerWorker(1, ANY_FUNCTION_CODE, &ModbusCache::respondFromCache);
     MBserver.registerWorker(1, ANY_FUNCTION_CODE, &ModbusCache::respondFromCache);
 
-    // Start the Modbus RTU server
-    modbusRTUServer.begin(modbusServerSerial, RTU_server_core); // or modbusRTUServer.begin(modbusServerSerial, -1) to specify coreID
-    MBserver.start(config.getTcpPort3(), 20, config.getTcpTimeout());
+    // Start the Modbus RTU server explicitly on Core 1
+    modbusRTUServer.begin(modbusServerSerial, 1);  // Force Core 1
+    
+    // Optimize TCP server for multiple clients with multiple in-flight requests
+    // Increase max connections from default 20 to 30 for better handling of multiple clients
+    // Keep the timeout from config for consistency
+    MBserver.start(config.getTcpPort3(), 30, config.getTcpTimeout());
 
     // Set update_interval from config
     update_interval = config.getPollingInterval();
@@ -96,7 +151,7 @@ void ModbusCache::begin() {
         modbusRTUClient->onDataHandler(&ModbusCache::handleData);
         modbusRTUClient->onErrorHandler(&ModbusCache::handleError);
     } else {
-        modbusTCPClient->setMaxInflightRequests(5);
+        modbusTCPClient->setMaxInflightRequests(10);
         dbgln("Setting up TCP client to [" + serverIP.toString() + "]:[" + String(serverPort)+"]");
         modbusTCPClient->connect(serverIP, serverPort);
         dbgln("TCP connect initiated");
@@ -104,19 +159,25 @@ void ModbusCache::begin() {
         modbusTCPClient->onDataHandler(&ModbusCache::handleData);
         modbusTCPClient->onErrorHandler(&ModbusCache::handleError);
     }
-    instance->lastSuccessfulUpdate = millis();
-    // debug the current milis value and the vlue of lastSuccessfulUpdate
-    dbgln("[begin] Current millis: " + String(millis()));
+    // Initialize lastSuccessfulUpdate to current time
+    unsigned long currentTime = millis();
+    instance->lastSuccessfulUpdate = currentTime;
+    
+    // Debug the current millis value and the value of lastSuccessfulUpdate
+    dbgln("[begin] Current millis: " + String(currentTime));
     dbgln("[begin] Last successful update: " + String(instance->lastSuccessfulUpdate));
+    dbgln("[begin] Time difference: " + String(currentTime - instance->lastSuccessfulUpdate) + "ms");
+
+    // Initialize poll groups for round-robin polling
+    initializePollGroups();
 }
 
 void ModbusCache::resetConnection() {
-    if (xSemaphoreTake(mutex, portMAX_DELAY)) {
+    if (xSemaphoreTakeRecursive(mutex, portMAX_DELAY)) {
         // Purge all tokens
         requestMap.clear();
-        std::queue<uint32_t> emptyQueue;
-        std::swap(insertionOrder, emptyQueue);
-        xSemaphoreGive(mutex);
+        insertionOrder.clear(); // Simply clear the vector instead of using std::swap
+        xSemaphoreGiveRecursive(mutex);
     }
 
     dbgln("Clearing pending requests and resetting Modbus TCP client.");
@@ -126,10 +187,9 @@ void ModbusCache::resetConnection() {
         modbusTCPClient->clearQueue();
         modbusTCPClient->resetCounts();
         modbusTCPClient->disconnect();
-        //WiFi.disconnect();
-        //delay(1000);
-        //WiFi.reconnect();
-        delay(1000);
+        
+        delay(1000); // Give it time to disconnect
+        
         dbgln("Reconnecting to " + serverIP.toString() + ":" + String(serverPort));
         modbusTCPClient->connect(serverIP, serverPort);
         delay(500);
@@ -178,49 +238,82 @@ void ModbusCache::initializeRegisters(const std::vector<ModbusRegister>& dynamic
         staticRegisterAddresses.insert(reg.address);
     }
     // Log which registers are 16 bit and 32 bit
-    dbgln("16-bit registers: ");
+    String reg16BitList = "16-bit registers: ";
     for (auto addr : register16BitValues) {
-        dbgln(String(addr.first));
+        reg16BitList += String(addr.first) + " ";
     }
-    dbgln("32-bit registers: ");
+    
+    String reg32BitList = "32-bit registers: ";
     for (auto addr : register32BitValues) {
-        dbgln(String(addr.first));
+        reg32BitList += String(addr.first) + " ";
     }
-
+    
+    dbgln(reg16BitList + "\n" + reg32BitList);
 }
 
 std::vector<uint16_t> ModbusCache::getRegisterValues(uint16_t startAddress, uint16_t count) {
+    // Pre-allocate the vector to avoid reallocations
     std::vector<uint16_t> values;
-    for (uint16_t i = 0; i < count; ++i) {
-        uint16_t address = startAddress + i;
-        if (is32BitRegister(address)) {
+    values.reserve(count * 2); // Worst case: all registers are 32-bit (2 words each)
+    
+    uint16_t i = 0;
+    uint16_t currentAddress = startAddress;
+    
+    while (i < count) {
+        if (is32BitRegister(currentAddress)) {
             // Handle 32-bit register
-            uint32_t value32 = read32BitRegister(address);
+            uint32_t value32 = read32BitRegister(currentAddress);
             Uint16Pair pair = split32BitRegister(value32);
+            
             values.push_back(pair.lowWord);
-            values.push_back(pair.highWord);
-            ++i; // Skip next address since it's part of the 32-bit value
+            if (i + 1 < count) { // Only add high word if we haven't reached the requested count
+                values.push_back(pair.highWord);
+                i++; // Count the high word
+            }
+            
+            currentAddress += 2; // Move to the next register after the 32-bit one
         } else {
             // Handle 16-bit register
-            values.push_back(read16BitRegister(address));
+            values.push_back(read16BitRegister(currentAddress));
+            currentAddress++;
         }
+        i++;
     }
+    
     return values;
 }
 
 uint16_t ModbusCache::read16BitRegister(uint16_t address) {
-    if (register16BitValues.find(address) != register16BitValues.end()) {
-        return register16BitValues[address];
+    // Use find instead of double lookup for better performance
+    auto it = register16BitValues.find(address);
+    if (it != register16BitValues.end()) {
+        return it->second;
     }
+    
     // Add this address to the set of unexpected registers
+    // Only in debug mode to avoid unnecessary operations in production
+    #ifdef DEBUG_MODE
     unexpectedRegisters.insert(address);
+    #endif
+    
     return 0; // Placeholder for non-existent register
 }
 
 uint32_t ModbusCache::read32BitRegister(uint16_t address) {
+    // Fast path check for 32-bit register
     if (is32BitRegister(address)) {
-        return register32BitValues[address];
+        // Use find instead of direct access for better error handling
+        auto it = register32BitValues.find(address);
+        if (it != register32BitValues.end()) {
+            return it->second;
+        }
     }
+    
+    // Log unexpected access only in debug mode
+    #ifdef DEBUG_MODE
+    dbgln("Attempted to read non-existent 32-bit register at address: " + String(address));
+    #endif
+    
     return 0; // Placeholder for non-existent register
 }
 
@@ -231,90 +324,216 @@ Uint16Pair ModbusCache::split32BitRegister(uint32_t value) {
     return result;
 }
 
+void ModbusCache::logWithCollapsing(const String& message) {
+    unsigned long currentTime = millis();
+    
+    // If this is the same message as the last one and within a reasonable time window
+    if (message == lastLogMessage && (currentTime - lastLogTime) < 10000) { // 10 second window
+        repeatCount++;
+        
+        // Only log every 50th occurrence or after 2 seconds since last log
+        if (repeatCount % 200 == 0 || (currentTime - lastLogTime) >= 2000) {
+            // Create a local String for the message
+            String logMsg = message + " (repeated " + String(repeatCount) + " times)";
+            dbgln(logMsg);
+            lastLogTime = currentTime;
+        }
+    } else {
+        // If we had previous repeated messages, show final count
+        if (repeatCount > 1) {
+            // Create a local String for the message
+            String logMsg = lastLogMessage + " (repeated " + String(repeatCount) + " times total)";
+            dbgln(logMsg);
+        }
+        
+        // New message, reset counter
+        lastLogMessage = message;
+        repeatCount = 1;
+        
+        // Log this new message directly
+        dbgln(message);
+        lastLogTime = currentTime;
+    }
+}
+
 void ModbusCache::update() {
-    if (millis() - lastPollEnd >= update_interval) {
-        lastPollStart = millis();
+    unsigned long currentMillis = millis();
 
-        String statusMsg = "\nUpdate Status @ "+String(lastPollStart)+":-\n"
-                           "[update] Last successful update: " + String(instance->lastSuccessfulUpdate) + "\n"
-                           "[update] Time since update recvd: " + String(millis() - instance->lastSuccessfulUpdate) + "ms\n"
-                           "[update] Pending reqs: " + String(requestMap.size()) + "\n";
+    // First, purge any aged tokens to clean up timed-out requests
+    purgeAgedTokens();
 
-        // Check for timed-out requests
-        std::vector<uint32_t> timedOutTokens;
-        if (xSemaphoreTake(mutex, portMAX_DELAY)) {
-            for (const auto& entry : requestMap) {
-                uint32_t token = entry.first;
-                unsigned long timestamp = std::get<2>(entry.second);
-                unsigned long now = millis();
-                if (now - timestamp > 5000) { // Timeout: 5 seconds
-                    //statusMsg += "[update] Request timed out. Token: " + String(token) + "\n";
-                    logErrln("[update] Request timed out. Token: " + String(token));
-                    timedOutTokens.push_back(token);
-                } else {
-                    // Log the token ID and time (second)
-                    statusMsg += "[update] Token NOT timed out: " + String(token) + ", Elapsed: " + String((now - timestamp) / 1000) + ", Now: " + String(now)+"\n";
+    if (currentMillis - lastPollStart >= update_interval) {
+        dbgln("[update] Updating Modbus Cache");
+        lastPollStart = currentMillis;
+        
+        // Initialize ranges if not done yet
+        if (registerRanges.empty()) {
+            dbgln("[update] Initializing register ranges");
+            initializeRegisterRanges();
+        }
+        
+        // First process static registers if not all fetched
+        if (!staticRegistersFetched) {
+            dbgln("[update] Processing static registers");
+            for (auto& range : registerRanges) {
+                if (range.isStatic) {
+                    processRegisterRange(range);
                 }
             }
-            xSemaphoreGive(mutex); // Release the mutex
-        }
-
-        // Check if we have exceeded the no-update timeout
-        unsigned long lastUpdate = instance->lastSuccessfulUpdate;
-        unsigned long now = millis();
-        unsigned long timeSinceLastUpdate = now - lastUpdate;
-        // We need to ensure that now is greater than lastSuccessfulUpdate to avoid underflow
-        if (timeSinceLastUpdate > 30000 && now > lastUpdate) {
-            logErr(statusMsg);
-            logErrln("No updates for " + String(timeSinceLastUpdate / 1000) + " seconds (" + String(now) + "-" +
-                     String(instance->lastSuccessfulUpdate) + "). Resetting connection.");
-            resetConnection();
-            // Don't restart the ESP32, just reset the connection
-            // delay(2000);
-            // ESP.restart();
-            return;
-        }
-
-        dbg(statusMsg);
-
-        // Purge timed-out tokens
-        for (uint32_t token : timedOutTokens) {
-            dbgln("[update] Purging timed-out token: " + String(token));
-            purgeToken(token);
-            dbgln("[update] Token purged");
-        }
-
-        // Skip updates if too many requests are still pending
-        if (requestMap.size() > 2) {
-            dbgln("[update] Too many requests pending. Skipping update.");
-            return;
-        }
-
-        dbgln("[update] Now we update modbusCache");
-        
-        // Log last poll start time
-        dbgln("[update] Last poll start: " + String(lastPollStart));
-
-        if (!staticRegistersFetched) {
-            dbgln("[update] Fetching static registers...");
-            fetchFromRemote(staticRegisterAddresses);
+            
+            // Check if all static registers are fetched
+            bool allStaticFetched = true;
+            for (uint16_t addr : staticRegisterAddresses) {
+                if (fetchedStaticRegisters.find(addr) == fetchedStaticRegisters.end()) {
+                    allStaticFetched = false;
+                    break;
+                }
+            }
+            if (allStaticFetched) {
+                staticRegistersFetched = true;
+                dbgln("[update] All static registers fetched");
+            }
         } else {
-            fetchFromRemote(dynamicRegisterAddresses);
+            // Process dynamic registers
+            for (auto& range : registerRanges) {
+                if (!range.isStatic) {
+                    // Find the index of this range among dynamic ranges
+                    size_t rangeIndex = 0;
+                    size_t totalDynamicRanges = 0;
+                    
+                    // Count dynamic ranges and find current index
+                    for (size_t i = 0; i < registerRanges.size(); i++) {
+                        if (!registerRanges[i].isStatic) {
+                            totalDynamicRanges++;
+                            if (&registerRanges[i] == &range) {
+                                rangeIndex = totalDynamicRanges;
+                            }
+                        }
+                    }
+                    
+                    dbgln("[update] Processing dynamic register range " + String(rangeIndex) + " of " + String(totalDynamicRanges));
+                    processRegisterRange(range);
+                }
+            }
         }
-        lastPollEnd = millis();
-
+        
         updateServerStatus();
-        dbgln("[update] Finished poll at: " + String(lastPollEnd));
+        dbgln("[update] Server status updated");
+    }
+}
 
-    } else {
-        // Log the time until the next update
-        static unsigned long lastSkipLogTime = 0;
-        unsigned long currentTime = millis();
-        if (currentTime - lastSkipLogTime > 500) {
-            dbgln("[update]Skip update. Time until next update: " + String(update_interval - (currentTime - lastPollEnd)) + "ms");
-            lastSkipLogTime = currentTime;
+void ModbusCache::initializeRegisterRanges() {
+    registerRanges.clear();
+    
+    // First handle static registers
+    if (!staticRegisterAddresses.empty()) {
+        uint16_t startAddress = *staticRegisterAddresses.begin();
+        uint16_t lastAddress = startAddress;
+        uint16_t regCount = is32BitRegister(startAddress) ? 2 : 1;
+        bool lastWas32Bit = is32BitRegister(startAddress);
+
+        for (auto it = std::next(staticRegisterAddresses.begin()); it != staticRegisterAddresses.end(); ++it) {
+            uint16_t currentAddress = *it;
+            bool isCurrent32Bit = is32BitRegister(currentAddress);
+            uint16_t expectedNextAddress = lastAddress + (lastWas32Bit ? 2 : 1);
+
+            if (currentAddress == expectedNextAddress) {
+                regCount += isCurrent32Bit ? 2 : 1;
+            } else {
+                // Add the current range
+                registerRanges.push_back({startAddress, regCount, true, 0, false});
+                // Start new range
+                startAddress = currentAddress;
+                regCount = isCurrent32Bit ? 2 : 1;
+            }
+            lastAddress = currentAddress;
+            lastWas32Bit = isCurrent32Bit;
+        }
+        // Add the last range
+        registerRanges.push_back({startAddress, regCount, true, 0, false});
+    }
+
+    // Then handle dynamic registers
+    if (!dynamicRegisterAddresses.empty()) {
+        uint16_t startAddress = *dynamicRegisterAddresses.begin();
+        uint16_t lastAddress = startAddress;
+        uint16_t regCount = is32BitRegister(startAddress) ? 2 : 1;
+        bool lastWas32Bit = is32BitRegister(startAddress);
+
+        for (auto it = std::next(dynamicRegisterAddresses.begin()); it != dynamicRegisterAddresses.end(); ++it) {
+            uint16_t currentAddress = *it;
+            bool isCurrent32Bit = is32BitRegister(currentAddress);
+            uint16_t expectedNextAddress = lastAddress + (lastWas32Bit ? 2 : 1);
+
+            if (currentAddress == expectedNextAddress) {
+                regCount += isCurrent32Bit ? 2 : 1;
+            } else {
+                // Add the current range
+                registerRanges.push_back({startAddress, regCount, false, 0, false});
+                // Start new range
+                startAddress = currentAddress;
+                regCount = isCurrent32Bit ? 2 : 1;
+            }
+            lastAddress = currentAddress;
+            lastWas32Bit = isCurrent32Bit;
+        }
+        // Add the last range
+        registerRanges.push_back({startAddress, regCount, false, 0, false});
+    }
+}
+
+void ModbusCache::processRegisterRange(RegisterRange& range) {
+    unsigned long currentTime = millis();
+    
+    // Skip if request is in flight and we haven't timed out
+    if (range.inFlight) {
+        unsigned long inFlightTime = currentTime - range.lastRequestTime;
+        dbgln("[processRegisterRange] Request in flight for " + String(inFlightTime) + "ms, skipping");
+        return;
+    }
+    
+    // If this is a static range that's already been fetched, skip it
+    if (range.isStatic) {
+        bool allFetched = true;
+        for (uint16_t addr = range.startAddress; addr < range.startAddress + range.regCount; addr++) {
+            if (fetchedStaticRegisters.find(addr) == fetchedStaticRegisters.end()) {
+                allFetched = false;
+                break;
+            }
+        }
+        if (allFetched) {
+            return;
         }
     }
+    
+    // Check if we need to wait before retrying
+    if (currentTime - range.lastRequestTime < RETRY_DELAY_MS) {
+        return;
+    }
+    
+    // Send the request
+    ModbusMessage request = ModbusMessage(1, 3, range.startAddress, range.regCount);
+    uint32_t currentToken = globalToken++;
+    
+    if (xSemaphoreTakeRecursive(mutex, portMAX_DELAY)) {
+        requestMap[currentToken] = std::make_tuple(range.startAddress, range.regCount, currentTime);
+        xSemaphoreGiveRecursive(mutex);
+    }
+    
+    if (config.getClientIsRTU()) {
+        modbusRTUClient->addRequest(request, currentToken);
+    } else {
+        modbusTCPClient->addRequest(request, currentToken);
+    }
+    
+    range.lastRequestTime = currentTime;
+    range.inFlight = true;
+    // Log the request time and token for debugging
+    dbgln("[processRegisterRange] Sent request for range " + String(range.startAddress) + 
+          "-" + String(range.startAddress + range.regCount - 1) + 
+          " with token " + String(currentToken) + 
+          " at time " + String(currentTime));
+    delay(10);
 }
 
 void ModbusCache::updateWaterMarks(uint16_t address, uint32_t value, bool is32Bit) {
@@ -443,135 +662,234 @@ void ModbusCache::setRegisterValue(uint16_t address, uint32_t value, bool is32Bi
     }
 }
 
-void ModbusCache::fetchFromRemote(const std::set<uint16_t>& regAddresses) {
-    if (regAddresses.empty()) return; // Early return if there are no addresses to process
-
-    uint16_t startAddress = *regAddresses.begin();
-    uint16_t lastAddress = startAddress;
-    bool lastWas32Bit = is32BitRegister(startAddress);
-    // Initialize regCount based on the first register size.
-    uint16_t regCount = lastWas32Bit ? 2 : 1;
-
-    //dbgln("startAddress: " + String(startAddress));
-
-    for (auto it = std::next(regAddresses.begin()); it != regAddresses.end(); ++it) {
-        //dbg(String(*it) + ", ");
-        uint16_t currentAddress = *it;
-        // If this is a static register that we have already fetched, but fetching
-        // of all static registers is not yet complete, skip it.
-        if (!staticRegistersFetched && fetchedStaticRegisters.find(currentAddress) != fetchedStaticRegisters.end()) {
-            continue;
-        }
-
-        // If this register is already in the queue, skip it.
-        bool isCurrent32Bit = is32BitRegister(currentAddress);
-
-        // Calculate expected next address considering the size of the last register.
-        uint16_t expectedNextAddress = lastAddress + (lastWas32Bit ? 2 : 1);
-
-        if (currentAddress == expectedNextAddress) {
-            // Address is contiguous with the last one considering register size.
-            regCount += isCurrent32Bit ? 2 : 1;
-        } else {
-            // Found a non-contiguous address, send request for the previous block.
-            //dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress));
-            sendModbusRequest(startAddress, regCount);
-
-            // Start new block from the current address.
-            startAddress = currentAddress;
-            regCount = isCurrent32Bit ? 2 : 1;
-        }
-
-        // Update for the next iteration.
-        lastAddress = currentAddress;
-        lastWas32Bit = isCurrent32Bit;
-
-        // Always check at the end of each iteration to send due to request size limit or if it's the last item.
-        if (regCount >= 100 || std::next(it) == regAddresses.end()) {
-            //dbgln("Sending request for " + String(regCount) + " registers starting at " + String(startAddress));
-            sendModbusRequest(startAddress, regCount);
-            yield(); // Yield to allow other tasks to run
-
-            // Prepare for potentially next block, reset regCount only if not at the end.
-            if (std::next(it) != regAddresses.end()) {
-                startAddress = *std::next(it);
-                lastWas32Bit = is32BitRegister(startAddress);
-                regCount = lastWas32Bit ? 2 : 1;
-                lastAddress = startAddress;
-            }
-        }
-    }
-    //dbgln("]");
-}
-
-
 void ModbusCache::updateServerStatus() {
-    if (millis() - instance->lastSuccessfulUpdate > (update_interval + 2000)) {
-        isOperational = false;
-    } else if(staticRegistersFetched && dynamicRegistersFetched) {
-        isOperational = true;
-    }
-}
-
-void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
-    if (regCount > 0) {
-        ModbusMessage request = ModbusMessage(1, 3, startAddress, regCount);
-        uint32_t currentToken = globalToken++;
-
-        dbgln("\n=== Sending Request ===");
-        dbgln("Start Address: 0x" + String(startAddress, HEX) + " (" + String(startAddress) + ")");
-        dbgln("Register Count: " + String(regCount));
-        dbgln("Token: " + String(currentToken));
-        dbgln("Request data: ");
-        printHex(request.data(), request.size());
-
-        if (xSemaphoreTake(mutex, portMAX_DELAY)) { // Wait indefinitely until the mutex is available
-            unsigned long timestamp = millis();
-            requestMap[currentToken] = std::make_tuple(startAddress, regCount, timestamp); // Store the request info along with timestamp
-            insertionOrder.push(currentToken); // Add the token to the queue
-            // Check if the map is at its maximum size
-            if (requestMap.size() >= 200) {
-                // Remove the oldest entry
-                uint32_t oldestToken = insertionOrder.front();
-                dbgln("[sendModbusRequest] Removing oldest entry with token: " + String(oldestToken));
-                requestMap.erase(oldestToken);
-                dbgln("[sendModbusRequest] Erasing token done");
-                insertionOrder.pop();
-            }
-            xSemaphoreGive(mutex); // Release the mutex
-        }
-        Error err;
-        if(config.getClientIsRTU()) {
-            err = modbusRTUClient->addRequest(request, currentToken);
+    unsigned long currentTime = millis();
+    bool shouldBeOperational = false;
+    
+    // Take mutex to safely check and update the operational state
+    if (xSemaphoreTakeRecursive(instance->mutex, pdMS_TO_TICKS(100))) {
+        // Handle uint32_t overflow/underflow conditions safely
+        unsigned long timeSinceUpdate;
+        if (currentTime >= instance->lastSuccessfulUpdate) {
+            timeSinceUpdate = currentTime - instance->lastSuccessfulUpdate;
         } else {
-            err = modbusTCPClient->addRequest(request, currentToken);
-        }
-
-        if (err != SUCCESS) {
-            logErrln("[sendModbusRequest] Error adding request: " + String((int)err));
+            // This case handles millis() overflow or lastUpdate being incorrectly set
+            logErrln("[updateServerStatus] Time calculation error: current=" + String(currentTime) + 
+                    ", lastUpdate=" + String(instance->lastSuccessfulUpdate));
+            // Don't change operational status based on incorrect time calculation
+            timeSinceUpdate = 0;
         }
         
+        // Use 2000ms instead of 1000ms to achieve the desired 2.5 second timeout
+        bool timeout = (timeSinceUpdate > (update_interval + 2000));
+        bool completed = (staticRegistersFetched && dynamicRegistersFetched);
+        
+        // Determine if server should be operational
+        shouldBeOperational = !timeout && completed;
+        
+        // Only log and update if there's a state change
+        if (shouldBeOperational != instance->isOperational) {
+            if (!shouldBeOperational) {
+                // Transitioning to non-operational state
+                dbgln("[updateServerStatus] No updates for " + String(timeSinceUpdate / 1000) + 
+                      " seconds, marking server as non-operational (current: " + 
+                      String(currentTime) + ", last: " + String(instance->lastSuccessfulUpdate) + ")");
+            } else {
+                // Transitioning to operational state
+                dbgln("[updateServerStatus] Server is now operational");
+            }
+            
+            // Update the state
+            instance->isOperational = shouldBeOperational;
+        }
+        
+        xSemaphoreGiveRecursive(instance->mutex);
+    } else {
+        // Log mutex acquisition failure but don't change state
+        logErrln("[updateServerStatus] Failed to acquire mutex to update server status");
     }
+}
+
+// Add a new method to check if we should throttle requests
+bool ModbusCache::shouldThrottleRequests() {
+    // If we have no poll groups, we should not throttle
+    if (pollGroups.empty()) {
+        return false;
+    }
+    
+    unsigned long currentTime = millis();
+    
+    // Check if we have too many pending requests
+    size_t pendingCount = 0;
+    
+    // Get the count of pending requests
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(50))) {
+        pendingCount = requestMap.size();
+        xSemaphoreGiveRecursive(mutex);
+    } else {
+        // If we can't get the mutex, assume we should throttle
+        dbgln("[shouldThrottleRequests] Failed to acquire mutex, so we should throttle");
+        return true;
+    }
+    
+    // Calculate maximum requests based on client type
+    size_t maxRequests = config.getClientIsRTU() ? 1 : MAX_PENDING_REQUESTS;
+    
+    // Calculate the throttling threshold based on how long the queue has been full
+    float throttleThreshold;
+    
+    if (queueWasFull) {
+        // If queue has been full, use progressive throttling thresholds
+        unsigned long queueFullDuration = currentTime - queueFullStartTime;
+        
+        if (queueFullDuration > 10000) { // 10+ seconds
+            // Very aggressive throttling - only allow 20% of max capacity
+            throttleThreshold = 0.2;
+        } else if (queueFullDuration > 5000) { // 5-10 seconds
+            // More aggressive throttling - only allow 40% of max capacity
+            throttleThreshold = 0.4;
+        } else { // 0-5 seconds
+            // Initial throttling - allow 60% of max capacity
+            throttleThreshold = 0.6;
+        }
+    } else {
+        // Normal operation - throttle at 80% of capacity
+        throttleThreshold = 0.8;
+    }
+    
+    // Check if we should throttle based on the calculated threshold
+    if (pendingCount >= maxRequests * throttleThreshold) {
+        // We have reached our throttling threshold
+        static unsigned long lastThrottleLog = 0;
+        if (currentTime - lastThrottleLog > 5000) {  // Log every 5 seconds to avoid spam
+            lastThrottleLog = currentTime;
+            logErrln("[throttle] Throttling at " + String(pendingCount) + 
+                   " of " + String(maxRequests) + " requests (" + 
+                   String(throttleThreshold * 100) + "% threshold)");
+        }
+        return true;
+    }
+    
+    // No throttling needed
+    return false;
+}
+
+// Modify the sendModbusRequest method to include throttling
+void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
+    // Check if we should throttle requests
+    if (shouldThrottleRequests()) {
+        return;
+    }
+    
+    // Add a small delay between requests (10ms as requested)
+    delay(10);
+    
+    // Create the request - use the constructor pattern seen elsewhere in the code
+    // Using slave ID 1 and function code 3 (Read Holding Registers)
+    ModbusMessage request = ModbusMessage(1, 3, startAddress, regCount);
+    
+    // Get a new token
+    uint32_t currentToken = globalToken++;
+    bool mutexAcquired = false;
+    
+    // Store the request details with timestamp - use a timeout for mutex acquisition
+    // to avoid blocking indefinitely if there's contention
+    const TickType_t xTicksToWait = pdMS_TO_TICKS(100); // 100ms timeout
+    
+    // Record mutex acquisition attempt
+    mutexAcquisitionAttempts++;
+    unsigned long mutexWaitStartTime = millis();
+    
+    if (xSemaphoreTakeRecursive(mutex, xTicksToWait)) {
+        mutexAcquired = true;
+        
+        // Record mutex acquisition time
+        unsigned long mutexAcquiredTime = millis();
+        mutexWaitingTime += (mutexAcquiredTime - mutexWaitStartTime);
+        
+        // Record internal operations
+        unsigned long currentTime = millis();
+        requestMap[currentToken] = std::make_tuple(startAddress, regCount, currentTime);
+        insertionOrder.push_back(currentToken);
+        
+        // Record mutex release time
+        unsigned long mutexReleaseTime = millis();
+        unsigned long holdTime = mutexReleaseTime - mutexAcquiredTime;
+        mutexHoldingTime += holdTime;
+        
+        // Update max hold time
+        if (holdTime > maxMutexHoldTime) {
+            maxMutexHoldTime = holdTime;
+        }
+        
+        // Log if the hold time is significant
+        if (holdTime > 50) {  // More than 50ms
+            logErrln("[sendModbusRequest] Mutex held for " + String(holdTime) + "ms");
+        }
+        
+        xSemaphoreGiveRecursive(mutex);
+    } else {
+        // If we couldn't acquire the mutex, log an error
+        mutexAcquisitionFailures++;
+        logErrln("[sendModbusRequest] Failed to acquire mutex within timeout. Request not sent.");
+        return;
+    }
+    
+    // Now do logging outside the mutex
+    String hexData = "";
+    for (size_t i = 0; i < request.size(); ++i) {
+        if (request.data()[i] < 16) {
+            hexData += "0"; // Add leading zero for values less than 16
+        }
+        hexData += String(request.data()[i], HEX);
+        
+        if (i < request.size() - 1) {
+            hexData += " "; // Space between bytes for readability
+        }
+    }
+    
+    dbgln("[sendRequest:" + String(currentToken) + "] === Sending Request ===\n"
+          "[sendRequest:" + String(currentToken) + "] Start Address: 0x" + String(startAddress, HEX) + " (" + String(startAddress) + ")\n"
+          "[sendRequest:" + String(currentToken) + "] Register Count: " + String(regCount) + "\n"
+          "[sendRequest:" + String(currentToken) + "] Token: " + String(currentToken) + "\n"
+          "[sendRequest:" + String(currentToken) + "] Request data: \n" + hexData);
+    
+    // Send the request based on client type
+    if (config.getClientIsRTU()) {
+        modbusRTUClient->addRequest(request, currentToken);
+    } else {
+        modbusTCPClient->addRequest(request, currentToken);
+    }
+    
+    // Yield to allow other tasks (especially network processing) to run
+    yield();
 }
 
 void ModbusCache::updateLatencyStats(unsigned long latency) {
-    // Update min and max latencies
+    // For the first value, initialize all stats
     if (latencies.empty()) {
-        minLatency = maxLatency = latency;
-    } else {
-        minLatency = std::min(minLatency, latency);
-        maxLatency = std::max(maxLatency, latency);
+        minLatency = latency;
+        maxLatency = latency;
+        averageLatency = latency;
+        sumLatencySquared = static_cast<double>(latency) * latency;
+        latencies.push_back(latency);
+        return;
     }
+
+    // Update min and max
+    minLatency = std::min(minLatency, latency);
+    maxLatency = std::max(maxLatency, latency);
 
     // Handle rolling window when full
     if (latencies.size() == maxLatencySamples) {
         unsigned long oldest = latencies.front();
         latencies.pop_front();
 
-        // Recalculate rolling average properly
-        averageLatency = averageLatency + (static_cast<double>(latency) - oldest) / maxLatencySamples;
+        // Update rolling average
+        averageLatency = averageLatency + 
+            (static_cast<double>(latency) - oldest) / maxLatencySamples;
 
-        // Update sum of squares correctly
+        // Update sum of squares
         sumLatencySquared = sumLatencySquared +
             static_cast<double>(latency) * latency -
             static_cast<double>(oldest) * oldest;
@@ -587,109 +905,359 @@ void ModbusCache::updateLatencyStats(unsigned long latency) {
 
 // This function handles responses from the Modbus TCP client
 void ModbusCache::handleData(ModbusMessage response, uint32_t token) {
-    dbgln("[handleData] Received response for token: " + String(token));
-    printHex(response.data(), response.size());
-    auto it = instance->requestMap.find(token);
-    if (it != instance->requestMap.end()) {
-        uint16_t startAddress = std::get<0>(it->second);
-        uint16_t regCount = std::get<1>(it->second);
-        unsigned long sentTimestamp = std::get<2>(it->second);
+    // Yield at the beginning of processing
+    yield();
+    
+    // Record mutex timing
+    unsigned long mutexWaitStartTime = millis();
+    bool mutexAcquired = false;
+    
+    if (xSemaphoreTakeRecursive(instance->mutex, pdMS_TO_TICKS(100))) {
+        mutexAcquired = true;
+        unsigned long mutexAcquiredTime = millis();
+        instance->mutexWaitingTime += (mutexAcquiredTime - mutexWaitStartTime);
+        instance->mutexAcquisitionAttempts++;
         
-        unsigned long responseTime = millis() - sentTimestamp;
-        dbgln("[handleData] Response time for token " + String(token) + ": " + String(responseTime) + " ms");
-        // Update latency stats
-        instance->updateLatencyStats(responseTime);
-
-        dbgln("[handleData] Start address: " + String(startAddress) + ", register count: " + String(regCount));
-        printHex(response.data(), response.size());
-
-        instance->processResponsePayload(response, startAddress, regCount);
-
-        instance->lastSuccessfulUpdate = millis();
-        dbgln("[handleData] Current millis: " + String(millis()));
-        dbgln("[handleData] Last successful update: " + String(instance->lastSuccessfulUpdate));
-        instance->purgeToken(token);
-        dbgln("[handleData] token purged");
-        if(instance->insertionOrder.size() > 6) {
-            dbgln("[rcpt:" + String(token) + "] Queue size: " + String(instance->insertionOrder.size()) + ", map size: " + String(instance->requestMap.size()));
+        auto it = instance->requestMap.find(token);
+        if (it != instance->requestMap.end()) {
+            uint16_t startAddress = std::get<0>(it->second);
+            uint16_t regCount = std::get<1>(it->second);
+            unsigned long sentTimestamp = std::get<2>(it->second);
+            
+            // Calculate response time
+            unsigned long responseTime = millis() - sentTimestamp;
+            dbgln("[handleData] Response time for token " + String(token) + ": " + String(responseTime) + " ms");
+            
+            // Find and mark the range as not in flight
+            for (auto& range : instance->registerRanges) {
+                if (range.startAddress == startAddress && range.regCount == regCount) {
+                    range.inFlight = false;
+                    break;
+                }
+            }
+            
+            // Process the response payload
+            instance->processResponsePayload(response, startAddress, regCount);
+            instance->lastSuccessfulUpdate = millis();
+            
+            // Update latency statistics
+            instance->updateLatencyStats(responseTime);
+            
+            // Clean up the request from the map
+            instance->requestMap.erase(token);
+            
+            // Get status report while mutex is still held
+            String statusReport = instance->getRequestMapStatus();
+            
+            // Record mutex hold time
+            unsigned long mutexReleaseTime = millis();
+            instance->mutexHoldingTime += (mutexReleaseTime - mutexAcquiredTime);
+            instance->maxMutexHoldTime = max(instance->maxMutexHoldTime, 
+                                           mutexReleaseTime - mutexAcquiredTime);
+            
+            xSemaphoreGiveRecursive(instance->mutex);
+            
+            // Log the status report after releasing the mutex
+            dbgln(statusReport);
+        } else {
+            xSemaphoreGiveRecursive(instance->mutex);
         }
     } else {
-        logErrln("[handleData] Token " + String(token) + " not found in map");
+        // Failed to acquire mutex
+        instance->mutexAcquisitionFailures++;
     }
-    dbgln("[handleData] Done");
+    
     yield();
 }
 
 void ModbusCache::handleError(Error error, uint32_t token) {
+    // ModbusError wraps the error code and provides a readable error message
     ModbusError me(error);
-    logErrln("\n=== Modbus Error ===");
-    logErrln("[handleError] Error code: 0x" + String((int)error, HEX));
-    logErrln("[handleError] Error message: " + String((const char *)me));
-    logErrln("[handleError] Token (to purge): " + String(token));
     
-    instance->purgeToken(token);
-    logErrln("[handleError] Map size after purge: " + String(instance->requestMap.size()));
+    // Log the error with more context
+    String errorContext = "Error response: " + String((int)me, HEX) + " - " + String((const char *)me) + 
+                         " token: " + String(token);
+    
+    // Check if this is a TCP-specific error
+    bool isTCPError = (error == Error::IP_CONNECTION_FAILED || 
+                      error == Error::TCP_HEAD_MISMATCH || 
+                      error == Error::ILLEGAL_IP_OR_PORT ||
+                      error == Error::TIMEOUT);
+    
+    if (isTCPError) {
+        logErrln("[TCP Error] " + errorContext);
+        // Set lastConnectionError to trigger TCP reconnection through instance
+        instance->lastConnectionError = millis();
+    } else {
+        // For other errors (like CRC errors, illegal functions, etc.), just log them
+        dbgln("[Modbus Error] " + errorContext);
+    }
+    
+    // Find and mark the range as not in flight
+    auto it = instance->requestMap.find(token);
+    if (it != instance->requestMap.end()) {
+        uint16_t startAddress = std::get<0>(it->second);
+        uint16_t regCount = std::get<1>(it->second);
+        
+        for (auto& range : instance->registerRanges) {
+            if (range.startAddress == startAddress && range.regCount == regCount) {
+                range.inFlight = false;
+                break;
+            }
+        }
+        
+        // Clean up the request from the map
+        if (xSemaphoreTakeRecursive(instance->mutex, portMAX_DELAY)) {
+            instance->requestMap.erase(token);
+            xSemaphoreGiveRecursive(instance->mutex);
+        }
+    }
 }
 
-void ModbusCache::purgeToken(uint32_t token) {
-    if (xSemaphoreTake(mutex, portMAX_DELAY)) { // Wait indefinitely until the mutex is available
-        std::vector<uint32_t> tokensToPurge; // List of tokens to be purged
-        unsigned long currentTime = millis();
-
-        // Add incoming token to the list
-        tokensToPurge.push_back(token);
-
-        // Find other tokens that are older than 6000ms
-        for (const auto& entry : requestMap) {
-            uint32_t currentToken = entry.first;
-            unsigned long sentTimestamp = std::get<2>(entry.second);
-            if (currentTime - sentTimestamp > 20000) {
-                tokensToPurge.push_back(currentToken);
-            }
-        }
-
-        // Remove tokens from the map
-        for (uint32_t purgeToken : tokensToPurge) {
-            dbgln("[purgeToken] Erasing token " + String(purgeToken) + " from map");
-            requestMap.erase(purgeToken);
-            dbgln("[purgeToken] Erasing token done");
-        }
-
-        // Efficiently process the queue
-        std::queue<uint32_t> tempQueue;
-        while (!insertionOrder.empty()) {
-            uint32_t currentToken = insertionOrder.front();
-            insertionOrder.pop();
-            if (std::find(tokensToPurge.begin(), tokensToPurge.end(), currentToken) == tokensToPurge.end()) {
-                tempQueue.push(currentToken);
-            }
-        }
-        //dbgln("Swapping queues");
-        std::swap(insertionOrder, tempQueue);
-        //dbgln("Swapping done");
-        xSemaphoreGive(mutex); // Release the mutex
+// Improved method to schedule reconnection
+void ModbusCache::scheduleReconnect() {
+    unsigned long currentTime = millis();
+    
+    // Only attempt reconnection once every 10 seconds
+    if (currentTime - lastReconnectAttempt < 10000) {
+        logWithCollapsing("[scheduleReconnect] Reconnection attempted too recently, skipping");
+        return;
     }
-    dbgln("[purgeToken] Erasing tokens done");
+    
+    lastReconnectAttempt = currentTime;
+    
+    if (modbusTCPClient != nullptr) {
+        // First reset all pending requests to clear the queue
+        resetAllPendingRequests();
+        
+        // Now handle the connection
+        logErrln("[scheduleReconnect] Disconnecting TCP client");
+        modbusTCPClient->disconnect();
+        delay(300); // Give it time to disconnect
+        
+        // Try to reconnect multiple times if needed
+        bool connected = false;
+        for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
+            logErrln("[scheduleReconnect] Reconnection attempt " + String(attempt));
+            
+            modbusTCPClient->connect(serverIP, serverPort);
+            delay(500); // Give it time to connect
+            
+            // Here we would check if connected, but since the client doesn't have an isConnected method,
+            // we'll just try multiple times
+            
+            if (attempt < 3) {
+                delay(1000); // Wait between attempts
+            }
+        }
+        
+        logErrln("[scheduleReconnect] Reconnection attempts completed");
+        
+        // Reset connection error flags
+        lastConnectionError = 0;
+        // We're not using lastRequestTimeout for backoff anymore, but we'll leave it here and just set it to 0
+        lastRequestTimeout = 0;
+        
+        // Reinitialize poll groups to start fresh
+        pollGroups.clear();
+        initializePollGroups();
+    }
+}
+
+// Improved TCP connection management
+void ModbusCache::ensureTCPConnection() {
+    // Only perform this check for TCP clients
+    if (config.getClientIsRTU() || modbusTCPClient == nullptr) {
+        return;
+    }
+    
+    // Get current time
+    unsigned long currentTime = millis();
+    
+    // Only run this check periodically (every 5 seconds)
+    if (currentTime - lastConnectionCheck < 5000) {
+        return;
+    }
+    
+    lastConnectionCheck = currentTime;
+    
+    // Check for various conditions that indicate we should reconnect
+    bool shouldReconnect = false;
+    
+    // 1. If we have had a recent TCP-specific connection error
+    if (lastConnectionError > 0 && currentTime - lastConnectionError > 5000) {
+        logWithCollapsing("[ensureTCPConnection] Previous TCP connection error detected");
+        shouldReconnect = true;
+    }
+    
+    // 2. If we have too many pending requests and haven't reconnected recently
+    size_t pendingCount = 0;
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(50))) {
+        pendingCount = requestMap.size();
+        xSemaphoreGiveRecursive(mutex);
+    }
+    
+    if (pendingCount >= MAX_PENDING_REQUESTS && currentTime - lastReconnectAttempt > 30000) {
+        logWithCollapsing("[ensureTCPConnection] Max pending requests reached, possible TCP connection issue");
+        shouldReconnect = true;
+    }
+    
+    // 3. If we haven't had a successful update in a long time
+    if (currentTime - lastSuccessfulUpdate > 30000) {
+        logErrln("[ensureTCPConnection] No successful updates for " + 
+               String((currentTime - lastSuccessfulUpdate) / 1000) + " seconds");
+        shouldReconnect = true;
+    }
+    
+    // If any condition is met and we haven't tried reconnecting recently
+    if (shouldReconnect && currentTime - lastReconnectAttempt > 30000) {
+        logErrln("[ensureTCPConnection] TCP connection issues detected, initiating reconnect");
+        lastReconnectAttempt = currentTime;
+        scheduleReconnect();
+    }
+}
+
+void ModbusCache::purgeToken(uint32_t token, bool mutexAlreadyHeld) {
+    // Variables to store information for deferred logging
+    bool tokenFound = false;
+    unsigned long elapsed = 0;
+    unsigned long currentTime = millis(); // Get time once, outside the mutex
+    
+    // Only take mutex if not already held
+    bool mutexAcquired = mutexAlreadyHeld;
+    if (!mutexAlreadyHeld) {
+        mutexAcquired = (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(100)) == pdTRUE);
+    }
+    
+    if (mutexAcquired) {
+        // Check if the token exists in the map
+        auto it = requestMap.find(token);
+        if (it != requestMap.end()) {
+            tokenFound = true;
+            
+            // Check elapsed time
+            unsigned long sentTime = std::get<2>(it->second);
+            uint16_t startAddress = std::get<0>(it->second);
+            uint16_t regCount = std::get<1>(it->second);
+            
+            // Handle potential millis() overflow
+            elapsed = (currentTime >= sentTime) ? 
+                     (currentTime - sentTime) : 
+                     (ULONG_MAX - sentTime + currentTime + 1);
+                                    
+            if (elapsed > REQUEST_TIMEOUT_MS) {
+                logErrln("[purgeToken:" + String(token) + "] Request timed out after " + 
+                        String(elapsed) + "ms (timeout threshold: " + String(REQUEST_TIMEOUT_MS) + "ms)");
+                
+                // Mark the corresponding range as not in flight
+                for (auto& range : registerRanges) {
+                    if (range.startAddress == startAddress && range.regCount == regCount) {
+                        range.inFlight = false;
+                        break;
+                    }
+                }
+            }
+            
+            // Remove from map
+            requestMap.erase(it);
+            
+            // Faster removal from insertion order by swapping with last element
+            auto orderIt = std::find(insertionOrder.begin(), insertionOrder.end(), token);
+            if (orderIt != insertionOrder.end()) {
+                // Swap with the last element and pop (avoids shifting elements)
+                if (orderIt != insertionOrder.end() - 1) {
+                    std::swap(*orderIt, insertionOrder.back());
+                }
+                insertionOrder.pop_back();
+            }
+        }
+        
+        // Only release mutex if we acquired it here
+        if (!mutexAlreadyHeld) {
+            xSemaphoreGiveRecursive(mutex);
+        }
+    } else {
+        // If we couldn't acquire the mutex, log error and return
+        logErrln("[purgeToken:" + String(token) + "] Failed to acquire mutex within timeout for token " + String(token));
+        return;
+    }
+    
+    // Now do all the logging outside the mutex
+    if (tokenFound) {
+        logWithCollapsing("[purgeToken:" + String(token) + "] Purged token " + String(token) + " after " + String(elapsed) + " ms");
+    } else {
+        // This is not an error; could be a token that was already purged
+        logWithCollapsing("[purgeToken:" + String(token) + "] Token " + String(token) + " not found in map");
+    }
+}
+
+// New method to purge aged tokens periodically, called less frequently
+void ModbusCache::purgeAgedTokens() {
+    std::vector<uint32_t> agedTokens;
+    unsigned long currentTime = millis();
+    
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(100))) {
+        // Pre-allocate to avoid resizing inside the critical section
+        agedTokens.reserve(requestMap.size());
+        
+        // First, check for aged tokens in the request map
+        for (const auto& entry : requestMap) {
+            uint32_t token = entry.first;
+            unsigned long sentTime = std::get<2>(entry.second);
+            
+            // Handle potential millis() overflow
+            unsigned long elapsed = (currentTime >= sentTime) ? 
+                                  (currentTime - sentTime) : 
+                                  (ULONG_MAX - sentTime + currentTime + 1);
+                               
+            if (elapsed > REQUEST_TIMEOUT_MS) {
+                agedTokens.push_back(token);
+            }
+        }
+        
+        // Now check for stuck inFlight flags
+        for (auto& range : registerRanges) {
+            if (range.inFlight) {
+                unsigned long inFlightTime = currentTime - range.lastRequestTime;
+                if (inFlightTime > REQUEST_TIMEOUT_MS) {
+                    logErrln("[purgeAgedTokens] Resetting stuck inFlight flag for range " + 
+                           String(range.startAddress) + " after " + String(inFlightTime) + "ms");
+                    range.inFlight = false;
+                }
+            }
+        }
+        
+        // Force purge the oldest token if we're at max capacity with no timeouts
+        if (requestMap.size() >= MAX_PENDING_REQUESTS && agedTokens.empty() && !insertionOrder.empty()) {
+            logErrln("[purgeAgedTokens] Queue full, force-purging oldest request");
+            agedTokens.push_back(insertionOrder.front());
+        }
+        
+        if (!agedTokens.empty()) {
+            logErrln("[purgeAgedTokens] Purging " + String(agedTokens.size()) + " aged tokens");
+        }
+        
+        // Purge tokens while still holding the mutex
+        for (uint32_t token : agedTokens) {
+            purgeToken(token, true);
+        }
+        
+        xSemaphoreGiveRecursive(mutex);
+    } else {
+        logErrln("[purgeAgedTokens] Failed to acquire mutex");
+    }
 }
 
 uint32_t extract32BitValue(const uint8_t* buffer, size_t index) {
-    uint32_t value = static_cast<uint32_t>(buffer[index + 2]) << 24 |
-                     static_cast<uint32_t>(buffer[index + 3]) << 16 |
-                     static_cast<uint32_t>(buffer[index]) << 8 |
-                     static_cast<uint32_t>(buffer[index + 1]);
-
-    String debugMsg = "32-bit Value: " + String(buffer[index]) + ", " +
-                      String(buffer[index + 1]) + ", " + String(buffer[index + 2]) + ", " +
-                      String(buffer[index + 3]);
-    //dbgln(debugMsg);
-    //dbgln("Resulting 32-bit Value: " + String(value));
-
-    return value;
+    // Combine bytes directly without string operations for debugging
+    return static_cast<uint32_t>(buffer[index + 2]) << 24 |
+           static_cast<uint32_t>(buffer[index + 3]) << 16 |
+           static_cast<uint32_t>(buffer[index]) << 8 |
+           static_cast<uint32_t>(buffer[index + 1]);
 }
 
 uint16_t extract16BitValue(const uint8_t* buffer, size_t index) {
-    // log the 2 bytes in order
-    //dbgln("16-bit Value: " + String(buffer[index]) + ", " + String(buffer[index + 1]));
+    // Combine bytes directly without string operations for debugging
     return static_cast<uint16_t>(buffer[index]) << 8 |
            static_cast<uint16_t>(buffer[index + 1]);
 }
@@ -697,58 +1265,89 @@ uint16_t extract16BitValue(const uint8_t* buffer, size_t index) {
 
 void ModbusCache::processResponsePayload(ModbusMessage& response, uint16_t startAddress, uint16_t regCount) {
     dbgln("[processResponsePayload] Processing payload...");
-    // Log the payload
-    //printHex(response.data(), response.size());
-    size_t payloadIndex = 0;
-    //const uint8_t* payload = const_cast<ModbusMessage&>(response).data();
+    
+    // Get payload pointer once
     const uint8_t* payload = response.data() + 3;
-
+    size_t payloadIndex = 0;
+    
+    // Pre-check if we need to update the register sets
+    bool needToCheckStaticCompletion = !staticRegistersFetched;
+    bool needToCheckDynamicCompletion = !dynamicRegistersFetched;
+    
+    // Yield before processing to ensure we don't trigger watchdog
+    yield();
+    
+    // Process registers in a single pass
     for (uint16_t i = 0; i < regCount; ++i) {
         uint16_t currentAddress = startAddress + i;
-        bool isStatic = isStaticRegister(currentAddress);
-        bool isDynamic = isDynamicRegister(currentAddress);
-        if (is32BitRegister(currentAddress)) {
+        
+        // Check register type only once
+        bool is32Bit = is32BitRegister(currentAddress);
+        bool is16Bit = !is32Bit && is16BitRegister(currentAddress);
+        
+        // Skip processing if register type is unknown
+        if (!is32Bit && !is16Bit) {
+            logWithCollapsing("[processResponsePayload] Address " + String(currentAddress) + " not defined as 16 or 32 bit. Skipping...");
+            continue;
+        }
+        
+        // Process based on register type
+        if (is32Bit) {
             uint32_t value = extract32BitValue(payload, payloadIndex);
-            // dbgln("32-bit Value at address " + String(currentAddress) + ": " + String(value));
-            // Log what we know about the register, including its dynamic/static status
-            //dbgln("32-bit Value at address " + String(currentAddress) + ": " + String(value) + " (Static: " + String(isStatic) + ", Dynamic: " + String(isDynamic) + ")");
-
             setRegisterValue(currentAddress, value, true); // true indicates 32-bit operation
             payloadIndex += 4; // Move past the 32-bit value in the payload
             i++; // Skip the next address, as it's part of the 32-bit value
-        } else if (is16BitRegister(currentAddress)) {
+        } else { // is16Bit
             uint16_t value = extract16BitValue(payload, payloadIndex);
-            //dbgln("16-bit Value at address " + String(currentAddress) + ": " + String(value));
-            // Log what we know about the register, including its dynamic/static status
-            //dbgln("16-bit Value at address " + String(currentAddress) + ": " + String(value) + " (Static: " + String(isStatic) + ", Dynamic: " + String(isDynamic) + ")");
             setRegisterValue(currentAddress, value); // Default is 16-bit operation
             payloadIndex += 2; // Move past the 16-bit value in the payload
-        } else {
-            dbgln("[processResponsePayload] Address " + String(currentAddress) + " not defined as 16 or 32 bit. Skipping...");
-            continue; // Skip processing this address if it doesn't match known types
         }
-
-        // Update processed registers sets
-        if (isStatic) {
+        
+        // Update processed registers sets - only if needed
+        if (needToCheckStaticCompletion && isStaticRegister(currentAddress)) {
             fetchedStaticRegisters.insert(currentAddress);
-        } else if (isDynamic) {
+        } else if (needToCheckDynamicCompletion && isDynamicRegister(currentAddress)) {
             fetchedDynamicRegisters.insert(currentAddress);
         }
+        
+        // Yield after processing every 5 registers to prevent watchdog timeout
+        if (i % 5 == 0) {
+            yield();
+        }
     }
+    
+    // Yield before completing the method
+    yield();
 
-    // Efficiently set completion booleans
-    if (!staticRegistersFetched) {
-        dbgln("[processResponsePayload] staticRegistersFetched: " + String(staticRegistersFetched) + ", staticRegisterAddresses.size(): " + String(staticRegisterAddresses.size()) + ", fetchedStaticRegisters.size(): " + String(fetchedStaticRegisters.size()));
+    // Efficiently set completion booleans - only check if needed
+    String statusLogs = "";
+    
+    if (needToCheckStaticCompletion) {
         if (staticRegisterAddresses.size() == fetchedStaticRegisters.size()) {
             staticRegistersFetched = true;
         }
+        statusLogs += "[processResponsePayload] staticRegistersFetched: " + String(staticRegistersFetched) + 
+              ", staticRegisterAddresses.size(): " + String(staticRegisterAddresses.size()) + 
+              ", fetchedStaticRegisters.size(): " + String(fetchedStaticRegisters.size()) + "\n";              
     }
-    if (!dynamicRegistersFetched) {
-        dbgln("[processResponsePayload]  dynamicRegistersFetched: " + String(dynamicRegistersFetched) + ", dynamicRegisterAddresses.size(): " + String(dynamicRegisterAddresses.size()) + ", fetchedDynamicRegisters.size(): " + String(fetchedDynamicRegisters.size()));
+    
+    if (needToCheckDynamicCompletion) {
+        statusLogs += "[processResponsePayload] dynamicRegistersFetched: " + String(dynamicRegistersFetched) + 
+              ", dynamicRegisterAddresses.size(): " + String(dynamicRegisterAddresses.size()) + 
+              ", fetchedDynamicRegisters.size(): " + String(fetchedDynamicRegisters.size());
+              
         if (dynamicRegisterAddresses.size() == fetchedDynamicRegisters.size()) {
             dynamicRegistersFetched = true;
         } 
     }
+    
+    if (statusLogs.length() > 0) {
+        logWithCollapsing(statusLogs);
+    }
+    
+    // Final yield before exiting
+    yield();
+    
     dbgln("[processResponsePayload] Done processing payload");
 }
 
@@ -956,71 +1555,102 @@ void ModbusCache::createEmulatedServer(const std::vector<ModbusRegister>& regist
 
 
 ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
-    dbgln("Received request to local server:");
-    printHex(request.data(), request.size());
+    // Yield at start to allow other tasks to run
+    yield();
 
-    uint8_t slaveID = request[0];
-    uint8_t functionCode = request[1];
-    uint16_t address = (request[2] << 8) | request[3];
-    uint16_t valueOrWords = (request[4] << 8) | request[5];
+    // Extract request parameters once
+    const uint8_t slaveID = request[0];
+    const uint8_t functionCode = request[1];
+    const uint16_t address = extract16BitValue(request.data(), 2);
+    const uint16_t valueOrWords = extract16BitValue(request.data(), 4);
 
-    if (functionCode == 6) { // Write Single Register
-        dbgln("Write Single Register - Slave ID: " + String(slaveID) + ", Address: " + String(address) + ", Value: " + String(valueOrWords));
-
-        // Forward the request to the actual device/server.
-        ModbusMessage forwardRequest;
-        forwardRequest.add(slaveID, functionCode, address, valueOrWords);
-        uint32_t currentToken = globalToken++;
-        instance->modbusTCPClient->addRequest(forwardRequest, currentToken);
-
-        // Update the value in the cache.
-        // The implementation depends on how you've structured your cache. 
-        // Here's a simplified example, adjust according to your actual implementation.
-        instance->setRegisterValue(address, valueOrWords); // This function needs to be designed to handle 16-bit writes.
-
-        // Assuming a successful write is confirmed by echoing back the request or a specific success message.
-        return forwardRequest; // Echo back the request for simplicity, adjust based on actual confirmation needed.
-    }
-
-    if (!instance->isOperational) {
-        dbgln("Server is not operational, returning no response");
-        return ModbusMessage(); // Assuming an empty ModbusMessage indicates no response
-    }
-
-    if (functionCode == 3 || functionCode == 4) { // Read Holding Registers or Read Input Registers
-        dbgln("Read Registers - Slave ID: " + String(slaveID) + ", Address: " + String(address) + ", Quantity: " + String(valueOrWords));
-        
-        auto values = instance->getRegisterValues(address, valueOrWords); // Fetch requested values
-        if (values.empty()) {
-            dbgln("No data available for the requested registers.");
-            return ModbusMessage(); // Return an empty message or a specific error response
+    // Pre-allocate response buffer
+    ModbusMessage response;
+    
+    // Record start time for monitoring
+    unsigned long startTime = millis();
+    
+    // Take mutex with a shorter timeout to prevent blocking too long
+    if (xSemaphoreTakeRecursive(instance->mutex, pdMS_TO_TICKS(50))) {
+        // Fast path for non-operational state
+        if (!instance->isOperational) {
+            xSemaphoreGiveRecursive(instance->mutex);
+            return ModbusMessage();
         }
 
-        ModbusMessage response;
-        response.add(slaveID); // Add slave ID
-        response.add(functionCode); // Add function code
-        response.add(static_cast<uint8_t>(valueOrWords * 2)); // Byte count
+        // Handle write single register (function code 6)
+        if (functionCode == 6) {
+            ModbusMessage forwardRequest;
+            forwardRequest.add(slaveID, functionCode, address, valueOrWords);
+            uint32_t currentToken = globalToken++;
+            
+            // Update cache first
+            instance->setRegisterValue(address, valueOrWords, false);
+            
+            // Release mutex before forwarding request
+            xSemaphoreGiveRecursive(instance->mutex);
+            
+            instance->modbusTCPClient->addRequest(forwardRequest, currentToken);
+            return forwardRequest;
+        }
 
-        // for (auto it = values.rbegin(); it != values.rend(); ++it) { // reverse this to match the order of the request
-        int wordCount = 0;
-        for (auto it = values.begin(); it != values.end(); ++it) {
-            auto value = *it;   
-            response.add(value);
-            wordCount++;
-            // Stop looping if wordcount equals valueOrWords
-            if (wordCount == valueOrWords) { // We might want word one of a 2 word register
-                break;
+        // Handle read holding registers or read input registers (function codes 3 or 4)
+        if (functionCode == 3 || functionCode == 4) {
+            // Add header information
+            response.add(slaveID);
+            response.add(functionCode);
+            response.add(static_cast<uint8_t>(valueOrWords * 2));
+            
+            uint16_t i = 0;
+            uint16_t currentAddress = address;
+            
+            // Calculate maximum time we should spend in this operation
+            const unsigned long MAX_PROCESSING_TIME = 200; // ms
+            
+            while (i < valueOrWords) {
+                // Check processing time more frequently
+                if (i % 3 == 0) {
+                    // Check if we're taking too long
+                    if (millis() - startTime > MAX_PROCESSING_TIME) {
+                        xSemaphoreGiveRecursive(instance->mutex);
+                        return ModbusMessage(); // Return empty response if taking too long
+                    }
+                }
+                
+                if (instance->is32BitRegister(currentAddress)) {
+                    uint32_t value32 = instance->read32BitRegister(currentAddress);
+                    Uint16Pair pair = instance->split32BitRegister(value32);
+                    
+                    response.add(pair.lowWord);
+                    if (i + 1 < valueOrWords) {
+                        response.add(pair.highWord);
+                        i++;
+                    }
+                    currentAddress += 2;
+                } else {
+                    response.add(instance->read16BitRegister(currentAddress));
+                    currentAddress++;
+                }
+                i++;
             }
-            // Log the value and the MSB and LSB
-            //dbgln("Value: " + String(value) + ", MSB: " + String((value >> 8) & 0xFF) + ", LSB: " + String(value & 0xFF));
         }
-
-        dbgln("Sending response from cache:");
-        printHex(response.data(), response.size());
-        return response;
+        
+        xSemaphoreGiveRecursive(instance->mutex);
+    } else {
+        // If we couldn't acquire the mutex quickly, return empty response
+        return ModbusMessage();
     }
-
-    return ModbusMessage(); // For unsupported function codes, return an empty message
+    
+    // Final yield before returning
+    yield();
+    
+    // Log if this operation took unusually long
+    unsigned long duration = millis() - startTime;
+    if (duration > 100) {
+        logErrln("[respondFromCache] Long operation: " + String(duration) + "ms for " + String(valueOrWords) + " registers");
+    }
+    
+    return response;
 }
 
 
@@ -1071,22 +1701,33 @@ float ModbusCache::getScaledValueFromRegister(const ModbusRegister& reg, uint32_
 
 
 float ModbusCache::getRegisterScaledValue(uint16_t address) {
-    auto it = registerDefinitions.find(address);
-    if (it == registerDefinitions.end()) {
-        return 0.0; // Register not found
-    }
-    const ModbusRegister& reg = it->second;
-    uint32_t rawValue = 0;
+    // Take mutex with timeout
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(100))) {
+        auto it = registerDefinitions.find(address);
+        if (it == registerDefinitions.end()) {
+            xSemaphoreGiveRecursive(mutex);
+            return 0.0; // Register not found
+        }
+        const ModbusRegister& reg = it->second;
+        uint32_t rawValue = 0;
 
-    // Read the raw value based on the register's bit width
-    if (is32BitRegister(address)) {
-        rawValue = read32BitRegister(address);
-    } else if (is16BitRegister(address)) {
-        rawValue = static_cast<uint32_t>(read16BitRegister(address));
-    }
+        // Read the raw value based on the register's bit width
+        if (is32BitRegister(address)) {
+            rawValue = read32BitRegister(address);
+        } else if (is16BitRegister(address)) {
+            rawValue = static_cast<uint32_t>(read16BitRegister(address));
+        }
 
-    // Use the new function to get the scaled value
-    return getScaledValueFromRegister(reg, rawValue);
+        // Get the scaled value
+        float result = getScaledValueFromRegister(reg, rawValue);
+        
+        xSemaphoreGiveRecursive(mutex);
+        return result;
+    }
+    
+    // If we failed to get the mutex, return 0
+    logErrln("[getRegisterScaledValue] Failed to acquire mutex within timeout");
+    return 0.0;
 }
 
 String ModbusCache::formatRegisterValue(const ModbusRegister& reg, float value) {
@@ -1177,18 +1818,18 @@ void ModbusCache::setCGBaudRate(uint16_t baudRateValue) {
     uint32_t currentToken = globalToken++;
 
     // Mutex protection for request map and queue
-    if (xSemaphoreTake(mutex, portMAX_DELAY)) {
+    if (xSemaphoreTakeRecursive(mutex, portMAX_DELAY)) {
         unsigned long timestamp = millis();
         requestMap[currentToken] = std::make_tuple(startAddress, 1, timestamp); // Register count is 1
-        insertionOrder.push(currentToken);
+        insertionOrder.push_back(currentToken);
 
         // Check if the map is at its maximum size
         if (requestMap.size() >= 200) {
             uint32_t oldestToken = insertionOrder.front();
             requestMap.erase(oldestToken);
-            insertionOrder.pop();
+            insertionOrder.erase(insertionOrder.begin()); // Remove the first element
         }
-        xSemaphoreGive(mutex);
+        xSemaphoreGiveRecursive(mutex);
     }
 
     // Send the request
@@ -1242,4 +1883,416 @@ std::pair<String, String> ModbusCache::getFormattedWaterMarks(uint16_t address) 
 
     // Return the formatted water marks as a pair of strings
     return std::make_pair(formattedHigh, formattedLow);
+}
+
+
+// Comprehensive method to fetch all system data in a single atomic operation
+ModbusCache::SystemSnapshot ModbusCache::fetchSystemSnapshot(const std::set<uint16_t>& addresses) {
+    SystemSnapshot snapshot;
+    
+    // Acquire mutex once for the entire operation
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(100))) {
+        // Fetch the insane counter
+        snapshot.insaneCounter = insaneCounter;
+        
+        // Copy the unexpected registers set
+        snapshot.unexpectedRegisters = unexpectedRegisters;
+        
+        // Get CG Baud Rate (register 8193)
+        float baudRateValue = getRegisterScaledValue(8193);
+        switch (static_cast<int>(baudRateValue)) {
+            case 1: snapshot.cgBaudRate = "9.6 kbps"; break;
+            case 2: snapshot.cgBaudRate = "19.2 kbps"; break;
+            case 3: snapshot.cgBaudRate = "38.4 kbps"; break;
+            case 4: snapshot.cgBaudRate = "57.6 kbps"; break;
+            case 5: snapshot.cgBaudRate = "115.2 kbps"; break;
+            default: snapshot.cgBaudRate = "Unknown"; break;
+        }
+        
+        // Process each register address
+        for (const auto& address : addresses) {
+            RegisterSnapshot regSnapshot;
+            
+            // Get register definition
+            auto defIt = registerDefinitions.find(address);
+            if (defIt != registerDefinitions.end()) {
+                regSnapshot.definition = defIt->second;
+                
+                // Get raw value based on register type
+                uint32_t rawValue = 0;
+                if (is32BitRegister(address)) {
+                    rawValue = read32BitRegister(address);
+                } else if (is16BitRegister(address)) {
+                    rawValue = static_cast<uint32_t>(read16BitRegister(address));
+                }
+                
+                // Get formatted value
+                float scaledValue = getScaledValueFromRegister(defIt->second, rawValue);
+                regSnapshot.formattedValue = formatRegisterValue(defIt->second, scaledValue);
+                
+                // Get water marks
+                uint32_t rawHighMark = highWaterMarks.find(address) != highWaterMarks.end() ? highWaterMarks[address] : 0;
+                uint32_t rawLowMark = lowWaterMarks.find(address) != lowWaterMarks.end() ? lowWaterMarks[address] : 0;
+                
+                float highMarkScaled = getScaledValueFromRegister(defIt->second, rawHighMark);
+                float lowMarkScaled = getScaledValueFromRegister(defIt->second, rawLowMark);
+                
+                String formattedHigh = formatRegisterValue(defIt->second, highMarkScaled);
+                String formattedLow = formatRegisterValue(defIt->second, lowMarkScaled);
+                
+                regSnapshot.waterMarks = std::make_pair(formattedHigh, formattedLow);
+            }
+            
+            // Add to result map
+            snapshot.registers[address] = regSnapshot;
+        }
+        
+        xSemaphoreGiveRecursive(mutex);
+    } else {
+        logErrln("[fetchSystemSnapshot] Failed to acquire mutex within timeout");
+    }
+    
+    return snapshot;
+}
+
+// Add a new method to reset all pending requests
+void ModbusCache::resetAllPendingRequests() {
+    // Use a timeout for mutex acquisition to avoid blocking indefinitely
+    const TickType_t xTicksToWait = pdMS_TO_TICKS(100); // 100ms timeout
+    
+    // Variables to store information for deferred logging
+    size_t requestCount = 0;
+    std::vector<uint32_t> tokens;
+    
+    if (xSemaphoreTakeRecursive(mutex, xTicksToWait)) {
+        // Store count for logging after mutex release
+        requestCount = requestMap.size();
+        
+        // Collect all tokens for diagnostic logging
+        tokens.reserve(requestCount);
+        for (const auto& entry : requestMap) {
+            tokens.push_back(entry.first);
+        }
+        
+        // Clear all pending requests
+        requestMap.clear();
+        insertionOrder.clear();
+        
+        // Reset the lastRequestTimeout to avoid backoff period
+        lastRequestTimeout = 0;
+        
+        xSemaphoreGiveRecursive(mutex); // Release mutex before logging
+    } else {
+        // If we couldn't acquire the mutex, log an error
+        logErrln("[resetAllPendingRequests] Failed to acquire mutex within timeout");
+        return;
+    }
+    
+    // Now log outside the mutex
+    if (requestCount > 0) {
+        String tokenList = "";
+        for (size_t i = 0; i < std::min(tokens.size(), size_t(5)); i++) {
+            if (!tokenList.isEmpty()) tokenList += ", ";
+            tokenList += String(tokens[i]);
+        }
+        if (tokens.size() > 5) {
+            tokenList += ", ... (" + String(tokens.size() - 5) + " more)";
+        }
+        
+        logErrln("[resetAllPendingRequests] Cleared " + String(requestCount) + 
+               " pending requests. Tokens: " + tokenList);
+        
+        // Force a small delay to let the system stabilize
+        delay(20);
+    } else {
+        logWithCollapsing("[resetAllPendingRequests] No pending requests to clear.");
+    }
+}
+
+// New method to initialize poll groups
+void ModbusCache::initializePollGroups() {
+    pollGroups.clear();
+    
+    // Create optimal batches for static registers
+    if (!staticRegisterAddresses.empty()) {
+        createOptimalRegisterBatches(std::vector<uint16_t>(
+            staticRegisterAddresses.begin(), staticRegisterAddresses.end()), true);
+    }
+    
+    // Create optimal batches for dynamic registers
+    if (!dynamicRegisterAddresses.empty()) {
+        createOptimalRegisterBatches(std::vector<uint16_t>(
+            dynamicRegisterAddresses.begin(), dynamicRegisterAddresses.end()), false);
+    }
+    
+    // Optimize the final poll groups
+    optimizePollGroups(pollGroups);
+    
+    // Reset round-robin state
+    currentGroupIndex = 0;
+    staticGroupsCompleted = false;
+    
+    // Log the created poll groups
+    String pollGroupsLog = "Created " + String(pollGroups.size()) + " poll groups:";
+    
+    for (size_t i = 0; i < pollGroups.size(); i++) {
+        const PollGroup& group = pollGroups[i];
+        String addressList = "";
+        for (uint16_t addr : group.addresses) {
+            if (!addressList.isEmpty()) addressList += ", ";
+            addressList += String(addr);
+        }
+        pollGroupsLog += "\nGroup " + String(i) + ": " + (group.isStatic ? "Static" : "Dynamic") + 
+              " - Addresses: " + addressList;
+    }
+    
+    dbgln(pollGroupsLog);
+}
+
+// Create optimal register batches based on address continuity and register type
+void ModbusCache::createOptimalRegisterBatches(const std::vector<uint16_t>& addresses, bool isStatic) {
+    if (addresses.empty()) return;
+    
+    const uint16_t MAX_BATCH_SIZE = 50; // Maximum registers per batch
+    
+    // Sort addresses for optimal batching
+    std::vector<uint16_t> sortedAddresses = addresses;
+    std::sort(sortedAddresses.begin(), sortedAddresses.end());
+    
+    PollGroup currentGroup;
+    currentGroup.isStatic = isStatic;
+    currentGroup.pollInterval = isStatic ? 0 : update_interval; // Static groups don't need regular polling
+    
+    // Start with the first address
+    uint16_t startAddress = sortedAddresses[0];
+    uint16_t lastAddress = startAddress;
+    bool lastWas32Bit = is32BitRegister(startAddress);
+    uint16_t currentGroupSize = lastWas32Bit ? 2 : 1;
+    currentGroup.addresses.push_back(startAddress);
+    
+    for (size_t i = 1; i < sortedAddresses.size(); i++) {
+        uint16_t currentAddress = sortedAddresses[i];
+        bool isCurrent32Bit = is32BitRegister(currentAddress);
+        uint16_t expectedNextAddress = lastAddress + (lastWas32Bit ? 2 : 1);
+        
+        // Check if this register would fit in the current batch
+        bool isContiguous = (currentAddress == expectedNextAddress);
+        bool wouldExceedMaxSize = (currentGroupSize + (isCurrent32Bit ? 2 : 1)) > MAX_BATCH_SIZE;
+        
+        if (isContiguous && !wouldExceedMaxSize) {
+            // Add to current group
+            currentGroup.addresses.push_back(currentAddress);
+            currentGroupSize += (isCurrent32Bit ? 2 : 1);
+        } else {
+            // Save current group and start a new one
+            if (!currentGroup.addresses.empty()) {
+                pollGroups.push_back(currentGroup);
+                currentGroup.addresses.clear();
+            }
+            
+            // Start new group
+            currentGroup.addresses.push_back(currentAddress);
+            currentGroupSize = isCurrent32Bit ? 2 : 1;
+        }
+        
+        // Update for next iteration
+        lastAddress = currentAddress;
+        lastWas32Bit = isCurrent32Bit;
+    }
+    
+    // Add the last group if not empty
+    if (!currentGroup.addresses.empty()) {
+        pollGroups.push_back(currentGroup);
+    }
+}
+
+// Optimize poll groups for more efficient polling
+void ModbusCache::optimizePollGroups(std::vector<PollGroup>& groups) {
+    // Nothing to optimize if we have 0 or 1 groups
+    if (groups.size() <= 1) return;
+    
+    // This is where additional optimizations could be implemented
+    // For example, balancing group sizes, adjusting poll intervals, etc.
+    
+    // For now, we'll just ensure static groups come first in the round-robin
+    std::stable_sort(groups.begin(), groups.end(), 
+        [](const PollGroup& a, const PollGroup& b) {
+            return a.isStatic && !b.isStatic;
+        });
+}
+
+// Process the next poll group in the round-robin
+void ModbusCache::processNextPollGroup() {
+    // If no poll groups, initialize them
+    if (pollGroups.empty()) {
+        initializePollGroups();
+        if (pollGroups.empty()) {
+            return;
+        }
+    }
+    
+    // Find the next group that doesn't have an in-flight request
+    size_t groupsChecked = 0;
+    bool foundEligibleGroup = false;
+    
+    while (groupsChecked < pollGroups.size() && !foundEligibleGroup) {
+        PollGroup& group = pollGroups[currentGroupIndex];
+        
+        // Only skip if the group has an in-flight request
+        bool hasInFlightRequest = false;
+        for (const auto& range : registerRanges) {
+            if (range.startAddress == group.addresses[0] && range.inFlight) {
+                hasInFlightRequest = true;
+                break;
+            }
+        }
+        
+        if (!hasInFlightRequest) {
+            foundEligibleGroup = true;
+        } else {
+            currentGroupIndex = (currentGroupIndex + 1) % pollGroups.size();
+            groupsChecked++;
+        }
+    }
+    
+    if (!foundEligibleGroup) {
+        // Log if we checked all groups and found none eligible
+        logErrln("[processNextPollGroup] All groups have in-flight requests");
+        return;
+    }
+    
+    // Get the current group
+    PollGroup& group = pollGroups[currentGroupIndex];
+    
+    // Handle empty groups (shouldn't happen, but just in case)
+    if (group.addresses.empty()) {
+        group.completed = true;
+        currentGroupIndex = (currentGroupIndex + 1) % pollGroups.size();
+        return;
+    }
+    
+    // Find contiguous ranges within the group to minimize Modbus requests
+    std::vector<std::pair<uint16_t, uint16_t>> ranges; // pairs of (startAddress, regCount)
+    
+    // Sort addresses to optimize for finding contiguous ranges
+    std::sort(group.addresses.begin(), group.addresses.end());
+    
+    // Start with the first address
+    uint16_t startAddress = group.addresses[0];
+    uint16_t lastAddress = startAddress;
+    bool lastWas32Bit = is32BitRegister(startAddress);
+    uint16_t regCount = lastWas32Bit ? 2 : 1;
+    
+    // Optimize batch sizes - don't make batches too large to avoid timeouts
+    const uint16_t MAX_REGISTERS_PER_BATCH = 24; // Limit batch size
+    
+    for (size_t i = 1; i < group.addresses.size(); i++) {
+        uint16_t currentAddress = group.addresses[i];
+        bool isCurrent32Bit = is32BitRegister(currentAddress);
+        uint16_t expectedNextAddress = lastAddress + (lastWas32Bit ? 2 : 1);
+        
+        // Check if this would exceed our max batch size
+        uint16_t potentialRegCount = regCount + (isCurrent32Bit ? 2 : 1);
+        
+        if (currentAddress == expectedNextAddress && potentialRegCount <= MAX_REGISTERS_PER_BATCH) {
+            // Contiguous and within size limit, extend current range
+            regCount = potentialRegCount;
+        } else {
+            // Not contiguous or would exceed size limit, finish current range and start new one
+            ranges.push_back(std::make_pair(startAddress, regCount));
+            startAddress = currentAddress;
+            regCount = isCurrent32Bit ? 2 : 1;
+        }
+        
+        // Update for next iteration
+        lastAddress = currentAddress;
+        lastWas32Bit = isCurrent32Bit;
+    }
+    
+    // Add the last range
+    ranges.push_back(std::make_pair(startAddress, regCount));
+    
+    // Check if we have capacity to send all the requests
+    size_t maxConcurrentRequests = config.getClientIsRTU() ? 1 : MAX_PENDING_REQUESTS;
+    
+    // Get current pending requests count
+    size_t currentPendingRequests = 0;
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(50))) {
+        currentPendingRequests = requestMap.size();
+        xSemaphoreGiveRecursive(mutex);
+    } else {
+        logWithCollapsing("[processNextPollGroup] Failed to acquire mutex, skipping poll cycle");
+        return;
+    }
+    
+    // Calculate how many requests we can send
+    int requestsAvailable = maxConcurrentRequests - currentPendingRequests;
+    
+    // For RTU, we only send one at a time
+    // For TCP, leave a small safety buffer to prevent edge cases
+    if (!config.getClientIsRTU()) {
+        requestsAvailable = std::min(requestsAvailable, static_cast<int>(MAX_PENDING_REQUESTS - 1));
+    }
+    
+    if (requestsAvailable <= 0) {
+        // No capacity to send requests, will try again later
+        logWithCollapsing("[processNextPollGroup] No capacity to send requests, will try again later");
+        return;
+    }
+    
+    // Send as many requests as we can, limited only by available capacity and number of ranges
+    size_t requestsToSend = std::min(static_cast<size_t>(requestsAvailable), ranges.size());
+    
+    // Send Modbus requests for each range (up to our limit)
+    for (size_t i = 0; i < requestsToSend; i++) {
+        sendModbusRequest(ranges[i].first, ranges[i].second);
+        yield(); // Allow other tasks to run
+    }
+    
+    // Update group status
+    if (group.isStatic) {
+        // Only mark static groups complete if we sent all ranges
+        if (requestsToSend >= ranges.size()) {
+            group.completed = true;
+        }
+    }
+    
+    // Move to next group for round-robin
+    currentGroupIndex = (currentGroupIndex + 1) % pollGroups.size();
+}
+
+String ModbusCache::getRequestMapStatus() {
+    // This function assumes the mutex is already held by the caller
+    String status;
+    status.reserve(200); // Pre-allocate space for the string
+    
+    // Count in-flight requests
+    size_t inFlightCount = 0;
+    unsigned long currentTime = millis();
+    unsigned long minAge = ULONG_MAX;
+    unsigned long maxAge = 0;
+    
+    for (const auto& range : registerRanges) {
+        if (range.inFlight) {
+            inFlightCount++;
+        }
+    }
+    
+    // Calculate ages of requests
+    for (const auto& entry : requestMap) {
+        unsigned long age = currentTime - std::get<2>(entry.second);
+        minAge = std::min(minAge, age);
+        maxAge = std::max(maxAge, age);
+    }
+    
+    // If no requests, set minAge to 0
+    if (requestMap.empty()) {
+        minAge = 0;
+    }
+    
+    status = "[RequestMap Status] Total: " + String(requestMap.size()) + 
+             ", In-Flight: " + String(inFlightCount) + 
+             ", Age Range: " + String(minAge) + "ms to " + String(maxAge) + "ms";
+             
+    return status;
 }

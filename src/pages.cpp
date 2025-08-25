@@ -4,13 +4,51 @@
 
 
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
+// Define a build time string for display on the status page
+#define BUILD_TIME_STR __DATE__ " " __TIME__
+
+// Check if GIT_VERSION is defined by our pre-build script
+#ifndef GIT_VERSION
+#define GIT_VERSION "Unknown"
+#endif
 
 // External variable declaration for WiFi connection time
 extern unsigned long lastWiFiConnectionTime;
 
+// Variables for connection handling
+static int activeConnections = 0;
+static const int MAX_CONNECTIONS = 10; // Maximum concurrent connections
+
+// Static cache variables for BSSID lookup
+static String cachedBSSID;
+static String cachedPayload;
+
+// Helper function to log heap memory at the start of each page request
+void logHeapMemory(const char* route) {
+  String message = String("[webserver] GET ") + route + " - Free heap: " + String(ESP.getFreeHeap()) + " bytes";
+  dbgln(message);
+}
+
+// Helper function for handling connection limits
+bool canAcceptConnection() {
+  if (activeConnections >= MAX_CONNECTIONS) {
+    dbgln("[webserver] Too many active connections: " + String(activeConnections) + " - Rejecting new connection");
+    return false;
+  }
+  activeConnections++;
+  return true;
+}
+
+// Helper function to release connection count
+void releaseConnection() {
+  if (activeConnections > 0) {
+    activeConnections--;
+  }
+}
+
 void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config, WiFiManager *wm){
     server->on("/metrics", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
-    dbgln("[webserver] GET /metrics");
+    logHeapMemory("/metrics");
 
     String response;
 
@@ -78,12 +116,22 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
 
 
   server->on("/lookup", HTTP_GET, [](AsyncWebServerRequest *request) {
+    logHeapMemory("/lookup");
       if (!request->hasParam("bssid")) {
           request->send(400, "application/json", "{\"error\":\"Missing BSSID parameter\"}");
           return;
       }
 
       String bssid = request->getParam("bssid")->value();
+      
+      // Check if we have a cached result for this BSSID
+      if (bssid == cachedBSSID && cachedPayload.length() > 0) {
+          dbgln("[BSSID] Cache hit for " + bssid);
+          request->send(200, "application/json", cachedPayload);
+          return;
+      }
+
+      dbgln("[BSSID] Cache miss for " + bssid + ", fetching from API");
       WiFiClient client;
       HTTPClient http;
       String url = "http://api.maclookup.app/v2/macs/" + bssid;
@@ -92,23 +140,44 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
           int httpCode = http.GET();
           if (httpCode == HTTP_CODE_OK) {
               String payload = http.getString();
+              // Update cache
+              cachedBSSID = bssid;
+              cachedPayload = payload;
               request->send(200, "application/json", payload);
           } else {
-              request->send(500, "application/json", "{\"error\":\"API request failed\"}");
+              // On error, try to use cached data if available
+              if (cachedPayload.length() > 0) {
+                  dbgln("[BSSID] API request failed, using cached data");
+                  request->send(200, "application/json", cachedPayload);
+              } else {
+                  request->send(500, "application/json", "{\"error\":\"API request failed\"}");
+              }
           }
           http.end();
       } else {
-          request->send(500, "application/json", "{\"error\":\"HTTP connection failed\"}");
+          // On connection failure, try to use cached data if available
+          if (cachedPayload.length() > 0) {
+              dbgln("[BSSID] HTTP connection failed, using cached data");
+              request->send(200, "application/json", cachedPayload);
+          } else {
+              request->send(500, "application/json", "{\"error\":\"HTTP connection failed\"}");
+          }
       }
   });
   server->on("/", HTTP_GET, [config](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /");
-    const String &hostname = config->getHostname();
-    auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Main", false, hostname);
+    logHeapMemory("/");
+
+    // Prepare to send an HTML response stream
+    AsyncResponseStream *response = request->beginResponseStream("text/html");
+
+    // Send the header with the hostname and title
+    String hostname = WiFi.getHostname();  // Fetch the hostname
+    sendResponseHeader(response, "Main Menu", false, hostname);
+
     sendButton(response, "Status", "status");
     sendButton(response, "Config", "config");
     sendButton(response, "Debug", "debug");
+    sendButton(response, "Log", "log");
     sendButton(response, "Firmware update", "update");
     sendButton(response, "WiFi reset", "wifi", "r");
     sendButton(response, "Reboot", "reboot", "r");
@@ -117,7 +186,16 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
   });
 
   server->on("/status", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
-    dbgln("[webserver] GET /status");
+    logHeapMemory("/status");
+    
+    // Yield to prevent watchdog timeout
+    yield();
+    
+    // Check if we can accept more connections
+    if (!canAcceptConnection()) {
+      request->send(503, "text/plain", "Server busy, try again later");
+      return;
+    }
 
     // Prepare to send an HTML response stream
     AsyncResponseStream *response = request->beginResponseStream("text/html");
@@ -126,6 +204,9 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     String hostname = WiFi.getHostname();  // Fetch the hostname
     sendResponseHeader(response, "Status", false, hostname);
 
+    // Yield to prevent watchdog timeout
+    yield();
+    
     // Send the content of the status page
     response->print(
       R"rawliteral(
@@ -134,44 +215,125 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
           fetch('/status.json')
             .then(response => response.json())
             .then(data => {
-                const table = document.getElementById('statusTable');
-                table.innerHTML = ''; // Clear existing table content
-
-                // Add table header
-                const header = table.createTHead();
-                const headerRow = header.insertRow(0);
-                const headers = ["Name", "Value", "Low", "High"];
-                headers.forEach(headerText => {
-                    const cell = headerRow.insertCell(-1);
+                // Create two-column layout
+                const contentDiv = document.getElementById('content');
+                
+                // Clear existing content
+                const oldTable = document.getElementById('statusTable');
+                const oldLeftPanel = document.getElementById('leftPanel');
+                const oldRightPanel = document.getElementById('rightPanel');
+                
+                if (oldTable) oldTable.remove();
+                if (oldLeftPanel) oldLeftPanel.remove();
+                if (oldRightPanel) oldRightPanel.remove();
+                
+                // Create the two-column container
+                const container = document.createElement('div');
+                container.style.display = 'flex';
+                container.style.flexWrap = 'wrap';
+                container.style.gap = '20px';
+                container.style.width = '100%';
+                
+                // Create left panel for single-value metrics
+                const leftPanel = document.createElement('div');
+                leftPanel.id = 'leftPanel';
+                leftPanel.style.flex = '1';
+                leftPanel.style.minWidth = '300px';
+                
+                // Create table for left panel
+                const leftTable = document.createElement('table');
+                leftTable.style.width = '100%';
+                leftTable.style.borderCollapse = 'collapse';
+                
+                // Create right panel for metrics with Value/Low/High
+                const rightPanel = document.createElement('div');
+                rightPanel.id = 'rightPanel';
+                rightPanel.style.flex = '1';
+                rightPanel.style.minWidth = '300px';
+                
+                // Create table for right panel
+                const rightTable = document.createElement('table');
+                rightTable.style.width = '100%';
+                rightTable.style.borderCollapse = 'collapse';
+                
+                // Add header row to right table
+                const rightHeader = rightTable.createTHead();
+                const rightHeaderRow = rightHeader.insertRow(0);
+                const rightHeaders = ["Name", "Value", "Low", "High"];
+                rightHeaders.forEach(headerText => {
+                    const cell = rightHeaderRow.insertCell(-1);
                     cell.textContent = headerText;
+                    cell.style.fontWeight = 'bold';
+                    cell.style.padding = '5px';
+                    cell.style.textAlign = 'left';
+                    cell.style.borderBottom = '1px solid #ddd';
                 });
-
-                // Ensure the table body is clear
-                let tbody = table.getElementsByTagName('tbody')[0];
-                if (!tbody) {
-                    tbody = table.createTBody();
-                } else {
-                    tbody.innerHTML = ''; // Clear existing table body content
-                }
-
-                // Assuming 'data' is the array under a key like 'data' in the JSON response
+                
+                // Create table bodies
+                const leftTbody = leftTable.createTBody();
+                const rightTbody = rightTable.createTBody();
+                
+                // Process data and add to appropriate tables
                 data.data.forEach(item => {
-                    const row = tbody.insertRow(-1);
-                    const cellName = row.insertCell(0);
-                    const cellValue = row.insertCell(1);
-                    const cellLow = row.insertCell(2);
-                    const cellHigh = row.insertCell(3);
+                    // Check if item has low and high values that are not empty
+                    const hasLowHigh = item.low !== undefined && item.high !== undefined && 
+                                       item.low !== "" && item.high !== "";
                     
-                    cellName.textContent = item.name;
-                    cellValue.textContent = item.value;
-                    cellLow.textContent = item.low;
-                    cellHigh.textContent = item.high;
-
-                    // Check if the current row is for the BSSID
-                    if (item.name === "ESP BSSID") {
-                        appendBssidCompany(cellValue, item.value);
+                    if (hasLowHigh) {
+                        // Add to right panel (Value/Low/High metrics)
+                        const row = rightTbody.insertRow(-1);
+                        const cellName = row.insertCell(0);
+                        const cellValue = row.insertCell(1);
+                        const cellLow = row.insertCell(2);
+                        const cellHigh = row.insertCell(3);
+                        
+                        cellName.textContent = item.name;
+                        cellValue.textContent = item.value;
+                        cellLow.textContent = item.low;
+                        cellHigh.textContent = item.high;
+                        
+                        // Apply styling
+                        [cellName, cellValue, cellLow, cellHigh].forEach(cell => {
+                            cell.style.padding = '5px';
+                            cell.style.borderBottom = '1px solid #eee';
+                        });
+                        
+                        // Check if the current row is for the BSSID
+                        if (item.name === "ESP BSSID") {
+                            appendBssidCompany(cellValue, item.value);
+                        }
+                    } else {
+                        // Add to left panel (single-value metrics)
+                        const row = leftTbody.insertRow(-1);
+                        const cellName = row.insertCell(0);
+                        const cellValue = row.insertCell(1);
+                        
+                        cellName.textContent = item.name + ":";
+                        cellValue.textContent = item.value;
+                        
+                        // Apply styling
+                        cellName.style.padding = '5px';
+                        cellName.style.fontWeight = 'bold';
+                        cellValue.style.padding = '5px';
+                        row.style.borderBottom = '1px solid #eee';
+                        
+                        // Check if the current row is for the BSSID
+                        if (item.name === "ESP BSSID") {
+                            appendBssidCompany(cellValue, item.value);
+                        }
                     }
                 });
+                
+                // Add tables to panels
+                leftPanel.appendChild(leftTable);
+                rightPanel.appendChild(rightTable);
+                
+                // Add panels to container
+                container.appendChild(leftPanel);
+                container.appendChild(rightPanel);
+                
+                // Add container to content div
+                contentDiv.insertBefore(container, contentDiv.firstChild);
             })
             .catch(error => console.error('Error:', error));
         }
@@ -207,7 +369,6 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
         document.addEventListener('DOMContentLoaded', fetchData); // Initial fetch
       </script>
       <div id="content">
-        <table id="statusTable"></table>
         <p></p>
         <form method="get" action="/">
           <button class="">Back</button>
@@ -219,22 +380,45 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     // Send the response trailer (closing tags)
     sendResponseTrailer(response);
 
+    // Yield before sending the response
+    yield();
+    
     // Send the final response
     request->send(response);
+    
+    // Release the connection count
+    releaseConnection();
   });
 
   // Endpoint to serve JSON data
   server->on("/status.json", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
-    dbgln("[webserver] GET /status.json");
+    logHeapMemory("/status.json");
+    
+    // Yield to prevent watchdog timeout
+    yield();
+    
+    // Check if we can accept more connections
+    if (!canAcceptConnection()) {
+      request->send(503, "application/json", "{\"error\":\"Server busy\"}");
+      return;
+    }
+    
     DynamicJsonDocument doc(4096);
     JsonArray data = doc.createNestedArray("data");
 
+    // Yield periodically during JSON generation
+    yield();
+    
     // Add system information as objects to the array
     auto addSystemInfo = [&data](const char* name, const String& value) {
         JsonObject obj = data.createNestedObject();
         obj["name"] = name;
         obj["value"] = value;
     };
+
+    // Add firmware version and build information at the top
+    addSystemInfo("Firmware Version", GIT_VERSION);
+    addSystemInfo("Firmware Build Time", BUILD_TIME_STR);
 
     unsigned long uptime = millis() / 1000;
     unsigned long days = uptime / 86400;
@@ -275,15 +459,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
     addSystemInfo("Primary RTU Messages", String(rtu->getMessageCount()));
     addSystemInfo("Primary RTU Pending Messages", String(rtu->pendingRequests()));
-    addSystemInfo("Primary RTU Errors", String(rtu->getErrorCount()));
-    addSystemInfo("Min Latency (ms)", String(modbusCache->getMinLatency()));
-    addSystemInfo("Max Latency (ms)", String(modbusCache->getMaxLatency()));
-    addSystemInfo("Average Latency (ms)", String(modbusCache->getAverageLatency()));
-    addSystemInfo("Standard Deviation Latency (ms)", String(modbusCache->getStdDeviation()));
-    // addSystemInfo("Bridge Message", String(bridge->getMessageCount()));
-    // addSystemInfo("Bridge Clients", String(bridge->activeClients()));
-    // addSystemInfo("Bridge Errors", String(bridge->getErrorCount()));
-
+    
     // Add Modbus information as objects to the array
     ModbusClientTCPasync* modbusTCPClient = modbusCache->getModbusTCPClient();
     
@@ -296,28 +472,33 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     addSystemInfo("Server - Static Registers Fetched", modbusCache->getStaticRegistersFetched() ? "Yes" : "No");
     addSystemInfo("Server - Dynamic Registers Fetched", modbusCache->getDynamicRegistersFetched() ? "Yes" : "No");
     addSystemInfo("Server - Operational", modbusCache->getIsOperational() ? "Yes" : "No");
-    addSystemInfo("ET112 BAUD Rate", modbusCache->getCGBaudRate());
+    
+    // Get dynamic register addresses
+    std::set<uint16_t> dynamicAddresses = modbusCache->getDynamicRegisterAddresses();
+    
+    // Fetch all system data in a single atomic operation including registers, unexpected registers, and insane counter
+    auto systemSnapshot = modbusCache->fetchSystemSnapshot(dynamicAddresses);
+    
+    // Use the baud rate from the system snapshot
+    addSystemInfo("ET112 BAUD Rate", systemSnapshot.cgBaudRate);
 
     // Add dynamic registers with low and high watermarks
-    for (auto& address : modbusCache->getDynamicRegisterAddresses()) {
-        String formattedValue = modbusCache->getFormattedRegisterValue(address);
-        std::pair<String, String> waterMarks = modbusCache->getFormattedWaterMarks(address);
-
-        auto regDef = modbusCache->getRegisterDefinition(address);
-        if (regDef.has_value()) {
+    for (const auto& [address, snapshot] : systemSnapshot.registers) {
+        if (snapshot.definition.has_value()) {
             JsonObject obj = data.createNestedObject();
-            obj["name"] = regDef->description;
-            obj["value"] = formattedValue;
-            obj["low"] = waterMarks.second;  // Low watermark
-            obj["high"] = waterMarks.first; // High watermark
+            obj["name"] = snapshot.definition->description;
+            obj["value"] = snapshot.formattedValue;
+            obj["low"] = snapshot.waterMarks.second;  // Low watermark
+            obj["high"] = snapshot.waterMarks.first;  // High watermark
         }
     }
-    // Show insaneCounter
-    addSystemInfo("Bogus Register Count", String(modbusCache->getInsaneCounter()));
+    
+    // Show insaneCounter from snapshot
+    addSystemInfo("Bogus Register Count", String(systemSnapshot.insaneCounter));
 
-    // Add unexpected registers as a single entry
+    // Add unexpected registers as a single entry from snapshot
     String unexpectedRegisters;
-    for (auto& address : modbusCache->getUnexpectedRegisters()) {
+    for (auto& address : systemSnapshot.unexpectedRegisters) {
         unexpectedRegisters += String(address) + ", ";
     }
     if (!unexpectedRegisters.isEmpty()) {
@@ -325,13 +506,33 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
         addSystemInfo("Unexpected Registers", unexpectedRegisters);
     }
 
+    // Add Modbus statistics
+    addSystemInfo("Modbus Min Latency", String(modbusCache->getMinLatency()) + " ms");
+    addSystemInfo("Modbus Max Latency", String(modbusCache->getMaxLatency()) + " ms");
+    addSystemInfo("Modbus Avg Latency", String(modbusCache->getAverageLatency(), 2) + " ms");
+    addSystemInfo("Modbus Latency StdDev", String(modbusCache->getStdDeviation(), 2) + " ms");
+    
+    // Add mutex statistics
+    addSystemInfo("Mutex Acquisition Attempts", String(modbusCache->getMutexAcquisitionAttempts()));
+    addSystemInfo("Mutex Acquisition Failures", String(modbusCache->getMutexAcquisitionFailures()));
+    addSystemInfo("Mutex Avg Wait Time", String(modbusCache->getAverageMutexWaitTime(), 2) + " ms");
+    addSystemInfo("Mutex Avg Hold Time", String(modbusCache->getAverageMutexHoldTime(), 2) + " ms");
+    addSystemInfo("Mutex Max Hold Time", String(modbusCache->getMaxMutexHoldTime()) + " ms");
+
+    // Yield again before serializing JSON
+    yield();
+
+    // Serialize the JSON document and send the response
     String jsonResponse;
     serializeJson(doc, jsonResponse);
     request->send(200, "application/json", jsonResponse);
+    
+    // Release the connection count
+    releaseConnection();
   });
 
   server->on("/baudrate", HTTP_GET, [config,modbusCache](AsyncWebServerRequest *request) {
-    dbgln("[webserver] GET /baudrate");
+    logHeapMemory("/baudrate");
     auto *response = request->beginResponseStream("text/html");
     const String &hostname = config->getHostname();
 
@@ -386,7 +587,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
   });
 
   server->on("/reboot", HTTP_GET, [config](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /reboot");
+    logHeapMemory("/reboot");
     const String &hostname = config->getHostname();
     auto *response = request->beginResponseStream("text/html");
     sendResponseHeader(response, "Really?", false, hostname);
@@ -405,7 +606,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     dbgln("[webserver] rebooted...")
   });
   server->on("/config", HTTP_GET, [config](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /config");
+    logHeapMemory("/config");
     const String &hostname = config->getHostname();
     auto *response = request->beginResponseStream("text/html");
     sendResponseHeader(response, "Configuration", false, hostname);
@@ -647,6 +848,41 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
           "</td>"
           "</tr>");
     response->printf("</table>");
+    response->print("<h3>Network Settings</h3>"
+      "<table>"
+      "<tr>"
+        "<td>"
+          "<label for=\"useStaticIP\">Use Static IP</label>"
+        "</td>"
+        "<td>");
+    response->printf("<input type=\"checkbox\" id=\"useStaticIP\" name=\"useStaticIP\" %s>", config->getUseStaticIP() ? "checked" : "");
+    response->print("</td>"
+      "</tr>"
+      "<tr>"
+        "<td>"
+          "<label for=\"staticIP\">Static IP Address</label>"
+        "</td>"
+        "<td>");
+    response->printf("<input type=\"text\" id=\"staticIP\" name=\"staticIP\" value=\"%s\" pattern=\"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$\">", config->getStaticIP().c_str());
+    response->print("</td>"
+      "</tr>"
+      "<tr>"
+        "<td>"
+          "<label for=\"staticGateway\">Gateway IP</label>"
+        "</td>"
+        "<td>");
+    response->printf("<input type=\"text\" id=\"staticGateway\" name=\"staticGateway\" value=\"%s\" pattern=\"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$\">", config->getStaticGateway().c_str());
+    response->print("</td>"
+      "</tr>"
+      "<tr>"
+        "<td>"
+          "<label for=\"staticSubnet\">Subnet Mask</label>"
+        "</td>"
+        "<td>");
+    response->printf("<input type=\"text\" id=\"staticSubnet\" name=\"staticSubnet\" value=\"%s\" pattern=\"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$\">", config->getStaticSubnet().c_str());
+    response->print("</td>"
+      "</tr>"
+      "</table>");
     response->print("<button class=\"r\">Save</button>"
       "</form>"
       "<p></p>");
@@ -665,6 +901,15 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       "  };"
       "  checkbox.addEventListener('change', showRTU);"
       "  showRTU();"
+      "  var staticIPCheckbox = document.getElementById('useStaticIP');"
+      "  var staticIPFields = ['staticIP', 'staticGateway', 'staticSubnet'];"
+      "  var toggleStaticFields = function() {"
+      "    staticIPFields.forEach(function(field) {"
+      "      document.getElementById(field).disabled = !staticIPCheckbox.checked;"
+      "    });"
+      "  };"
+      "  staticIPCheckbox.addEventListener('change', toggleStaticFields);"
+      "  toggleStaticFields();"
       "});"
       "</script>");
     sendResponseTrailer(response);
@@ -807,10 +1052,49 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       config->setClientIsRTU(false);
       dbgln("[webserver] Modbus Client is RTU: false");
     }
-    
+    if (request->hasParam("useStaticIP", true)) {
+        config->setUseStaticIP(true);
+        dbgln("[webserver] saved useStaticIP");
+    } else {
+        config->setUseStaticIP(false);
+        dbgln("[webserver] cleared useStaticIP");
+    }
+    if (request->hasParam("staticIP", true)) {
+        String staticIP = request->getParam("staticIP", true)->value();
+        IPAddress ip;
+        if (ip.fromString(staticIP)) {
+            config->setStaticIP(staticIP);
+            dbgln("[webserver] saved static IP");
+        } else {
+            dbgln("[webserver] invalid static IP");
+            validIP = false;
+        }
+    }
+    if (request->hasParam("staticGateway", true)) {
+        String gateway = request->getParam("staticGateway", true)->value();
+        IPAddress ip;
+        if (ip.fromString(gateway)) {
+            config->setStaticGateway(gateway);
+            dbgln("[webserver] saved gateway IP");
+        } else {
+            dbgln("[webserver] invalid gateway IP");
+            validIP = false;
+        }
+    }
+    if (request->hasParam("staticSubnet", true)) {
+        String subnet = request->getParam("staticSubnet", true)->value();
+        IPAddress ip;
+        if (ip.fromString(subnet)) {
+            config->setStaticSubnet(subnet);
+            dbgln("[webserver] saved subnet mask");
+        } else {
+            dbgln("[webserver] invalid subnet mask");
+            validIP = false;
+        }
+    }
   });
   server->on("/debug", HTTP_GET, [config](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /debug");
+    logHeapMemory("/debug");
     const String &hostname = config->getHostname();
     auto *response = request->beginResponseStream("text/html");
     sendResponseHeader(response, "Debug RTU Client", false, hostname);
@@ -871,7 +1155,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     request->send(response);
   });
   server->on("/update", HTTP_GET, [config](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /update");
+    logHeapMemory("/update");
     const String &hostname = config->getHostname();
     auto *response = request->beginResponseStream("text/html");
     sendResponseHeader(response, "Firmware Update", false, hostname);
@@ -931,7 +1215,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     }
   });
   server->on("/wifi", HTTP_GET, [config](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /wifi");
+    logHeapMemory("/wifi");
     auto *response = request->beginResponseStream("text/html");
     const String &hostname = config->getHostname();
 
@@ -958,10 +1242,11 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     dbgln("[webserver] rebooted...");
   });
   server->on("/favicon.ico", [](AsyncWebServerRequest *request){
-    dbgln("[webserver] GET /favicon.ico");
+    logHeapMemory("/favicon.ico");
     request->send(204);//TODO add favicon
   });
   server->on("/style.css", [](AsyncWebServerRequest *request){
+    logHeapMemory("/style.css");
     if (request->hasHeader("If-None-Match")){
       auto header = request->getHeader("If-None-Match");
       if (header->value() == String(ETAG)){
@@ -996,6 +1281,91 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     response->addHeader("ETag", ETAG);
     request->send(response);
   });
+  server->on("/log", HTTP_GET, [config](AsyncWebServerRequest *request) {
+    logHeapMemory("/log");
+    
+    AsyncResponseStream *response = request->beginResponseStream("text/html");
+    sendLogPage(response, config->getHostname());
+    request->send(response);
+  });
+  
+  // Add log data endpoint for AJAX fallback - ultra lightweight version
+  server->on("/logdata", HTTP_GET, [](AsyncWebServerRequest *request) {
+    logHeapMemory("/logdata");
+    // Don't even log this request to avoid recursive logging
+    // dbgln("[webserver] GET /logdata");
+    
+    // Send a simple response immediately
+    AsyncResponseStream *response = request->beginResponseStream("text/plain");
+    response->addHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    
+    // Get position parameter if it exists
+    size_t position = 0;
+    if (request->hasParam("position")) {
+        position = request->getParam("position")->value().toInt();
+    }
+    
+    // Get chunk_size parameter if it exists
+    size_t maxChars = 8192; // Default to 8KB
+    if (request->hasParam("chunk_size")) {
+        maxChars = request->getParam("chunk_size")->value().toInt();
+        // Limit to reasonable size to prevent memory issues
+        if (maxChars > 32768) {
+            maxChars = 32768; // Cap at 32KB (buffer size)
+        }
+    }
+    
+    // Immediately yield to allow other tasks to run
+    yield();
+    
+    // Get a chunk of data with the requested size
+    String messages = "";
+    bool hasOverflow = false;
+    
+    // Use a critical section to minimize mutex lock time
+    {
+        // Manually get data from buffer with minimal processing
+        size_t newPosition = position;
+        
+        // Get overflow flag
+        hasOverflow = debugBuffer.hasOverflowed();
+        
+        // Get a chunk of messages with the requested size
+        messages = debugBuffer.getSafeChunk(position, maxChars, newPosition);
+        
+        // Update position
+        position = newPosition;
+    }
+    
+    // Write position first
+    response->print(position);
+    response->print("\n");
+    
+    // Write overflow flag
+    response->print(hasOverflow ? "1" : "0");
+    response->print("\n");
+    
+    // Write messages
+    response->print(messages);
+    
+    // Send response
+    request->send(response);
+  });
+  
+  // Add log clear endpoint
+  server->on("/logclear", HTTP_POST, [](AsyncWebServerRequest *request) {
+    dbgln("[webserver] POST /logclear");
+    
+    // Allow other tasks to run immediately
+    yield();
+    
+    // Clear the log buffer
+    debugBuffer.clear();
+    
+    // Send a simple text response
+    request->send(200, "text/plain", "OK");
+  });
+
   server->onNotFound([](AsyncWebServerRequest *request){
     dbg("[webserver] request to ");dbg(request->url());dbgln(" not found");
     request->send(404, "text/plain", "404");
@@ -1182,4 +1552,296 @@ const String WiFiQuality(int rssiValue)
         case -80 ... -71: return "Not Good"; 
         default: return "Unusable";
     }
+}
+
+void sendLogPage(AsyncResponseStream *response, const String &hostname) {
+    // Use inline style to have more control
+    sendResponseHeader(response, "Log Viewer", true, hostname);
+    
+    // Add custom styles for log viewer
+    response->print(R"(
+    <style>
+        /* Override the default center alignment */
+        body {
+            text-align: left !important;
+        }
+        
+        #content {
+            text-align: left !important;
+            display: block !important;
+            width: 95% !important;
+            max-width: 1200px !important;
+            margin: 0 auto !important;
+        }
+        
+        h2, h3 {
+            text-align: left !important;
+        }
+        
+        #log-container {
+            background-color: #1e1e1e;
+            color: #f0f0f0;
+            font-family: monospace;
+            padding: 10px;
+            height: 600px; /* Increased height */
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            text-align: left !important;
+            width: 100% !important;
+            font-size: 14px; /* Explicit font size */
+        }
+        
+        .log-controls {
+            margin-bottom: 10px;
+            text-align: left !important;
+            width: 100% !important;
+        }
+        
+        .log-controls button {
+            margin-right: 10px;
+            text-align: center; /* Keep button text centered */
+            width: auto !important;
+            padding: 8px 16px; /* More padding for better clickability */
+        }
+        
+        .log-timestamp {
+            color: #888;
+        }
+        
+        .log-wifi {
+            color: #58a6ff;
+        }
+        
+        .log-webserver {
+            color: #7ee787;
+        }
+        
+        .log-error {
+            color: #f85149;
+        }
+        
+        .log-modbuscache {
+            color: #d2a8ff;
+        }
+        
+        .log-config {
+            color: #f0883e;
+        }
+        
+        .log-setup {
+            color: #79c0ff;
+        }
+        
+        .autoscroll-enabled {
+            background-color: #238636 !important;
+        }
+        
+        #buffer-info {
+            font-size: 12px;
+            color: #888;
+            margin-top: 5px;
+        }
+    </style>
+    )");
+    
+    // Log container and controls
+    response->print(R"(
+    <h2>Log Viewer</h2>
+    <div class="log-controls">
+        <button id="clear-log" class="btn btn-danger">Clear Log</button>
+        <button id="toggle-autoscroll" class="btn btn-primary autoscroll-enabled">Autoscroll: ON</button>
+        <button id="download-log" class="btn btn-secondary">Download Log</button>
+        <span id="connection-status">AJAX: Connecting...</span>
+        <div id="buffer-info">Buffer size: 32KB (approx. 400-800 messages)</div>
+    </div>
+    <div id="log-container"></div>
+    )");
+    
+    // JavaScript for WebSocket and log handling
+    response->print(R"(
+    <script>
+        const logContainer = document.getElementById('log-container');
+        const clearLogBtn = document.getElementById('clear-log');
+        const toggleAutoscrollBtn = document.getElementById('toggle-autoscroll');
+        const downloadLogBtn = document.getElementById('download-log');
+        const connectionStatus = document.getElementById('connection-status');
+        
+        let position = 0;
+        let autoscroll = true;
+        let isLoadingChunk = false;
+        let messageCount = 0;
+        let updateCount = 0;
+        let lastUpdateTime = Date.now();
+        let updatesPerSecond = 0;
+        
+        // Chunk size for data
+        const CHUNK_SIZE = 8192; // Increased from 512 to 8KB to match server-side
+        
+        // Start AJAX polling
+        startAjaxPolling();
+        
+        // Start AJAX polling
+        function startAjaxPolling() {
+            connectionStatus.textContent = 'AJAX: Connected (Continuous Polling)';
+            connectionStatus.style.color = '#238636';
+            
+            // Get initial data
+            fetchLogUpdates();
+            
+            // Note: We're now using requestAnimationFrame and setTimeout for continuous polling
+        }
+        
+        // Fetch log updates via AJAX
+        function fetchLogUpdates() {
+            if (isLoadingChunk) return;
+            
+            isLoadingChunk = true;
+            fetch(`/logdata?position=${position}&chunk_size=8192`)
+                .then(response => response.text())
+                .then(data => {
+                    // Parse the simple text format
+                    const lines = data.split('\n');
+                    if (lines.length >= 2) {
+                        // First line is position
+                        position = parseInt(lines[0], 10);
+                        
+                        // Second line is overflow flag
+                        const hasOverflow = lines[1] === '1';
+                        
+                        // Rest is messages (join remaining lines)
+                        const messages = lines.slice(2).join('\n');
+                        
+                        if (messages) {
+                            // Ensure the message ends with a newline
+                            const messageWithNewline = messages.endsWith('\n') ? messages : messages + '\n';
+                            appendLog(messageWithNewline);
+                        }
+                        
+                        if (hasOverflow) {
+                            appendLog('[System] Log buffer overflow detected. Some messages may have been lost.\n');
+                        }
+                    }
+                    
+                    // Track update rate
+                    updateCount++;
+                    const now = Date.now();
+                    const elapsed = now - lastUpdateTime;
+                    
+                    // Update the rate every second
+                    if (elapsed >= 1000) {
+                        updatesPerSecond = Math.round((updateCount / elapsed) * 1000);
+                        document.getElementById('buffer-info').textContent = 
+                            `Buffer size: 32KB (approx. 400-800 messages) - Currently showing: ~${messageCount} messages - Updates: ${updatesPerSecond}/sec`;
+                        updateCount = 0;
+                        lastUpdateTime = now;
+                    }
+                    
+                    isLoadingChunk = false;
+                    
+                    // Almost continuous polling - use requestAnimationFrame for browser efficiency
+                    // This will poll as fast as the browser can render, but will pause when tab is inactive
+                    requestAnimationFrame(() => {
+                        // Add a longer delay to prevent overwhelming the ESP32
+                        setTimeout(fetchLogUpdates, 200);
+                    });
+                })
+                .catch(error => {
+                    console.error('Error fetching log updates:', error);
+                    isLoadingChunk = false;
+                    connectionStatus.textContent = 'AJAX: Error - Retrying...';
+                    connectionStatus.style.color = '#f85149';
+                    
+                    // Retry after a short delay
+                    setTimeout(fetchLogUpdates, 1000);
+                });
+        }
+        
+        // Append log messages to the container
+        function appendLog(messages) {
+            if (!messages) return;
+            
+            // Count approximate number of messages (by counting newlines)
+            const newLines = (messages.match(/\n/g) || []).length;
+            messageCount += newLines + 1;
+            
+            // Process and colorize the log messages
+            const colorizedMessages = colorizeLog(messages);
+            logContainer.innerHTML += colorizedMessages;
+            
+            // Limit the DOM size to prevent browser slowdown
+            if (logContainer.innerHTML.length > 500000) {
+                // Keep only the last 400K characters
+                logContainer.innerHTML = logContainer.innerHTML.slice(-400000);
+                
+                // Recalculate message count (approximate)
+                const totalLines = (logContainer.innerHTML.match(/\n/g) || []).length;
+                messageCount = totalLines + 1;
+            }
+            
+            if (autoscroll) {
+                logContainer.scrollTop = logContainer.scrollHeight;
+            }
+        }
+        
+        // Colorize log messages based on content
+        function colorizeLog(messages) {
+            return messages.replace(/\[(\d+s)\]/g, '<span class="log-timestamp">[$1]</span>')
+                          .replace(/\[WiFi\]/g, '<span class="log-wifi">[WiFi]</span>')
+                          .replace(/\[webserver\]/g, '<span class="log-webserver">[webserver]</span>')
+                          .replace(/\[modbusCache\]/g, '<span class="log-modbuscache">[modbusCache]</span>')
+                          .replace(/\[config\]/g, '<span class="log-config">[config]</span>')
+                          .replace(/\[setup\]/g, '<span class="log-setup">[setup]</span>')
+                          .replace(/\[ws\]/g, '<span class="log-wifi">[ws]</span>')
+                          .replace(/Error|Failed|failed|error/gi, '<span class="log-error">$&</span>');
+        }
+        
+        // Clear log
+        clearLogBtn.addEventListener('click', function() {
+            fetch('/logclear', { method: 'POST' })
+                .then(() => {
+                    logContainer.innerHTML = '';
+                    position = 0;
+                    messageCount = 0;
+                    updateCount = 0;
+                    lastUpdateTime = Date.now();
+                    updatesPerSecond = 0;
+                    document.getElementById('buffer-info').textContent = 
+                        'Buffer size: 32KB (approx. 400-800 messages) - Currently showing: ~0 messages - Updates: 0/sec';
+                })
+                .catch(error => {
+                    console.error('Error clearing log:', error);
+                });
+        });
+        
+        // Toggle autoscroll
+        toggleAutoscrollBtn.addEventListener('click', function() {
+            autoscroll = !autoscroll;
+            this.textContent = `Autoscroll: ${autoscroll ? 'ON' : 'OFF'}`;
+            this.classList.toggle('autoscroll-enabled', autoscroll);
+            
+            if (autoscroll) {
+                logContainer.scrollTop = logContainer.scrollHeight;
+            }
+        });
+        
+        // Download log
+        downloadLogBtn.addEventListener('click', function() {
+            const logText = logContainer.innerText;
+            const blob = new Blob([logText], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `esp32_log_${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        });
+    </script>
+    )");
+    
+    sendResponseTrailer(response);
 }

@@ -18,6 +18,10 @@ Config::Config()
     ,_serialConfig(SERIAL_8N1)
     ,_clientIsRTU(true)
     ,_pollingInterval(500)
+    ,_staticIP("0.0.0.0")
+    ,_staticGateway("0.0.0.0")
+    ,_staticSubnet("255.255.255.0")
+    ,_useStaticIP(false)
 {}
 
 void Config::begin(Preferences *prefs)
@@ -38,6 +42,10 @@ void Config::begin(Preferences *prefs)
     _serialConfig = _prefs->getULong("serialConfig", _serialConfig);
     _clientIsRTU = _prefs->getBool("clientIsRTU", _clientIsRTU);
     _pollingInterval = _prefs->getULong("pollingInterval", _pollingInterval);
+    _staticIP = _prefs->getString("staticIP", _staticIP);
+    _staticGateway = _prefs->getString("staticGateway", _staticGateway);
+    _staticSubnet = _prefs->getString("staticSubnet", _staticSubnet);
+    _useStaticIP = _prefs->getBool("useStaticIP", _useStaticIP);
     if (_prefs->isKey("hostname")) {
         _hostname = _prefs->getString("hostname", "");  // Use stored hostname if present
     } else {
@@ -300,4 +308,44 @@ String Config::getHostname() const {
 void Config::setHostname(const String& hostname) {
     _hostname = hostname;
     _prefs->putString("hostname", _hostname); // Save hostname to preferences
+}
+
+void Config::setStaticIP(const String& ip) {
+    if (_staticIP == ip) return;
+    _staticIP = ip;
+    _prefs->putString("staticIP", _staticIP);
+}
+
+String Config::getStaticIP() const {
+    return _staticIP;
+}
+
+void Config::setStaticGateway(const String& gateway) {
+    if (_staticGateway == gateway) return;
+    _staticGateway = gateway;
+    _prefs->putString("staticGateway", _staticGateway);
+}
+
+String Config::getStaticGateway() const {
+    return _staticGateway;
+}
+
+void Config::setStaticSubnet(const String& subnet) {
+    if (_staticSubnet == subnet) return;
+    _staticSubnet = subnet;
+    _prefs->putString("staticSubnet", _staticSubnet);
+}
+
+String Config::getStaticSubnet() const {
+    return _staticSubnet;
+}
+
+void Config::setUseStaticIP(bool useStatic) {
+    if (_useStaticIP == useStatic) return;
+    _useStaticIP = useStatic;
+    _prefs->putBool("useStaticIP", _useStaticIP);
+}
+
+bool Config::getUseStaticIP() const {
+    return _useStaticIP;
 }

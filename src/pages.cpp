@@ -7,9 +7,20 @@
 // Define a build time string for display on the status page
 #define BUILD_TIME_STR __DATE__ " " __TIME__
 
+// Include version header if it exists
+#ifdef __has_include
+    #if __has_include("version.h")
+        #include "version.h"
+    #endif
+#endif
+
 // Check if GIT_VERSION is defined by our pre-build script
 #ifndef GIT_VERSION
-#define GIT_VERSION "Unknown"
+    #ifdef FIRMWARE_VERSION
+        #define GIT_VERSION FIRMWARE_VERSION
+    #else
+        #define GIT_VERSION "Unknown"
+    #endif
 #endif
 
 // External variable declaration for WiFi connection time

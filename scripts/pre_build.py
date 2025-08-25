@@ -25,7 +25,12 @@ debug_log("Pre-build script started")
 debug_log(f"Working directory: {os.getcwd()}")
 debug_log(f"Python executable: {sys.executable}")
 debug_log(f"Platform: {sys.platform}")
-debug_log(f"Script path: {os.path.abspath(__file__)}")
+# Handle case where __file__ might not be defined in SCons context
+try:
+    script_path = os.path.abspath(__file__)
+except NameError:
+    script_path = "unknown (SCons context)"
+debug_log(f"Script path: {script_path}")
 
 def run_command(command):
     """Run a shell command and return its output"""
@@ -92,6 +97,15 @@ def main():
     # Set environment variable for build process
     debug_log(f"Setting GIT_VERSION to: {version_info}")
     os.environ["GIT_VERSION"] = version_info
+    
+    # Also create a header file as backup
+    header_content = f'#ifndef VERSION_H\n#define VERSION_H\n#define FIRMWARE_VERSION "{version_info}"\n#endif\n'
+    try:
+        with open("include/version.h", "w") as f:
+            f.write(header_content)
+        debug_log("Created version.h header file")
+    except Exception as e:
+        debug_log(f"Failed to create version.h: {e}")
     
     # This can be used in the C++ code with the GIT_VERSION define
     debug_log("Pre-build script completed successfully")

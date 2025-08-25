@@ -162,39 +162,30 @@ int buttonState;
 bool wifiConnected = false;
 bool wifiDisconnectDetected = false;
 unsigned long lastWiFiConnectionTime = 0; // Track when WiFi was last connected
-SemaphoreHandle_t wifiMutex = NULL; // Add mutex for WiFi state
+// Removed WiFi mutex - simplified event handling
 
 void WiFiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
-    if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        switch (event) {
-            case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-                dbgln("[WiFi] Connected to AP");
-                wifiConnected = true;
-                wifiDisconnectDetected = false;
-                lastWiFiConnectionTime = millis(); // Record connection time
-                break;
-            case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-                dbgln("[WiFi] Disconnected from AP");
-                wifiDisconnectDetected = true;
-                wifiConnected = false;
-                lastWiFiConnectionTime = 0; // Reset connection time on disconnection
-                break;
-            case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-                dbgln("[WiFi] Got IP: " + WiFi.localIP().toString());
-                wifiConnected = true;
-                if (lastWiFiConnectionTime == 0) { // If not set by CONNECTED event
-                    lastWiFiConnectionTime = millis(); // Record connection time
-                }
-                break;
-            case ARDUINO_EVENT_WIFI_SCAN_DONE:
-                dbgln("[WiFi] Scan completed");
-                break;
-            default:
-                break;
-        }
-        xSemaphoreGive(wifiMutex);
-    } else {
-        dbgln("[WiFi] Failed to acquire mutex in event handler");
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            dbgln("[WiFi] Connected to AP");
+            wifiConnected = true;
+            wifiDisconnectDetected = false;
+            lastWiFiConnectionTime = millis();
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            dbgln("[WiFi] Disconnected from AP");
+            wifiDisconnectDetected = true;
+            wifiConnected = false;
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            dbgln("[WiFi] Got IP: " + WiFi.localIP().toString());
+            wifiConnected = true;
+            if (lastWiFiConnectionTime == 0) {
+                lastWiFiConnectionTime = millis();
+            }
+            break;
+        default:
+            break;
     }
 }
 
@@ -324,28 +315,87 @@ bool forceWiFiReset() {
     }
 }
 
-bool isWiFiActuallyDisconnected() {
-    if (wifiDisconnectDetected) {
-        // If we detected a disconnect event, trust it
-        return true;
-    }
+bool connectToStrongestAP() {
+    dbgln("[WiFi] Scanning for strongest AP...");
     
-    // First quick check
-    if (WiFi.status() == WL_CONNECTED) {
+    // Get SSID and password from WiFiManager
+    String targetSSID = wm.getWiFiSSID();
+    String password = wm.getWiFiPass();
+    
+    if (targetSSID.length() == 0 || password.length() == 0) {
+        dbgln("[WiFi] No SSID or password available for scanning");
         return false;
     }
     
-    // Check multiple times to confirm disconnection, but with shorter delays
-    int disconnectedCount = 0;
-    for (int i = 0; i < WIFI_CONNECTION_VERIFY_COUNT; i++) {
-        if (WiFi.status() != WL_CONNECTED) {
-            disconnectedCount++;
-        }
-        delay(50); // Reduced from 100ms to 50ms
+    // Disconnect first
+    WiFi.disconnect();
+    delay(500);
+    
+    // Scan for networks
+    int networkCount = WiFi.scanNetworks();
+    if (networkCount == 0) {
+        dbgln("[WiFi] No networks found during scan");
+        return false;
     }
     
-    // Only consider disconnected if all checks failed
-    return disconnectedCount == WIFI_CONNECTION_VERIFY_COUNT;
+    // Find all matching SSIDs and select the strongest one
+    int bestRSSI = -999;
+    int bestNetworkIndex = -1;
+    
+    dbgln("[WiFi] Found " + String(networkCount) + " networks:");
+    for (int i = 0; i < networkCount; i++) {
+        String ssid = WiFi.SSID(i);
+        int rssi = WiFi.RSSI(i);
+        dbgln("  " + String(i) + ": " + ssid + " (" + String(rssi) + "dBm)");
+        
+        // Check if this network matches our target SSID and has better signal
+        if (ssid.equals(targetSSID) && rssi > bestRSSI) {
+            bestRSSI = rssi;
+            bestNetworkIndex = i;
+        }
+    }
+    
+    if (bestNetworkIndex == -1) {
+        dbgln("[WiFi] Target SSID '" + targetSSID + "' not found in scan results");
+        WiFi.scanDelete(); // Clean up scan results
+        return false;
+    }
+    
+    // Connect to the strongest AP
+    dbgln("[WiFi] Connecting to strongest AP: " + targetSSID + " (RSSI: " + String(bestRSSI) + "dBm)");
+    
+    // Use the specific BSSID to avoid fixation on weaker APs
+    uint8_t* bssid = WiFi.BSSID(bestNetworkIndex);
+    WiFi.begin(targetSSID.c_str(), password.c_str(), 0, bssid);
+    
+    // Wait for connection
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        dbg(".");
+        attempts++;
+    }
+    
+    WiFi.scanDelete(); // Clean up scan results
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        dbgln("\n[WiFi] Successfully connected to strongest AP: " + WiFi.SSID() + 
+              " with RSSI " + String(WiFi.RSSI()) + "dBm");
+        return true;
+    } else {
+        dbgln("\n[WiFi] Failed to connect to strongest AP");
+        return false;
+    }
+}
+
+bool isWiFiActuallyDisconnected() {
+    // Trust the event handler's disconnect detection
+    if (wifiDisconnectDetected) {
+        return true;
+    }
+    
+    // Simple status check - no multiple verification needed
+    return WiFi.status() != WL_CONNECTED;
 }
 
 void setup() {
@@ -362,11 +412,7 @@ void setup() {
     esp_task_wdt_init(20, false); // 20 second timeout, don't panic on timeout
     esp_task_wdt_delete(NULL); // Remove current task (setup/loop) from watchdog monitoring
     
-    // Initialize WiFi mutex
-    wifiMutex = xSemaphoreCreateMutex();
-    if (wifiMutex == NULL) {
-        dbgln("[setup] Failed to create WiFi mutex!");
-    }
+    // Simplified WiFi handling - no mutex needed
     
     dbgln("[config] load");
     prefs.begin("modbusRtuGw");
@@ -402,12 +448,12 @@ void setup() {
     wm.setConfigPortalTimeout(180); 
     wm.setBreakAfterConfig(true); // Ensure we save config after portal use
 
-    // First, try a complete WiFi reset and connect to the strongest AP
-    bool connected = forceWiFiReset();
+    // First, try to connect to the strongest available AP for this SSID
+    bool connected = connectToStrongestAP();
     
     // If that fails, fall back to WiFiManager
     if (!connected) {
-        dbgln("[WiFi] Force reset failed, falling back to WiFiManager");
+        dbgln("[WiFi] Strongest AP connection failed, falling back to WiFiManager");
         
         // Attempt to connect or start the config portal
         if (!wm.autoConnect("ESP32_AP")) {
@@ -416,17 +462,17 @@ void setup() {
             ESP.restart(); // Optionally restart after config portal closes
         }
         
-        // After connecting with WiFiManager, try to find and connect to the strongest AP
+        // After connecting with WiFiManager, scan again to connect to strongest AP
         if (WiFi.status() == WL_CONNECTED) {
-            dbgln("[WiFi] Connected via WiFiManager, now finding the strongest AP");
-            // connectToStrongestAP();
-            
-            // Initialize WiFi connection time if not already set by event handler
-            if (lastWiFiConnectionTime == 0) {
-                lastWiFiConnectionTime = millis();
-                dbgln("[WiFi] Initialized connection time: " + String(lastWiFiConnectionTime));
-            }
+            dbgln("[WiFi] Connected via WiFiManager, scanning for strongest AP");
+            connectToStrongestAP();
         }
+    }
+    
+    // Initialize WiFi connection time if not already set by event handler
+    if (WiFi.status() == WL_CONNECTED && lastWiFiConnectionTime == 0) {
+        lastWiFiConnectionTime = millis();
+        dbgln("[WiFi] Initialized connection time: " + String(lastWiFiConnectionTime));
     }
 
     dbgln("[wifi] finished");
@@ -465,13 +511,8 @@ void setup() {
 void loop() {
     static unsigned long lastUpdateTime = 0;
     static unsigned long lastWiFiCheckTime = 0;
-    static bool inAPMode = false;
-    static unsigned long lastDisconnectionCheckTime = 0;
-    static int reconnectionAttempts = 0;
-    const int maxReconnectionAttempts = 3;
-    static unsigned long reconnectionBackoff = 5000; // Start with 5 seconds
-    static unsigned long lastScanTime = 0;
     static unsigned long lastHeapCheck = 0;
+    static unsigned long lastScanTime = 0;
     unsigned long currentTime = millis();
     
     // Check heap memory every 30 seconds
@@ -480,46 +521,48 @@ void loop() {
         dbgln("[main] Free heap: " + String(ESP.getFreeHeap()) + " bytes");
     }
     
-    // Add explicit WiFi reconnection handling with mutex protection
-    if (xSemaphoreTake(wifiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        if (wifiDisconnectDetected || WiFi.status() != WL_CONNECTED) {
-            // Only attempt reconnection every 5 seconds initially, then back off
-            if (currentTime - lastDisconnectionCheckTime >= reconnectionBackoff) {
-                lastDisconnectionCheckTime = currentTime;
-                
-                dbgln("[WiFi] Connection lost, attempting reconnection...");
-                
-                // Try to reconnect
-                if (reconnectionAttempts < maxReconnectionAttempts) {
-                    WiFi.disconnect();
-                    delay(100);
-                    String ssid = wm.getWiFiSSID();
-                    String password = wm.getWiFiPass();
-                    
-                    if (ssid.length() > 0 && password.length() > 0) {
-                        WiFi.begin(ssid.c_str(), password.c_str());
-                        reconnectionAttempts++;
-                        dbgln("[WiFi] Reconnection attempt " + String(reconnectionAttempts));
-                        
-                        // Increase backoff time for next attempt (exponential backoff)
-                        reconnectionBackoff = min(reconnectionBackoff * 2, 300000UL); // Max 5 minutes
-                    }
-                } else {
-                    // If we've failed multiple times, try a full reset
-                    dbgln("[WiFi] Multiple reconnection attempts failed, trying full reset");
-                    forceWiFiReset();
-                    reconnectionAttempts = 0;
-                    reconnectionBackoff = 5000; // Reset backoff time
+    // Simple WiFi status monitoring - only for extreme cases
+    static unsigned long lastWiFiResetTime = 0;
+    static int wifiResetCount = 0;
+    
+    // Only intervene if WiFi has been disconnected for a long time (30+ seconds)
+    // and the ESP32's auto-reconnect isn't working
+    if (WiFi.status() != WL_CONNECTED) {
+        static unsigned long disconnectStartTime = 0;
+        
+        if (disconnectStartTime == 0) {
+            disconnectStartTime = currentTime;
+            dbgln("[WiFi] Disconnection detected, waiting for auto-reconnect...");
+        }
+        
+        // If disconnected for more than 30 seconds, try our reset
+        if (currentTime - disconnectStartTime > 30000 && 
+            currentTime - lastWiFiResetTime > 60000) { // At least 1 minute between resets
+            
+            dbgln("[WiFi] Long disconnection detected, attempting forceWiFiReset");
+            if (forceWiFiReset()) {
+                disconnectStartTime = 0; // Reset timer on successful reconnect
+                wifiResetCount = 0;
+            } else {
+                wifiResetCount++;
+                if (wifiResetCount >= 3) {
+                    logErrln("[WiFi] Multiple reset failures, rebooting device");
+                    ESP.restart();
                 }
             }
-        } else if (WiFi.status() == WL_CONNECTED && wifiDisconnectDetected) {
-            // We've successfully reconnected
-            wifiDisconnectDetected = false;
-            reconnectionAttempts = 0;
-            reconnectionBackoff = 5000; // Reset backoff time
-            dbgln("[WiFi] Successfully reconnected to " + WiFi.SSID());
+            lastWiFiResetTime = currentTime;
         }
-        xSemaphoreGive(wifiMutex);
+    } else {
+        // Connected - reset disconnect timer and counters
+        static unsigned long disconnectStartTime = 0;
+        disconnectStartTime = 0;
+        wifiResetCount = 0;
+        
+        // Clear the disconnect flag if set
+        if (wifiDisconnectDetected) {
+            wifiDisconnectDetected = false;
+            dbgln("[WiFi] Reconnection successful");
+        }
     }
     
     // Check if we need to reboot due to no data for 60 seconds
@@ -611,7 +654,7 @@ void loop() {
     // Get current time
     currentTime = millis();
     
-    // Reduce frequency of WiFi checks
+    // Reduce frequency of WiFi signal strength checks
     if (WiFi.status() == WL_CONNECTED && currentTime - lastWiFiCheckTime >= WIFI_CHECK_INTERVAL) {
         lastWiFiCheckTime = currentTime;
         int rssi = WiFi.RSSI();
@@ -619,11 +662,10 @@ void loop() {
         // Only log periodically to reduce serial noise
         dbgln("[WiFi] Current RSSI: " + String(rssi) + "dBm");
         
-        // Only scan for better AP if signal is very weak and we haven't scanned recently
-        if (rssi < WIFI_RSSI_THRESHOLD && currentTime - lastScanTime >= 300000) { // 5 minutes between scans
+        // Only suggest better AP scan if signal is critically weak (but don't actually do it in runtime)
+        if (rssi < WIFI_RSSI_THRESHOLD && currentTime - lastScanTime >= 300000) { // 5 minutes between logs
             lastScanTime = currentTime;
-            dbgln("[WiFi] Signal strength critically low, scanning for stronger AP");
-            // connectToStrongestAP();
+            dbgln("[WiFi] Signal strength critically low - consider checking AP placement");
         }
     }
 

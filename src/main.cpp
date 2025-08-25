@@ -178,7 +178,9 @@ void WiFiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
             wifiConnected = false;
             break;
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-            dbgln("[WiFi] Got IP: " + WiFi.localIP().toString());
+            static char ipBuffer[32];
+        snprintf(ipBuffer, sizeof(ipBuffer), "[WiFi] Got IP: %s", WiFi.localIP().toString().c_str());
+        dbgln(ipBuffer);
             wifiConnected = true;
             if (lastWiFiConnectionTime == 0) {
                 lastWiFiConnectionTime = millis();
@@ -237,16 +239,19 @@ void updateDisplay() {
     if (wattsRegisterAddress != -1) {
         // Get the "Watts" value from the Modbus cache
         float wattsValue = modbusCache->getRegisterScaledValue(wattsRegisterAddress);
-        String ssidString = "SSID: " + WiFi.SSID();
-        String ipString = "IP: " + WiFi.localIP().toString();
+        static char ssidBuffer[64];
+        static char ipBuffer[32];
+        snprintf(ssidBuffer, sizeof(ssidBuffer), "SSID: %s", WiFi.SSID().c_str());
+        snprintf(ipBuffer, sizeof(ipBuffer), "IP: %s", WiFi.localIP().toString().c_str());
 
         u8g2.clearBuffer();
         u8g2.setFont(u8g2_font_ncenB14_tr);
 
         // Display the wattage if data is operational, otherwise show "No Data"
         if (modbusCache->getIsOperational()) {
-            String wattsString = String(wattsValue, 1) + " W";
-            u8g2.drawStr(0, 16, wattsString.c_str());
+            static char wattsBuffer[32];
+            snprintf(wattsBuffer, sizeof(wattsBuffer), "%.1f W", wattsValue);
+            u8g2.drawStr(0, 16, wattsBuffer);
         } else {
             u8g2.drawStr(0, 16, "No data");
         }
@@ -255,8 +260,8 @@ void updateDisplay() {
         u8g2.drawStr(0, 30, "Grid Power");
 
         // Display WiFi SSID and IP address
-        u8g2.drawStr(0, 45, ssidString.c_str());
-        u8g2.drawStr(0, 60, ipString.c_str());
+        u8g2.drawStr(0, 45, ssidBuffer);
+        u8g2.drawStr(0, 60, ipBuffer);
 
         u8g2.sendBuffer();
     }
@@ -412,8 +417,6 @@ void setup() {
     esp_task_wdt_init(20, false); // 20 second timeout, don't panic on timeout
     esp_task_wdt_delete(NULL); // Remove current task (setup/loop) from watchdog monitoring
     
-    // Simplified WiFi handling - no mutex needed
-    
     dbgln("[config] load");
     prefs.begin("modbusRtuGw");
     config.begin(&prefs);
@@ -430,53 +433,51 @@ void setup() {
     // Register WiFi event handler
     WiFi.onEvent(WiFiEventHandler);
 
-    // Configure WiFi settings
+    // Configure WiFi settings - trust ESP32's built-in management
     WiFi.setAutoConnect(true);
     WiFi.setAutoReconnect(true);
     
     String hostname = config.getHostname();
     WiFi.setHostname(hostname.c_str());
     
-    // Set clean connect to prevent BSSID fixation
-    wm.setCleanConnect(true);
-
-    wm.setAPCallback(configModeCallback); // Set callback for AP mode
+    // Configure WiFiManager
+    wm.setAPCallback(configModeCallback);
     wm.setClass("invert");
     wm.setShowStaticFields(true);
     wm.setShowDnsFields(true);
     wm.setConnectTimeout(20);
     wm.setConfigPortalTimeout(180); 
-    wm.setBreakAfterConfig(true); // Ensure we save config after portal use
+    wm.setBreakAfterConfig(true);
 
-    // First, try to connect to the strongest available AP for this SSID
-    bool connected = connectToStrongestAP();
-    
-    // If that fails, fall back to WiFiManager
-    if (!connected) {
-        dbgln("[WiFi] Strongest AP connection failed, falling back to WiFiManager");
-        
-        // Attempt to connect or start the config portal
-        if (!wm.autoConnect("ESP32_AP")) {
-            dbgln("[WiFiManager] Failed to connect, starting captive portal...");
-            wm.startConfigPortal("ESP32_AP");
-            ESP.restart(); // Optionally restart after config portal closes
-        }
-        
-        // After connecting with WiFiManager, scan again to connect to strongest AP
-        if (WiFi.status() == WL_CONNECTED) {
-            dbgln("[WiFi] Connected via WiFiManager, scanning for strongest AP");
-            connectToStrongestAP();
-        }
+    // Simple WiFi connection - let WiFiManager and ESP32 handle everything
+    if (!wm.autoConnect("ESP32_AP")) {
+        dbgln("[WiFiManager] Failed to connect, starting captive portal...");
+        wm.startConfigPortal("ESP32_AP");
+        ESP.restart(); // Restart after config portal closes
     }
     
-    // Initialize WiFi connection time if not already set by event handler
+    // Set WiFi task to higher priority than UART - disable power saving for consistent performance
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    dbgln("[WiFi] Power saving disabled for stability");
+    
+    // Lower main task priority to give WiFi higher priority
+#ifdef CONFIG_FREERTOS_UNICORE
+    vTaskPrioritySet(NULL, 1); // Lower main task priority on single core
+    dbgln("[WiFi] Lowered main task priority for single core");
+#else
+    // On dual core, WiFi typically runs on core 0, app on core 1 by default
+    dbgln("[WiFi] Using default dual core configuration");
+#endif
+    
+    // Initialize WiFi connection time if connected
     if (WiFi.status() == WL_CONNECTED && lastWiFiConnectionTime == 0) {
         lastWiFiConnectionTime = millis();
-        dbgln("[WiFi] Initialized connection time: " + String(lastWiFiConnectionTime));
+        static char connBuffer[128];
+        snprintf(connBuffer, sizeof(connBuffer), "[WiFi] Connected to: %s (RSSI: %ddBm)", WiFi.SSID().c_str(), WiFi.RSSI());
+        dbgln(connBuffer);
     }
 
     dbgln("[wifi] finished");
-    delay(2000);
 
     MBUlogLvl = LOG_LEVEL_WARNING;
 
@@ -510,58 +511,27 @@ void setup() {
 
 void loop() {
     static unsigned long lastUpdateTime = 0;
-    static unsigned long lastWiFiCheckTime = 0;
     static unsigned long lastHeapCheck = 0;
-    static unsigned long lastScanTime = 0;
     unsigned long currentTime = millis();
     
     // Check heap memory every 30 seconds
     if (currentTime - lastHeapCheck >= 30000) {
         lastHeapCheck = currentTime;
-        dbgln("[main] Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+        static char heapBuffer[64];
+        snprintf(heapBuffer, sizeof(heapBuffer), "[main] Free heap: %u bytes", ESP.getFreeHeap());
+        dbgln(heapBuffer);
     }
     
-    // Simple WiFi status monitoring - only for extreme cases
-    static unsigned long lastWiFiResetTime = 0;
-    static int wifiResetCount = 0;
-    
-    // Only intervene if WiFi has been disconnected for a long time (30+ seconds)
-    // and the ESP32's auto-reconnect isn't working
-    if (WiFi.status() != WL_CONNECTED) {
-        static unsigned long disconnectStartTime = 0;
-        
-        if (disconnectStartTime == 0) {
-            disconnectStartTime = currentTime;
-            dbgln("[WiFi] Disconnection detected, waiting for auto-reconnect...");
-        }
-        
-        // If disconnected for more than 30 seconds, try our reset
-        if (currentTime - disconnectStartTime > 30000 && 
-            currentTime - lastWiFiResetTime > 60000) { // At least 1 minute between resets
-            
-            dbgln("[WiFi] Long disconnection detected, attempting forceWiFiReset");
-            if (forceWiFiReset()) {
-                disconnectStartTime = 0; // Reset timer on successful reconnect
-                wifiResetCount = 0;
-            } else {
-                wifiResetCount++;
-                if (wifiResetCount >= 3) {
-                    logErrln("[WiFi] Multiple reset failures, rebooting device");
-                    ESP.restart();
-                }
-            }
-            lastWiFiResetTime = currentTime;
-        }
-    } else {
-        // Connected - reset disconnect timer and counters
-        static unsigned long disconnectStartTime = 0;
-        disconnectStartTime = 0;
-        wifiResetCount = 0;
-        
-        // Clear the disconnect flag if set
-        if (wifiDisconnectDetected) {
-            wifiDisconnectDetected = false;
-            dbgln("[WiFi] Reconnection successful");
+    // Simple WiFi status logging - trust ESP32's auto-reconnect
+    static unsigned long lastWiFiStatusLog = 0;
+    if (currentTime - lastWiFiStatusLog >= 60000) { // Log every minute
+        lastWiFiStatusLog = currentTime;
+        if (WiFi.status() == WL_CONNECTED) {
+            static char wifiBuffer[128];
+            snprintf(wifiBuffer, sizeof(wifiBuffer), "[WiFi] Connected to: %s (RSSI: %ddBm)", WiFi.SSID().c_str(), WiFi.RSSI());
+            dbgln(wifiBuffer);
+        } else {
+            dbgln("[WiFi] Disconnected - auto-reconnect in progress");
         }
     }
     
@@ -584,8 +554,9 @@ void loop() {
             timeSinceLastUpdate = currentTime - lastUpdate;
         } else {
             // This case handles millis() overflow or lastUpdate being incorrectly set to a future time
-            logErrln("[main] Time calculation error: current=" + String(currentTime) + 
-                    ", lastUpdate=" + String(lastUpdate));
+            static char timeBuffer[128];
+            snprintf(timeBuffer, sizeof(timeBuffer), "[main] Time calculation error: current=%lu, lastUpdate=%lu", currentTime, lastUpdate);
+            logErrln(timeBuffer);
             // Use a more reasonable value instead of overflowing
             timeSinceLastUpdate = 0;
         }
@@ -595,10 +566,10 @@ void loop() {
             lastStatusCheck = currentTime;
             // This call is thread-safe as it uses proper getters
             bool isOp = modbusCache->getIsOperational();
-            dbgln("[main] Server operational: " + String(isOp ? "YES" : "NO") + 
-                  ", Time since last update: " + String(timeSinceLastUpdate / 1000) + " seconds" +
-                  ", current: " + String(currentTime) + ", lastUpdate: " + String(lastUpdate) +
-                  ", connection problem counter: " + String(connectionProblemCounter));
+            static char statusBuffer[256];
+            snprintf(statusBuffer, sizeof(statusBuffer), "[main] Server operational: %s, Time since last update: %lu seconds, current: %lu, lastUpdate: %lu, connection problem counter: %d", 
+                    isOp ? "YES" : "NO", timeSinceLastUpdate / 1000, currentTime, lastUpdate, connectionProblemCounter);
+            dbgln(statusBuffer);
             
             // If the server is non-operational, increment our problem counter
             if (!isOp) {
@@ -617,9 +588,10 @@ void loop() {
                 
                 // Log the sustained problem duration
                 if (connectionProblemCounter > 1) {
-                    logErrln("[main] Non-operational state for " + 
-                           String(sustainedProblemTime / 1000) + " seconds, counter: " + 
-                           String(connectionProblemCounter));
+                    static char problemBuffer[128];
+                    snprintf(problemBuffer, sizeof(problemBuffer), "[main] Non-operational state for %lu seconds, counter: %d", 
+                            sustainedProblemTime / 1000, connectionProblemCounter);
+                    logErrln(problemBuffer);
                 }
                 
                 // Force reboot after 6 consecutive non-operational checks (approximately 60 seconds)
@@ -639,8 +611,9 @@ void loop() {
         // Original reboot logic - keep as a failsafe
         // If it's been more than 60 seconds with no data, reboot the device
         if (timeSinceLastUpdate > 60000 && timeSinceLastUpdate < 3600000) { // Between 1 minute and 1 hour
-            logErrln("[main] No data received for " + String(timeSinceLastUpdate / 1000) + 
-                   " seconds. Rebooting device...");
+            static char rebootBuffer[128];
+            snprintf(rebootBuffer, sizeof(rebootBuffer), "[main] No data received for %lu seconds. Rebooting device...", timeSinceLastUpdate / 1000);
+            logErrln(rebootBuffer);
             delay(200); // Short delay to allow log message to be sent
             ESP.restart();
         }
@@ -651,24 +624,6 @@ void loop() {
         modbusCache->update();
     }
     
-    // Get current time
-    currentTime = millis();
-    
-    // Reduce frequency of WiFi signal strength checks
-    if (WiFi.status() == WL_CONNECTED && currentTime - lastWiFiCheckTime >= WIFI_CHECK_INTERVAL) {
-        lastWiFiCheckTime = currentTime;
-        int rssi = WiFi.RSSI();
-        
-        // Only log periodically to reduce serial noise
-        dbgln("[WiFi] Current RSSI: " + String(rssi) + "dBm");
-        
-        // Only suggest better AP scan if signal is critically weak (but don't actually do it in runtime)
-        if (rssi < WIFI_RSSI_THRESHOLD && currentTime - lastScanTime >= 300000) { // 5 minutes between logs
-            lastScanTime = currentTime;
-            dbgln("[WiFi] Signal strength critically low - consider checking AP placement");
-        }
-    }
-
     // Update the OLED
     if (currentTime - lastUpdateTime >= 200) {
         lastUpdateTime = currentTime;

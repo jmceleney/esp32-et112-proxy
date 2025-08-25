@@ -25,22 +25,29 @@ static unsigned long queueFullStartTime = 0;
 static unsigned long lastQueueStatusLog = 0;
 
 void printHex(const uint8_t *buffer, size_t length) {
-    String hexOutput;
-    hexOutput.reserve(length * 3); // Each byte takes 2 chars + 1 space
+    if (length == 0) return;
     
-    for (size_t i = 0; i < length; ++i) {
-        if (buffer[i] < 16) {
-            hexOutput += "0"; // Add leading zero for values less than 16
-        }
-        hexOutput += String(buffer[i], HEX);
+    // Use static buffer to avoid String memory fragmentation
+    // Each byte needs 2 hex chars + 1 space, plus null terminator
+    const size_t MAX_BYTES = 85; // 85 * 3 = 255 chars + null = 256
+    static char hexBuffer[256];
+    
+    // Limit length to prevent buffer overflow
+    size_t maxLength = std::min(length, MAX_BYTES);
+    size_t pos = 0;
+    
+    for (size_t i = 0; i < maxLength && pos < sizeof(hexBuffer) - 4; ++i) {
+        // Use %02X to get exactly 2 hex digits with leading zero if needed
+        pos += snprintf(&hexBuffer[pos], sizeof(hexBuffer) - pos, "%02X", buffer[i]);
         
-        if (i < length - 1) {
-            hexOutput += " "; // Space between bytes for readability
+        // Add space between bytes except for the last one
+        if (i < maxLength - 1 && pos < sizeof(hexBuffer) - 2) {
+            hexBuffer[pos++] = ' ';
         }
     }
     
-    // Print the entire hex string at once
-    dbgln(hexOutput);
+    hexBuffer[pos] = '\0';
+    dbgln(hexBuffer);
 }
 
 // Initialize static instance pointer
@@ -333,17 +340,21 @@ void ModbusCache::logWithCollapsing(const String& message) {
         
         // Only log every 50th occurrence or after 2 seconds since last log
         if (repeatCount % 200 == 0 || (currentTime - lastLogTime) >= 2000) {
-            // Create a local String for the message
-            String logMsg = message + " (repeated " + String(repeatCount) + " times)";
-            dbgln(logMsg);
+            // Use static buffer to avoid String concatenation memory fragmentation
+            static char logBuffer[256];
+            snprintf(logBuffer, sizeof(logBuffer), "%s (repeated %u times)", 
+                    message.c_str(), repeatCount);
+            dbgln(logBuffer);
             lastLogTime = currentTime;
         }
     } else {
         // If we had previous repeated messages, show final count
         if (repeatCount > 1) {
-            // Create a local String for the message
-            String logMsg = lastLogMessage + " (repeated " + String(repeatCount) + " times total)";
-            dbgln(logMsg);
+            // Use static buffer to avoid String concatenation memory fragmentation
+            static char logBuffer[256];
+            snprintf(logBuffer, sizeof(logBuffer), "%s (repeated %u times total)", 
+                    lastLogMessage.c_str(), repeatCount);
+            dbgln(logBuffer);
         }
         
         // New message, reset counter
@@ -375,9 +386,14 @@ void ModbusCache::update() {
         // First process static registers if not all fetched
         if (!staticRegistersFetched) {
             dbgln("[update] Processing static registers");
+            size_t rangeCount = 0;
             for (auto& range : registerRanges) {
                 if (range.isStatic) {
                     processRegisterRange(range);
+                    // Strategic yield every 3 ranges to give WiFi priority
+                    if (++rangeCount % 3 == 0) {
+                        yield();
+                    }
                 }
             }
             
@@ -395,6 +411,7 @@ void ModbusCache::update() {
             }
         } else {
             // Process dynamic registers
+            size_t dynamicRangeCount = 0;
             for (auto& range : registerRanges) {
                 if (!range.isStatic) {
                     // Find the index of this range among dynamic ranges
@@ -413,6 +430,11 @@ void ModbusCache::update() {
                     
                     dbgln("[update] Processing dynamic register range " + String(rangeIndex) + " of " + String(totalDynamicRanges));
                     processRegisterRange(range);
+                    
+                    // Strategic yield every 2 dynamic ranges to give WiFi priority
+                    if (++dynamicRangeCount % 2 == 0) {
+                        yield();
+                    }
                 }
             }
         }
@@ -844,24 +866,34 @@ void ModbusCache::sendModbusRequest(uint16_t startAddress, uint16_t regCount) {
         return;
     }
     
-    // Now do logging outside the mutex
-    String hexData = "";
-    for (size_t i = 0; i < request.size(); ++i) {
-        if (request.data()[i] < 16) {
-            hexData += "0"; // Add leading zero for values less than 16
-        }
-        hexData += String(request.data()[i], HEX);
+    // Now do logging outside the mutex using static buffers to avoid memory fragmentation
+    static char hexBuffer[128]; // Buffer for hex data
+    size_t hexPos = 0;
+    
+    // Build hex string efficiently using proper formatting
+    for (size_t i = 0; i < request.size() && hexPos < sizeof(hexBuffer) - 4; ++i) {
+        // Use %02X to get exactly 2 hex digits with leading zero if needed
+        hexPos += snprintf(&hexBuffer[hexPos], sizeof(hexBuffer) - hexPos, "%02X", request.data()[i]);
         
-        if (i < request.size() - 1) {
-            hexData += " "; // Space between bytes for readability
+        // Add space between bytes except for the last one
+        if (i < request.size() - 1 && hexPos < sizeof(hexBuffer) - 2) {
+            hexBuffer[hexPos++] = ' ';
         }
     }
+    hexBuffer[hexPos] = '\0';
     
-    dbgln("[sendRequest:" + String(currentToken) + "] === Sending Request ===\n"
-          "[sendRequest:" + String(currentToken) + "] Start Address: 0x" + String(startAddress, HEX) + " (" + String(startAddress) + ")\n"
-          "[sendRequest:" + String(currentToken) + "] Register Count: " + String(regCount) + "\n"
-          "[sendRequest:" + String(currentToken) + "] Token: " + String(currentToken) + "\n"
-          "[sendRequest:" + String(currentToken) + "] Request data: \n" + hexData);
+    // Use static buffer for comprehensive logging to avoid String concatenation
+    static char logBuffer[512];
+    snprintf(logBuffer, sizeof(logBuffer),
+        "[sendRequest:%u] === Sending Request ===\n"
+        "[sendRequest:%u] Start Address: 0x%X (%u)\n"
+        "[sendRequest:%u] Register Count: %u\n"
+        "[sendRequest:%u] Token: %u\n"
+        "[sendRequest:%u] Request data: %s",
+        currentToken, currentToken, startAddress, startAddress, 
+        currentToken, regCount, currentToken, currentToken, hexBuffer);
+    
+    dbgln(logBuffer);
     
     // Send the request based on client type
     if (config.getClientIsRTU()) {
@@ -1624,12 +1656,24 @@ ModbusMessage ModbusCache::respondFromCache(ModbusMessage request) {
             uint16_t i = 0;
             uint16_t currentAddress = address;
             
-            // Collect all values quickly without yields
+            // Collect all values with strategic yields for WiFi
             while (i < valueOrWords) {
                 // Check processing time to prevent holding mutex too long
                 if (millis() - startTime > 30) { // Reduced timeout
                     xSemaphoreGiveRecursive(instance->mutex);
                     return ModbusMessage(); // Return empty response if taking too long
+                }
+                
+                // Add strategic yield every 5 registers to give WiFi task priority
+                if (i % 5 == 0 && i > 0) {
+                    xSemaphoreGiveRecursive(instance->mutex);
+                    yield(); // Give WiFi task a chance to run
+                    // Re-acquire mutex and check operational state
+                    if (!xSemaphoreTakeRecursive(instance->mutex, pdMS_TO_TICKS(50)) || 
+                        !instance->isOperational.load()) {
+                        return ModbusMessage();
+                    }
+                    startTime = millis(); // Reset timeout after yield
                 }
                 
                 if (instance->is32BitRegister(currentAddress)) {

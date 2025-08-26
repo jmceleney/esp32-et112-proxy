@@ -460,13 +460,18 @@ void setup() {
     esp_wifi_set_ps(WIFI_PS_NONE);
     dbgln("[WiFi] Power saving disabled for stability");
     
+    // Configure WiFi persistent connection settings
+    WiFi.persistent(true);
+    WiFi.setSleep(false);
+    
     // Lower main task priority to give WiFi higher priority
 #ifdef CONFIG_FREERTOS_UNICORE
     vTaskPrioritySet(NULL, 1); // Lower main task priority on single core
     dbgln("[WiFi] Lowered main task priority for single core");
 #else
     // On dual core, WiFi typically runs on core 0, app on core 1 by default
-    dbgln("[WiFi] Using default dual core configuration");
+    vTaskPrioritySet(NULL, 1); // Lower main task priority
+    dbgln("[WiFi] Lowered main task priority for WiFi stability");
 #endif
     
     // Initialize WiFi connection time if connected
@@ -522,16 +527,55 @@ void loop() {
         dbgln(heapBuffer);
     }
     
-    // Simple WiFi status logging - trust ESP32's auto-reconnect
+    // Active WiFi monitoring and recovery
     static unsigned long lastWiFiStatusLog = 0;
-    if (currentTime - lastWiFiStatusLog >= 60000) { // Log every minute
+    static unsigned long lastWiFiReconnectAttempt = 0;
+    static int wifiReconnectAttempts = 0;
+    
+    // Check WiFi status more frequently
+    if (currentTime - lastWiFiStatusLog >= 30000) { // Check every 30 seconds
         lastWiFiStatusLog = currentTime;
         if (WiFi.status() == WL_CONNECTED) {
             static char wifiBuffer[128];
             snprintf(wifiBuffer, sizeof(wifiBuffer), "[WiFi] Connected to: %s (RSSI: %ddBm)", WiFi.SSID().c_str(), WiFi.RSSI());
             dbgln(wifiBuffer);
+            wifiReconnectAttempts = 0; // Reset counter on successful connection
         } else {
-            dbgln("[WiFi] Disconnected - auto-reconnect in progress");
+            dbgln("[WiFi] Disconnected - initiating recovery");
+        }
+        yield(); // Give WiFi stack CPU time after heavy string operations and WiFi calls
+    }
+    
+    // Active WiFi recovery when disconnected
+    if (WiFi.status() != WL_CONNECTED) {
+        if (currentTime - lastWiFiReconnectAttempt >= 5000) { // Try every 5 seconds
+            lastWiFiReconnectAttempt = currentTime;
+            wifiReconnectAttempts++;
+            
+            dbgln("[WiFi] Connection lost, attempting recovery (attempt " + String(wifiReconnectAttempts) + ")");
+            
+            if (wifiReconnectAttempts <= 2) {
+                // First attempts: Simple reconnect
+                WiFi.reconnect();
+                yield();
+            } else if (wifiReconnectAttempts <= 4) {
+                // Next attempts: Force WiFi reset
+                if (forceWiFiReset()) {
+                    wifiReconnectAttempts = 0;
+                }
+                yield();
+            } else if (wifiReconnectAttempts <= 6) {
+                // Try connecting to strongest AP
+                if (connectToStrongestAP()) {
+                    wifiReconnectAttempts = 0;
+                }
+                yield();
+            } else {
+                // Final resort - restart device
+                logErrln("[WiFi] Multiple reconnection failures, restarting device");
+                delay(100);
+                ESP.restart();
+            }
         }
     }
     
@@ -570,6 +614,7 @@ void loop() {
             snprintf(statusBuffer, sizeof(statusBuffer), "[main] Server operational: %s, Time since last update: %lu seconds, current: %lu, lastUpdate: %lu, connection problem counter: %d", 
                     isOp ? "YES" : "NO", timeSinceLastUpdate / 1000, currentTime, lastUpdate, connectionProblemCounter);
             dbgln(statusBuffer);
+            yield(); // Give WiFi stack CPU time after heavy logging operations
             
             // If the server is non-operational, increment our problem counter
             if (!isOp) {
@@ -592,6 +637,7 @@ void loop() {
                     snprintf(problemBuffer, sizeof(problemBuffer), "[main] Non-operational state for %lu seconds, counter: %d", 
                             sustainedProblemTime / 1000, connectionProblemCounter);
                     logErrln(problemBuffer);
+                    yield(); // Give WiFi stack CPU time after error logging
                 }
                 
                 // Force reboot after 6 consecutive non-operational checks (approximately 60 seconds)
@@ -606,6 +652,7 @@ void loop() {
                 connectionProblemCounter = 0;
                 noUpdatesSince = 0;
             }
+            yield(); // Give WiFi stack CPU time after complex status checking block
         }
         
         // Original reboot logic - keep as a failsafe
@@ -619,18 +666,33 @@ void loop() {
         }
     }
 
-    // Update the Modbus Cache
+    // Update the Modbus Cache with WiFi-friendly timing
     if (modbusCache) {
-        modbusCache->update();
+        // Only update if WiFi is stable or we're not in active recovery
+        if (WiFi.status() == WL_CONNECTED || wifiReconnectAttempts == 0) {
+            modbusCache->update();
+            yield(); // Ensure WiFi gets CPU time after Modbus operations
+        } else {
+            // During WiFi recovery, skip Modbus updates to prioritize reconnection
+            yield();
+            delay(10); // Give extra time to WiFi stack during recovery
+        }
     }
     
     // Update the OLED
     if (currentTime - lastUpdateTime >= 200) {
         lastUpdateTime = currentTime;
         updateDisplay();
+        yield(); // Give WiFi stack CPU time after I2C OLED operations
     }
 
-    wm.process(); // Non-blocking WiFiManager process
+    // Only process WiFiManager when WiFi is stable to avoid conflicts
+    if (WiFi.status() == WL_CONNECTED) {
+        wm.process(); // Non-blocking WiFiManager process
+    }
+    yield(); // Give WiFi stack CPU time
     
-    yield();
+    // Add small delay to ensure WiFi stack gets enough time
+    delay(1); // 1ms delay ensures WiFi stack runs
+    yield(); // Final yield before loop restart
 }

@@ -244,18 +244,30 @@ void ModbusCache::initializeRegisters(const std::vector<ModbusRegister>& dynamic
         }
         staticRegisterAddresses.insert(reg.address);
     }
-    // Log which registers are 16 bit and 32 bit
-    String reg16BitList = "16-bit registers: ";
+    // Log which registers are 16 bit and 32 bit using static buffers to avoid fragmentation
+    static char reg16BitBuffer[512];
+    static char reg32BitBuffer[512];
+    
+    // Build 16-bit register list
+    int pos16 = snprintf(reg16BitBuffer, sizeof(reg16BitBuffer), "16-bit registers: ");
     for (auto addr : register16BitValues) {
-        reg16BitList += String(addr.first) + " ";
+        if (pos16 < sizeof(reg16BitBuffer) - 10) {
+            pos16 += snprintf(&reg16BitBuffer[pos16], sizeof(reg16BitBuffer) - pos16, "%u ", addr.first);
+        }
     }
     
-    String reg32BitList = "32-bit registers: ";
+    // Build 32-bit register list
+    int pos32 = snprintf(reg32BitBuffer, sizeof(reg32BitBuffer), "32-bit registers: ");
     for (auto addr : register32BitValues) {
-        reg32BitList += String(addr.first) + " ";
+        if (pos32 < sizeof(reg32BitBuffer) - 10) {
+            pos32 += snprintf(&reg32BitBuffer[pos32], sizeof(reg32BitBuffer) - pos32, "%u ", addr.first);
+        }
     }
     
-    dbgln(reg16BitList + "\n" + reg32BitList);
+    // Use static buffer for combined output
+    static char combinedBuffer[1024];
+    snprintf(combinedBuffer, sizeof(combinedBuffer), "%s\n%s", reg16BitBuffer, reg32BitBuffer);
+    dbgln(combinedBuffer);
 }
 
 std::vector<uint16_t> ModbusCache::getRegisterValues(uint16_t startAddress, uint16_t count) {
@@ -390,10 +402,9 @@ void ModbusCache::update() {
             for (auto& range : registerRanges) {
                 if (range.isStatic) {
                     processRegisterRange(range);
-                    // Strategic yield every 3 ranges to give WiFi priority
-                    if (++rangeCount % 3 == 0) {
-                        yield();
-                    }
+                    // Aggressive yield after every range to give WiFi priority
+                    yield();
+                    rangeCount++;
                 }
             }
             
@@ -431,10 +442,10 @@ void ModbusCache::update() {
                     dbgln("[update] Processing dynamic register range " + String(rangeIndex) + " of " + String(totalDynamicRanges));
                     processRegisterRange(range);
                     
-                    // Strategic yield every 2 dynamic ranges to give WiFi priority
-                    if (++dynamicRangeCount % 2 == 0) {
-                        yield();
-                    }
+                    // Aggressive yield after every dynamic range to give WiFi priority
+                    yield();
+                    dynamicRangeCount++;
+                    delay(1); // Small delay to ensure WiFi gets time
                 }
             }
         }
@@ -546,9 +557,14 @@ void ModbusCache::processRegisterRange(RegisterRange& range) {
     ModbusMessage request = ModbusMessage(1, 3, range.startAddress, range.regCount);
     uint32_t currentToken = globalToken++;
     
-    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(100))) {
+    if (xSemaphoreTakeRecursive(mutex, pdMS_TO_TICKS(10))) { // Reduced timeout from 100ms to 10ms
         requestMap[currentToken] = std::make_tuple(range.startAddress, range.regCount, currentTime);
         xSemaphoreGiveRecursive(mutex);
+        yield(); // Give WiFi time after mutex operations
+    } else {
+        // Failed to get mutex quickly, yield to WiFi
+        yield();
+        return; // Skip this update cycle to prevent blocking
     }
     
     if (config.getClientIsRTU()) {

@@ -1,7 +1,7 @@
 #ifndef PAGES_H
     #define PAGES_H
 
-    #include <WiFiManager.h>
+    #include <ESPAsyncWiFiManager.h>
     #include <Logging.h>
     #include <ESPAsyncWebServer.h>
     #include <ModbusClientRTU.h>
@@ -11,7 +11,7 @@
     #include "debug.h"
     #include "debug_buffer.h"
 
-    void setupPages(AsyncWebServer* server, ModbusCache *modbusCache, Config *config, WiFiManager *wm);
+    void setupPages(AsyncWebServer* server, ModbusCache *modbusCache, Config *config, AsyncWiFiManager *wm);
     void sendResponseHeader(AsyncResponseStream *response, const char *title, bool inlineStyle = false, const String &hostname = "");
     void sendResponseTrailer(AsyncResponseStream *response);
     void sendButton(AsyncResponseStream *response, const char *title, const char *action, const char *css = "");
@@ -22,4 +22,7 @@
     void sendLogPage(AsyncResponseStream *response, const String &hostname);
     const String ErrorName(Modbus::Error code);
     const String WiFiQuality(int rssiValue);
+    
+    // External flag to track config portal mode
+    extern bool inConfigPortal;
 #endif /* PAGES_H */

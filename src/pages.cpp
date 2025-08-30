@@ -75,7 +75,7 @@ void cleanupBssidCache() {
   }
 }
 
-void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config, WiFiManager *wm){
+void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config, AsyncWiFiManager *wm){
     server->on("/metrics", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
     logHeapMemory("/metrics");
 
@@ -1323,9 +1323,11 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
   });
   server->on("/wifi", HTTP_POST, [wm](AsyncWebServerRequest *request){
     dbgln("[webserver] POST /wifi");
+    inConfigPortal = true; // Set flag before erasing to prevent interference
     request->redirect("/");
-    wm->erase();
+    wm->resetSettings();
     dbgln("[webserver] erased wifi config");
+    delay(100); // Small delay to ensure response is sent
     dbgln("[webserver] rebooting...");
     ESP.restart();
     dbgln("[webserver] rebooted...");

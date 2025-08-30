@@ -1,7 +1,8 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
-#include <WiFiManager.h>
+#include <ESPAsyncWiFiManager.h>
 #include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <Logging.h>
 #include <U8g2lib.h>
@@ -13,7 +14,6 @@
 #include "esp_wifi.h"  // For esp_wifi_restore()
 #include <cmath> // Include cmath for acos
 #include <Arduino.h>
-#include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <ModbusClientTCPasync.h>
@@ -31,7 +31,8 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
 AsyncWebServer webServer(80);
 Config config;
 Preferences prefs;
-WiFiManager wm;
+DNSServer dnsServer;
+AsyncWiFiManager wm(&webServer, &dnsServer);
 
 std::vector<ModbusRegister> dynamicRegisters = {
     {0, RegisterType::INT32, "Volts", 0.1, UnitType::V},
@@ -162,6 +163,7 @@ int buttonState;
 bool wifiConnected = false;
 bool wifiDisconnectDetected = false;
 unsigned long lastWiFiConnectionTime = 0; // Track when WiFi was last connected
+bool inConfigPortal = false; // Track if we're in config portal mode
 // Removed WiFi mutex - simplified event handling
 
 void WiFiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -192,9 +194,10 @@ void WiFiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
 }
 
 // Callback for when we enter Access Point mode
-void configModeCallback(WiFiManager *myWiFiManager) {
+void configModeCallback(AsyncWiFiManager *myWiFiManager) {
     dbgln("[WiFiManager] Entered config mode");
     dbgln("AP SSID: " + myWiFiManager->getConfigPortalSSID());
+    inConfigPortal = true; // Set flag to indicate we're in config portal
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_ncenB08_tr);
     u8g2.drawStr(0, 14, myWiFiManager->getConfigPortalSSID().c_str());
@@ -222,10 +225,6 @@ void handleButton() {
       if (buttonState == LOW) {
         // Increment mode and wrap around
         displayMode = (displayMode + 1) % 4;
-
-        // Print the current mode for debugging
-        Serial.print("displayMode changed to: ");
-        Serial.println(displayMode);
       }
     }
   }
@@ -289,8 +288,8 @@ bool forceWiFiReset() {
     delay(500);
     
     // Get SSID and password from WiFiManager
-    String ssid = wm.getWiFiSSID();
-    String password = wm.getWiFiPass();
+    String ssid = wm.getConfiguredSTASSID();
+    String password = wm.getConfiguredSTAPassword();
     
     if (ssid.length() == 0 || password.length() == 0) {
         dbgln("[WiFi] No SSID or password available, cannot reset WiFi");
@@ -324,8 +323,8 @@ bool connectToStrongestAP() {
     dbgln("[WiFi] Scanning for strongest AP...");
     
     // Get SSID and password from WiFiManager
-    String targetSSID = wm.getWiFiSSID();
-    String password = wm.getWiFiPass();
+    String targetSSID = wm.getConfiguredSTASSID();
+    String password = wm.getConfiguredSTAPassword();
     
     if (targetSSID.length() == 0 || password.length() == 0) {
         dbgln("[WiFi] No SSID or password available for scanning");
@@ -433,36 +432,80 @@ void setup() {
     // Register WiFi event handler
     WiFi.onEvent(WiFiEventHandler);
 
-    // Configure WiFi settings - trust ESP32's built-in management
-    WiFi.setAutoConnect(true);
-    WiFi.setAutoReconnect(true);
-    
+    // Configure hostname
     String hostname = config.getHostname();
     WiFi.setHostname(hostname.c_str());
     
+    // Let WiFiManager handle all WiFi configuration
+    // Don't interfere with WiFi settings here
+    
+    // Get MAC address for unique AP name
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    char apName[20];
+    snprintf(apName, sizeof(apName), "ESP32_%02X%02X", mac[4], mac[5]);
+    dbgln("[WiFiManager] AP name will be: " + String(apName));
+    
     // Configure WiFiManager
     wm.setAPCallback(configModeCallback);
-    wm.setClass("invert");
-    wm.setShowStaticFields(true);
-    wm.setShowDnsFields(true);
+    // Note: ESPAsyncWiFiManager doesn't support setClass, setShowStaticFields, setShowDnsFields
     wm.setConnectTimeout(20);
-    wm.setConfigPortalTimeout(180); 
-    wm.setBreakAfterConfig(true);
-
-    // Simple WiFi connection - let WiFiManager and ESP32 handle everything
-    if (!wm.autoConnect("ESP32_AP")) {
-        dbgln("[WiFiManager] Failed to connect, starting captive portal...");
-        wm.startConfigPortal("ESP32_AP");
-        ESP.restart(); // Restart after config portal closes
+    wm.setMinimumSignalQuality(20); // Set minimum signal quality
+    
+    // Configure save callback
+    wm.setSaveConfigCallback([]() {
+        dbgln("[WiFiManager] Configuration saved, will restart");
+        inConfigPortal = false;
+    });
+    
+    // Use autoConnect - it handles everything:
+    // 1. Tries to connect with saved credentials
+    // 2. If no credentials or connection fails, automatically starts config portal
+    // 3. The portal runs at 192.168.4.1
+    
+    dbgln("[WiFiManager] Starting WiFi configuration...");
+    
+    // Set config portal timeout (3 minutes)
+    wm.setConfigPortalTimeout(180);
+    
+    // This single call handles everything
+    bool connected = wm.autoConnect(apName);
+    
+    if (!connected) {
+        // Portal timed out without connection
+        dbgln("[WiFiManager] Failed to connect and portal timed out");
+        dbgln("[WiFiManager] Starting unlimited config portal...");
+        
+        inConfigPortal = true;
+        
+        // Disable watchdog for unlimited portal
+        esp_task_wdt_delete(NULL);
+        
+        // Set no timeout and restart portal
+        wm.setConfigPortalTimeout(0);
+        
+        // Start portal again with no timeout
+        if (wm.startConfigPortal(apName)) {
+            dbgln("[WiFiManager] Configuration saved, restarting...");
+        } else {
+            dbgln("[WiFiManager] Portal exited without saving");
+        }
+        
+        ESP.restart();
     }
+    
+    // If we get here, we connected successfully
+    inConfigPortal = false;
+    dbgln("[WiFiManager] Successfully connected to WiFi");
+    
+    // Configure WiFi for stable operation now that we're connected
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+    WiFi.setSleep(false);
     
     // Set WiFi task to higher priority than UART - disable power saving for consistent performance
     esp_wifi_set_ps(WIFI_PS_NONE);
     dbgln("[WiFi] Power saving disabled for stability");
-    
-    // Configure WiFi persistent connection settings
-    WiFi.persistent(true);
-    WiFi.setSleep(false);
     
     // Lower main task priority to give WiFi higher priority
 #ifdef CONFIG_FREERTOS_UNICORE
@@ -509,12 +552,23 @@ void setup() {
 
     dbgln("[modbusCache] finished");
 
+    // Setup web server pages - AsyncWiFiManager shares the same server
     setupPages(&webServer, modbusCache, &config, &wm);
-    webServer.begin();
+    
+    // AsyncWiFiManager will handle starting the server
+    dbgln("[webServer] Configured with AsyncWiFiManager");
+    
     dbgln("[setup] finished");
 }
 
 void loop() {
+    // If we're in config portal mode, just handle WiFiManager and return
+    if (inConfigPortal) {
+        wm.loop();
+        delay(10);
+        return;
+    }
+    
     static unsigned long lastUpdateTime = 0;
     static unsigned long lastHeapCheck = 0;
     unsigned long currentTime = millis();
@@ -687,8 +741,8 @@ void loop() {
     }
 
     // Only process WiFiManager when WiFi is stable to avoid conflicts
-    if (WiFi.status() == WL_CONNECTED) {
-        wm.process(); // Non-blocking WiFiManager process
+    if (WiFi.status() == WL_CONNECTED && !inConfigPortal) {
+        wm.loop(); // Non-blocking WiFiManager process
     }
     yield(); // Give WiFi stack CPU time
     

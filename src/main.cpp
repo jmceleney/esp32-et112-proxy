@@ -157,8 +157,12 @@ int buttonState;
 // Button hold variables for WiFi reset
 unsigned long buttonHoldStartTime = 0;
 bool buttonHolding = false;
-const unsigned long WIFI_RESET_HOLD_TIME = 6000; // 6 seconds to reset WiFi
+const unsigned long WIFI_RESET_HOLD_TIME = 9000; // 9 seconds to reset WiFi
+const unsigned long SCREEN_SWITCH_DELAY = 1000; // 1 second delay before WiFi reset countdown
 int countdownSeconds = 0;
+// Multi-screen display variables
+int currentScreen = 0; // 0 = screen1 (default), 1 = screen2
+const int NUM_SCREENS = 2;
 
 #define WIFI_RSSI_THRESHOLD -80  // RSSI threshold to trigger reconnection (dBm)
 #define WIFI_CHECK_INTERVAL 300000 // Check WiFi signal strength every 5 minutes
@@ -229,44 +233,55 @@ void handleButton() {
           // Start hold timer
           buttonHoldStartTime = millis();
           buttonHolding = true;
-          countdownSeconds = WIFI_RESET_HOLD_TIME / 1000; // Start countdown from 6
         }
       }
       // Button just released (rising edge)
       else if (buttonState == HIGH) {
         if (buttonHolding) {
-          // Button was released before hold time completed
+          unsigned long holdDuration = millis() - buttonHoldStartTime;
           buttonHolding = false;
           countdownSeconds = 0;
-          // Return to normal display mode cycling
-          displayMode = (displayMode + 1) % 4;
+          
+          // Check hold duration to determine action
+          if (holdDuration < SCREEN_SWITCH_DELAY) {
+            // Short press (< 1 second) - switch screens
+            currentScreen = (currentScreen + 1) % NUM_SCREENS;
+          }
+          // If held longer than 1 second but less than 6, just cancel (no action)
+          // WiFi reset happens in the hold timing section below
         }
       }
     }
   }
   
-  // Handle button hold timing and countdown
+  // Handle button hold timing and countdown (only after 1 second delay)
   if (buttonHolding && buttonState == LOW) {
     unsigned long holdDuration = millis() - buttonHoldStartTime;
-    int newCountdown = (WIFI_RESET_HOLD_TIME - holdDuration) / 1000;
     
-    // Update countdown display
-    if (newCountdown != countdownSeconds && newCountdown >= 0) {
-      countdownSeconds = newCountdown;
-    }
-    
-    // Check if hold time has been reached
-    if (holdDuration >= WIFI_RESET_HOLD_TIME) {
-      // Reset WiFi configuration
-      dbgln("[Button] WiFi reset triggered by 6-second hold");
-      wm.resetSettings();
+    // Only start countdown after 1-second delay
+    if (holdDuration >= SCREEN_SWITCH_DELAY) {
+      unsigned long countdownDuration = holdDuration - SCREEN_SWITCH_DELAY;
+      unsigned long remainingTime = WIFI_RESET_HOLD_TIME - SCREEN_SWITCH_DELAY - countdownDuration;
+      int newCountdown = (remainingTime + 999) / 1000; // Round up to nearest second
       
-      // Reset button state
-      buttonHolding = false;
-      countdownSeconds = 0;
+      // Update countdown display
+      if (newCountdown != countdownSeconds && newCountdown >= 0) {
+        countdownSeconds = newCountdown;
+      }
       
-      // Restart ESP32 to apply changes
-      ESP.restart();
+      // Check if full hold time has been reached (6 seconds total)
+      if (holdDuration >= WIFI_RESET_HOLD_TIME) {
+        // Reset WiFi configuration
+        dbgln("[Button] WiFi reset triggered by 6-second hold");
+        wm.resetSettings();
+        
+        // Reset button state
+        buttonHolding = false;
+        countdownSeconds = 0;
+        
+        // Restart ESP32 to apply changes
+        ESP.restart();
+      }
     }
   }
   
@@ -278,7 +293,7 @@ void updateDisplay() {
     
     u8g2.clearBuffer();
     
-    // Check if we're in button hold countdown mode
+    // Check if we're in button hold countdown mode (only after 1 second hold)
     if (buttonHolding && countdownSeconds > 0) {
         // Show WiFi reset countdown in the lower area to avoid color bands
         u8g2.setFont(u8g2_font_ncenB14_tr);
@@ -291,32 +306,70 @@ void updateDisplay() {
         u8g2.setFont(u8g2_font_ncenB08_tr);
         u8g2.drawStr(0, 64, "Release to cancel");
     }
-    else if (wattsRegisterAddress != -1) {
-        // Normal display mode
-        // Get the "Watts" value from the Modbus cache
-        float wattsValue = modbusCache->getRegisterScaledValue(wattsRegisterAddress);
-        static char ssidBuffer[64];
-        static char ipBuffer[32];
-        snprintf(ssidBuffer, sizeof(ssidBuffer), "SSID: %s", WiFi.SSID().c_str());
-        snprintf(ipBuffer, sizeof(ipBuffer), "IP: %s", WiFi.localIP().toString().c_str());
+    else {
+        // Normal display modes based on currentScreen
+        if (currentScreen == 0) {
+            // Screen 1 - Original display with power data
+            if (wattsRegisterAddress != -1) {
+                // Get the "Watts" value from the Modbus cache
+                float wattsValue = modbusCache->getRegisterScaledValue(wattsRegisterAddress);
+                static char ssidBuffer[64];
+                static char ipBuffer[32];
+                snprintf(ssidBuffer, sizeof(ssidBuffer), "SSID: %s", WiFi.SSID().c_str());
+                snprintf(ipBuffer, sizeof(ipBuffer), "IP: %s", WiFi.localIP().toString().c_str());
 
-        u8g2.setFont(u8g2_font_ncenB14_tr);
+                u8g2.setFont(u8g2_font_ncenB14_tr);
 
-        // Display the wattage if data is operational, otherwise show "No Data"
-        if (modbusCache->getIsOperational()) {
-            static char wattsBuffer[32];
-            snprintf(wattsBuffer, sizeof(wattsBuffer), "%.1f W", wattsValue);
-            u8g2.drawStr(0, 16, wattsBuffer);
-        } else {
-            u8g2.drawStr(0, 16, "No data");
+                // Display the wattage if data is operational, otherwise show "No Data"
+                if (modbusCache->getIsOperational()) {
+                    static char wattsBuffer[32];
+                    snprintf(wattsBuffer, sizeof(wattsBuffer), "%.1f W", wattsValue);
+                    u8g2.drawStr(0, 16, wattsBuffer);
+                } else {
+                    u8g2.drawStr(0, 16, "No data");
+                }
+
+                u8g2.setFont(u8g2_font_ncenB08_tr);
+                u8g2.drawStr(0, 30, "Grid Power");
+
+                // Display WiFi SSID and IP address
+                u8g2.drawStr(0, 45, ssidBuffer);
+                u8g2.drawStr(0, 60, ipBuffer);
+            }
         }
-
-        u8g2.setFont(u8g2_font_ncenB08_tr);
-        u8g2.drawStr(0, 30, "Grid Power");
-
-        // Display WiFi SSID and IP address
-        u8g2.drawStr(0, 45, ssidBuffer);
-        u8g2.drawStr(0, 60, ipBuffer);
+        else if (currentScreen == 1) {
+            // Screen 2 - Detailed electrical measurements
+            u8g2.setFont(u8g2_font_ncenB08_tr); // Use small font to fit all data
+            
+            if (modbusCache && modbusCache->getIsOperational()) {
+                // Get electrical values from Modbus cache
+                float volts = modbusCache->getRegisterScaledValue(0);        // Volts register
+                float amps = modbusCache->getRegisterScaledValue(2);         // Amps register  
+                float watts = modbusCache->getRegisterScaledValue(wattsRegisterAddress); // Watts register
+                float powerFactor = modbusCache->getRegisterScaledValue(14); // Power Factor register
+                float energyKwh = modbusCache->getRegisterScaledValue(16);   // Energy kWh (+) register
+                
+                // Create display buffers
+                static char line1[32], line2[32], line3[32], line4[32], line5[32];
+                
+                // Format each line with values
+                snprintf(line1, sizeof(line1), "Volts: %.1fV", volts);
+                snprintf(line2, sizeof(line2), "Amps: %.3fA", amps);
+                snprintf(line3, sizeof(line3), "Watts: %.1fW", watts);
+                snprintf(line4, sizeof(line4), "PF: %.3f", powerFactor);
+                snprintf(line5, sizeof(line5), "Energy: %.1fkWh", energyKwh);
+                
+                // Draw each line, using every available line on the display
+                u8g2.drawStr(0, 12, line1);  // Line 1
+                u8g2.drawStr(0, 24, line2);  // Line 2  
+                u8g2.drawStr(0, 36, line3);  // Line 3
+                u8g2.drawStr(0, 48, line4);  // Line 4
+                u8g2.drawStr(0, 60, line5);  // Line 5
+            } else {
+                // Display "No data" if not operational
+                u8g2.drawStr(0, 32, "No Modbus Data");
+            }
+        }
     }
     
     u8g2.sendBuffer();
@@ -611,8 +664,9 @@ void setup() {
     // Setup web server pages - AsyncWiFiManager shares the same server
     setupPages(&webServer, modbusCache, &config, &wm);
     
-    // AsyncWiFiManager will handle starting the server
-    dbgln("[webServer] Configured with AsyncWiFiManager");
+    // Start the web server
+    webServer.begin();
+    dbgln("[webServer] Started web server");
     
     dbgln("[setup] finished");
 }

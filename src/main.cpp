@@ -154,6 +154,11 @@ unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 50; // 50ms debounce delay
 int lastButtonState = HIGH; // Assume button not pressed at start
 int buttonState;
+// Button hold variables for WiFi reset
+unsigned long buttonHoldStartTime = 0;
+bool buttonHolding = false;
+const unsigned long WIFI_RESET_HOLD_TIME = 6000; // 6 seconds to reset WiFi
+int countdownSeconds = 0;
 
 #define WIFI_RSSI_THRESHOLD -80  // RSSI threshold to trigger reconnection (dBm)
 #define WIFI_CHECK_INTERVAL 300000 // Check WiFi signal strength every 5 minutes
@@ -207,35 +212,87 @@ void configModeCallback(AsyncWiFiManager *myWiFiManager) {
 }
 
 void handleButton() {
-  // Read the button state
   int reading = digitalRead(buttonPin);
-
-  // Check if the button state has changed
+  
+  // Debounce logic
   if (reading != lastButtonState) {
-    lastDebounceTime = millis(); // Reset the debounce timer
+    lastDebounceTime = millis();
   }
-
-  // If the debounce delay has passed and the state is stable
+  
   if ((millis() - lastDebounceTime) > debounceDelay) {
-    // If the state is different from the previous stable state
     if (reading != buttonState) {
       buttonState = reading;
-
-      // Only act on the falling edge (button pressed)
+      
+      // Button just pressed (falling edge)
       if (buttonState == LOW) {
-        // Increment mode and wrap around
-        displayMode = (displayMode + 1) % 4;
+        if (!buttonHolding) {
+          // Start hold timer
+          buttonHoldStartTime = millis();
+          buttonHolding = true;
+          countdownSeconds = WIFI_RESET_HOLD_TIME / 1000; // Start countdown from 6
+        }
+      }
+      // Button just released (rising edge)
+      else if (buttonState == HIGH) {
+        if (buttonHolding) {
+          // Button was released before hold time completed
+          buttonHolding = false;
+          countdownSeconds = 0;
+          // Return to normal display mode cycling
+          displayMode = (displayMode + 1) % 4;
+        }
       }
     }
   }
-
-  // Save the reading for next loop
+  
+  // Handle button hold timing and countdown
+  if (buttonHolding && buttonState == LOW) {
+    unsigned long holdDuration = millis() - buttonHoldStartTime;
+    int newCountdown = (WIFI_RESET_HOLD_TIME - holdDuration) / 1000;
+    
+    // Update countdown display
+    if (newCountdown != countdownSeconds && newCountdown >= 0) {
+      countdownSeconds = newCountdown;
+    }
+    
+    // Check if hold time has been reached
+    if (holdDuration >= WIFI_RESET_HOLD_TIME) {
+      // Reset WiFi configuration
+      dbgln("[Button] WiFi reset triggered by 6-second hold");
+      wm.resetSettings();
+      
+      // Reset button state
+      buttonHolding = false;
+      countdownSeconds = 0;
+      
+      // Restart ESP32 to apply changes
+      ESP.restart();
+    }
+  }
+  
   lastButtonState = reading;
 }
 
 void updateDisplay() {
     dbgln("Updating display...");
-    if (wattsRegisterAddress != -1) {
+    
+    u8g2.clearBuffer();
+    
+    // Check if we're in button hold countdown mode
+    if (buttonHolding && countdownSeconds > 0) {
+        // Show WiFi reset countdown in the lower area to avoid color bands
+        u8g2.setFont(u8g2_font_ncenB14_tr);
+        u8g2.drawStr(0, 40, "WiFi Reset");
+        
+        char countdownBuffer[32];
+        snprintf(countdownBuffer, sizeof(countdownBuffer), "Hold: %d", countdownSeconds);
+        u8g2.drawStr(0, 55, countdownBuffer);
+        
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawStr(0, 64, "Release to cancel");
+    }
+    else if (wattsRegisterAddress != -1) {
+        // Normal display mode
         // Get the "Watts" value from the Modbus cache
         float wattsValue = modbusCache->getRegisterScaledValue(wattsRegisterAddress);
         static char ssidBuffer[64];
@@ -243,7 +300,6 @@ void updateDisplay() {
         snprintf(ssidBuffer, sizeof(ssidBuffer), "SSID: %s", WiFi.SSID().c_str());
         snprintf(ipBuffer, sizeof(ipBuffer), "IP: %s", WiFi.localIP().toString().c_str());
 
-        u8g2.clearBuffer();
         u8g2.setFont(u8g2_font_ncenB14_tr);
 
         // Display the wattage if data is operational, otherwise show "No Data"
@@ -261,9 +317,9 @@ void updateDisplay() {
         // Display WiFi SSID and IP address
         u8g2.drawStr(0, 45, ssidBuffer);
         u8g2.drawStr(0, 60, ipBuffer);
-
-        u8g2.sendBuffer();
     }
+    
+    u8g2.sendBuffer();
 }
 
 // Declare these functions as non-static so they can be accessed from other files
@@ -732,6 +788,9 @@ void loop() {
             delay(10); // Give extra time to WiFi stack during recovery
         }
     }
+    
+    // Handle button input
+    handleButton();
     
     // Update the OLED
     if (currentTime - lastUpdateTime >= 200) {

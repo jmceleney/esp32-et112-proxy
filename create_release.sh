@@ -40,8 +40,11 @@ if [ -n "$uncommitted_files" ]; then
     fi
 fi
 
-# Get current version tag
-current_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+# Get current version tag (prefer release tags starting with 'v')
+current_tag=$(git tag -l 'v*' --sort=-version:refname | head -1)
+if [ -z "$current_tag" ]; then
+    current_tag="v0.0.0"
+fi
 print_color $GREEN "Current version: $current_tag"
 
 # Parse current version (assuming vMAJOR.MINOR.PATCH format)

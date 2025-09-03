@@ -1,8 +1,10 @@
 #include "pages.h"
+#include "system_utils.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <atomic>
 #include <map>
+#include <LittleFS.h>
 
 
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
@@ -86,6 +88,12 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     response += String("esp_uptime_seconds ") + String(uptime) + "\n";
     response += String("esp_rssi ") + String(WiFi.RSSI()) + "\n";
     response += String("esp_heap_free_bytes ") + String(ESP.getFreeHeap()) + "\n";
+
+    CPULoadInfo cpuLoad = getCPULoad();
+    if (cpuLoad.isValid) {
+        response += String("esp_cpu0_load_percent ") + String(cpuLoad.core0Load, 2) + "\n";
+        response += String("esp_cpu1_load_percent ") + String(cpuLoad.core1Load, 2) + "\n";
+    }
 
     // Modbus metrics
     ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
@@ -221,263 +229,8 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
           }
       }
   });
-  server->on("/", HTTP_GET, [config](AsyncWebServerRequest *request){
-    logHeapMemory("/");
 
-    // Prepare to send an HTML response stream
-    AsyncResponseStream *response = request->beginResponseStream("text/html");
-
-    // Send the header with the hostname and title
-    String hostname = WiFi.getHostname();  // Fetch the hostname
-    sendResponseHeader(response, "Main Menu", false, hostname);
-
-    sendButton(response, "Status", "status");
-    sendButton(response, "Config", "config");
-    sendButton(response, "Debug", "debug");
-    sendButton(response, "Log", "log");
-    sendButton(response, "Firmware update", "update");
-    sendButton(response, "WiFi reset", "wifi", "r");
-    sendButton(response, "Reboot", "reboot", "r");
-    sendResponseTrailer(response);
-    request->send(response);
-  });
-
-  server->on("/status", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
-    logHeapMemory("/status");
-    
-    // Yield to prevent watchdog timeout
-    yield();
-    
-    // Check if we can accept more connections
-    if (!canAcceptConnection()) {
-      request->send(503, "text/plain", "Server busy, try again later");
-      return;
-    }
-
-    // Prepare to send an HTML response stream
-    AsyncResponseStream *response = request->beginResponseStream("text/html");
-
-    // Send the header with the hostname and title
-    String hostname = WiFi.getHostname();  // Fetch the hostname
-    sendResponseHeader(response, "Status", false, hostname);
-
-    // Yield to prevent watchdog timeout
-    yield();
-    
-    // Send the content of the status page
-    response->print(
-      R"rawliteral(
-      <script>
-        function fetchData() {
-          fetch('/status.json')
-            .then(response => response.json())
-            .then(data => {
-                // Create two-column layout
-                const contentDiv = document.getElementById('content');
-                
-                // Clear existing content
-                const oldTable = document.getElementById('statusTable');
-                const oldLeftPanel = document.getElementById('leftPanel');
-                const oldRightPanel = document.getElementById('rightPanel');
-                
-                if (oldTable) oldTable.remove();
-                if (oldLeftPanel) oldLeftPanel.remove();
-                if (oldRightPanel) oldRightPanel.remove();
-                
-                // Create the two-column container
-                const container = document.createElement('div');
-                container.style.display = 'flex';
-                container.style.flexWrap = 'wrap';
-                container.style.gap = '20px';
-                container.style.width = '100%';
-                
-                // Create left panel for single-value metrics
-                const leftPanel = document.createElement('div');
-                leftPanel.id = 'leftPanel';
-                leftPanel.style.flex = '1';
-                leftPanel.style.minWidth = '300px';
-                
-                // Create table for left panel
-                const leftTable = document.createElement('table');
-                leftTable.style.width = '100%';
-                leftTable.style.borderCollapse = 'collapse';
-                
-                // Create right panel for metrics with Value/Low/High
-                const rightPanel = document.createElement('div');
-                rightPanel.id = 'rightPanel';
-                rightPanel.style.flex = '1';
-                rightPanel.style.minWidth = '300px';
-                
-                // Create table for right panel
-                const rightTable = document.createElement('table');
-                rightTable.style.width = '100%';
-                rightTable.style.borderCollapse = 'collapse';
-                
-                // Add header row to right table
-                const rightHeader = rightTable.createTHead();
-                const rightHeaderRow = rightHeader.insertRow(0);
-                const rightHeaders = ["Name", "Value", "Low", "High"];
-                rightHeaders.forEach(headerText => {
-                    const cell = rightHeaderRow.insertCell(-1);
-                    cell.textContent = headerText;
-                    cell.style.fontWeight = 'bold';
-                    cell.style.padding = '5px';
-                    cell.style.textAlign = 'left';
-                    cell.style.borderBottom = '1px solid #ddd';
-                });
-                
-                // Create table bodies
-                const leftTbody = leftTable.createTBody();
-                const rightTbody = rightTable.createTBody();
-                
-                // Process data and add to appropriate tables
-                data.data.forEach(item => {
-                    // Check if item has low and high values that are not empty
-                    const hasLowHigh = item.low !== undefined && item.high !== undefined && 
-                                       item.low !== "" && item.high !== "";
-                    
-                    if (hasLowHigh) {
-                        // Add to right panel (Value/Low/High metrics)
-                        const row = rightTbody.insertRow(-1);
-                        const cellName = row.insertCell(0);
-                        const cellValue = row.insertCell(1);
-                        const cellLow = row.insertCell(2);
-                        const cellHigh = row.insertCell(3);
-                        
-                        cellName.textContent = item.name;
-                        cellValue.textContent = item.value;
-                        cellLow.textContent = item.low;
-                        cellHigh.textContent = item.high;
-                        
-                        // Apply styling
-                        [cellName, cellValue, cellLow, cellHigh].forEach(cell => {
-                            cell.style.padding = '5px';
-                            cell.style.borderBottom = '1px solid #eee';
-                        });
-                        
-                        // Check if the current row is for the BSSID
-                        if (item.name === "ESP BSSID") {
-                            appendBssidCompany(cellValue, item.value);
-                        }
-                    } else {
-                        // Add to left panel (single-value metrics)
-                        const row = leftTbody.insertRow(-1);
-                        const cellName = row.insertCell(0);
-                        const cellValue = row.insertCell(1);
-                        
-                        cellName.textContent = item.name + ":";
-                        cellValue.textContent = item.value;
-                        
-                        // Apply styling
-                        cellName.style.padding = '5px';
-                        cellName.style.fontWeight = 'bold';
-                        cellValue.style.padding = '5px';
-                        row.style.borderBottom = '1px solid #eee';
-                        
-                        // Check if the current row is for the BSSID
-                        if (item.name === "ESP BSSID") {
-                            appendBssidCompany(cellValue, item.value);
-                        }
-                    }
-                });
-                
-                // Add tables to panels
-                leftPanel.appendChild(leftTable);
-                rightPanel.appendChild(rightTable);
-                
-                // Add panels to container
-                container.appendChild(leftPanel);
-                container.appendChild(rightPanel);
-                
-                // Add container to content div
-                contentDiv.insertBefore(container, contentDiv.firstChild);
-            })
-            .catch(error => console.error('Error:', error));
-        }
-
-        // Debouncing for BSSID requests
-        const bssidRequestQueue = new Map();
-        let bssidRequestTimer = null;
-        
-        function appendBssidCompany(cell, bssid) {
-          // Check if the BSSID is already cached with expiry
-          const cachedData = localStorage.getItem(`bssid-${bssid}`);
-          if (cachedData) {
-              try {
-                  const data = JSON.parse(cachedData);
-                  const cacheAge = Date.now() - (data.timestamp || 0);
-                  // Use cached data if less than 24 hours old
-                  if (cacheAge < 24 * 60 * 60 * 1000) {
-                      cell.textContent += ` (${data.company})`;
-                      return;
-                  }
-              } catch (e) {
-                  // Invalid cache data, remove it
-                  localStorage.removeItem(`bssid-${bssid}`);
-              }
-          }
-
-          // Add to request queue for debouncing
-          bssidRequestQueue.set(bssid, cell);
-          
-          // Clear existing timer and set new one
-          if (bssidRequestTimer) clearTimeout(bssidRequestTimer);
-          bssidRequestTimer = setTimeout(processBssidRequests, 500); // 500ms debounce
-        }
-        
-        function processBssidRequests() {
-          // Process all queued BSSID requests
-          const requests = Array.from(bssidRequestQueue.entries());
-          bssidRequestQueue.clear();
-          
-          requests.forEach(([bssid, cell]) => {
-              // Fetch the MAC lookup asynchronously
-              fetch(`/lookup?bssid=${bssid}`)
-                  .then(response => response.json())
-                  .then(data => {
-                      if (data.success && data.found) {
-                          const company = data.company;
-                          // Cache the result in localStorage with timestamp
-                          localStorage.setItem(`bssid-${bssid}`, JSON.stringify({ 
-                              company: company,
-                              timestamp: Date.now()
-                          }));
-
-                          // Update the cell with the company name
-                          cell.textContent += ` (${company})`;
-                      } else {
-                          console.warn(`No data found for BSSID: ${bssid}`);
-                      }
-                  })
-                  .catch(error => console.error('MAC Lookup Error:', error));
-          });
-        }
-
-        // Optimized refresh interval - reduced from 3 to 5 seconds
-        setInterval(fetchData, 5000); // Refresh every 5 seconds
-        document.addEventListener('DOMContentLoaded', fetchData); // Initial fetch
-      </script>
-      <div id="content">
-        <p></p>
-        <form method="get" action="/">
-          <button class="">Back</button>
-        </form>
-        <p></p>
-      )rawliteral"
-    );
-
-    // Send the response trailer (closing tags)
-    sendResponseTrailer(response);
-
-    // Yield before sending the response
-    yield();
-    
-    // Send the final response
-    request->send(response);
-    
-    // Release the connection count
-    releaseConnection();
-  });
+  // Legacy home route removed - now handled by Preact SPA
 
   // Endpoint to serve JSON data
   server->on("/status.json", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
@@ -545,6 +298,13 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     addSystemInfo("ESP Subnet Mask", WiFi.subnetMask().toString());
     addSystemInfo("ESP Gateway", WiFi.gatewayIP().toString());
     addSystemInfo("ESP BSSID", WiFi.BSSIDstr());
+
+    CPULoadInfo cpuLoad = getCPULoad();
+    if (cpuLoad.isValid) {
+        addSystemInfo("ESP CPU Core 0 Load", String(cpuLoad.core0Load, 1) + "%");
+        addSystemInfo("ESP CPU Core 1 Load", String(cpuLoad.core1Load, 1) + "%");
+    }
+
     ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
     addSystemInfo("Primary RTU Messages", String(rtu->getMessageCount()));
     addSystemInfo("Primary RTU Pending Messages", String(rtu->pendingRequests()));
@@ -1457,9 +1217,47 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     request->send(200, "text/plain", "OK");
   });
 
-  server->onNotFound([](AsyncWebServerRequest *request){
-    dbg("[webserver] request to ");dbg(request->url());dbgln(" not found");
-    request->send(404, "text/plain", "404");
+  // Catch all route for SPA - redirect to modern UI for unhandled routes
+  server->onNotFound([](AsyncWebServerRequest *request) {
+      String path = request->url();
+      
+      // Skip API routes and existing legacy routes
+      if (path.startsWith("/api") || path.startsWith("/metrics") || 
+          path.startsWith("/config") || 
+          path.startsWith("/debug") || path.startsWith("/log") || 
+          path.startsWith("/update") || path.startsWith("/wifi") || 
+          path.startsWith("/reboot") || path.startsWith("/style.css") || 
+          path.startsWith("/favicon.ico") || path.startsWith("/baudrate") ||
+          path.startsWith("/menu")) {
+          // Let the default 404 handler handle these
+          request->send(404, "text/plain", "404");
+          return;
+      }
+
+      // Check if it's a static web asset request
+      if (path.startsWith("/web/assets/") || path.startsWith("/assets/")) {
+          // Try to serve the file from LittleFS with proper MIME type
+          String filePath = path.startsWith("/web/") ? path : "/web" + path;
+          if (LittleFS.exists(filePath)) {
+              String contentType = "text/plain";
+              if (path.endsWith(".js")) {
+                  contentType = "application/javascript";
+              } else if (path.endsWith(".css")) {
+                  contentType = "text/css";
+              } else if (path.endsWith(".json")) {
+                  contentType = "application/json";
+              }
+              request->send(LittleFS, filePath, contentType);
+              return;
+          }
+      }
+
+      // For all other routes, serve the Preact SPA
+      if (LittleFS.exists("/web/index.html")) {
+          request->send(LittleFS, "/web/index.html", "text/html");
+      } else {
+          request->send(404, "text/plain", "Web UI not found - please upload filesystem");
+      }
   });
 }
 

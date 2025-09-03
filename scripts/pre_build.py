@@ -121,4 +121,55 @@ try:
 except Exception as e:
     debug_log(f"Failed to add build flag: {e}")
 
+# Build frontend if it exists and has changed
+def build_frontend():
+    """Build the Preact frontend if necessary"""
+    web_dir = "web"
+    data_dir = "data"
+    
+    # Check if web directory exists
+    if not os.path.exists(web_dir):
+        debug_log("No web directory found, skipping frontend build")
+        return
+    
+    # Check if package.json exists
+    package_json = os.path.join(web_dir, "package.json")
+    if not os.path.exists(package_json):
+        debug_log("No package.json found in web directory, skipping frontend build")
+        return
+    
+    debug_log("Frontend directory detected, checking if build is needed")
+    
+    # Create data directory if it doesn't exist
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+        debug_log("Created data directory")
+    
+    # Check if node_modules exists, if not install dependencies
+    node_modules_dir = os.path.join(web_dir, "node_modules")
+    if not os.path.exists(node_modules_dir):
+        debug_log("Installing frontend dependencies...")
+        try:
+            subprocess.run(["npm", "install"], cwd=web_dir, check=True)
+            debug_log("Frontend dependencies installed successfully")
+        except subprocess.CalledProcessError as e:
+            debug_log(f"Failed to install frontend dependencies: {e}")
+            return
+        except FileNotFoundError:
+            debug_log("npm not found, skipping frontend build")
+            return
+    
+    # Build the frontend
+    debug_log("Building frontend...")
+    try:
+        subprocess.run(["npm", "run", "build"], cwd=web_dir, check=True)
+        debug_log("Frontend built successfully")
+    except subprocess.CalledProcessError as e:
+        debug_log(f"Frontend build failed: {e}")
+    except FileNotFoundError:
+        debug_log("npm not found, skipping frontend build")
+
+# Build frontend
+build_frontend()
+
 debug_log("Pre-build script completed successfully")

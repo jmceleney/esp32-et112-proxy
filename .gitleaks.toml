@@ -51,4 +51,6 @@ paths = [
     '''CLAUDE\.md''',
     '''README\.md''',
     '''stream\.py''',  # Test file with commented IPs
+    '''web/.*''',  # Web interface with placeholder IPs
+    '''data/web/.*''',  # Built web assets with placeholder IPs
 ]

@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <Logging.h>
 #include <U8g2lib.h>
+#include <LittleFS.h>
 #include "ModbusCache.h"
 #include "config.h"
 #include "pages.h"
@@ -176,6 +177,9 @@ bool inConfigPortal = false; // Track if we're in config portal mode
 // Removed WiFi mutex - simplified event handling
 
 void WiFiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
+    static char ipBuffer[32];
+    String hostname;
+    
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_CONNECTED:
             dbgln("[WiFi] Connected to AP");
@@ -187,15 +191,20 @@ void WiFiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
             dbgln("[WiFi] Disconnected from AP");
             wifiDisconnectDetected = true;
             wifiConnected = false;
+            // Stop mDNS when WiFi disconnects to prevent UDP errors
+            MDNS.end();
+            dbgln("[mDNS] Stopped due to WiFi disconnect");
             break;
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-            static char ipBuffer[32];
-        snprintf(ipBuffer, sizeof(ipBuffer), "[WiFi] Got IP: %s", WiFi.localIP().toString().c_str());
-        dbgln(ipBuffer);
+            snprintf(ipBuffer, sizeof(ipBuffer), "[WiFi] Got IP: %s", WiFi.localIP().toString().c_str());
+            dbgln(ipBuffer);
             wifiConnected = true;
             if (lastWiFiConnectionTime == 0) {
                 lastWiFiConnectionTime = millis();
             }
+            // Only initialize mDNS if not already running
+            // mDNS will be initialized in setup() after first connection
+            // Reinitializing causes UDP socket conflicts (error 9)
             break;
         default:
             break;
@@ -528,6 +537,14 @@ void setup() {
     dbgln("[config] load");
     prefs.begin("modbusRtuGw");
     config.begin(&prefs);
+    
+    // Initialize LittleFS for serving web files
+    dbgln("[filesystem] initializing LittleFS");
+    if (!LittleFS.begin()) {
+        dbgln("[filesystem] LittleFS mount failed");
+    } else {
+        dbgln("[filesystem] LittleFS mounted successfully");
+    }
     pinMode(buttonPin, INPUT_PULLUP); // Use internal pull-up resistor
 
     u8g2.begin();
@@ -632,6 +649,19 @@ void setup() {
         static char connBuffer[128];
         snprintf(connBuffer, sizeof(connBuffer), "[WiFi] Connected to: %s (RSSI: %ddBm)", WiFi.SSID().c_str(), WiFi.RSSI());
         dbgln(connBuffer);
+    }
+    
+    // Initialize mDNS service after WiFi connection
+    if (WiFi.status() == WL_CONNECTED) {
+        String hostname = config.getHostname();
+        if (MDNS.begin(hostname.c_str())) {
+            dbgln("[mDNS] Started with hostname: " + hostname);
+            // Add service to advertise
+            MDNS.addService("http", "tcp", 80);
+            MDNS.addService("modbus", "tcp", 502);
+        } else {
+            logErrln("[mDNS] Failed to start");
+        }
     }
 
     dbgln("[wifi] finished");
@@ -853,10 +883,9 @@ void loop() {
         yield(); // Give WiFi stack CPU time after I2C OLED operations
     }
 
-    // Only process WiFiManager when WiFi is stable to avoid conflicts
-    if (WiFi.status() == WL_CONNECTED && !inConfigPortal) {
-        wm.loop(); // Non-blocking WiFiManager process
-    }
+    // WiFiManager loop only needed during config portal mode
+    // Calling wm.loop() when connected causes DNS UDP socket errors
+    // The DNSServer is only valid during captive portal operation
     yield(); // Give WiFi stack CPU time
     
     // Add small delay to ensure WiFi stack gets enough time

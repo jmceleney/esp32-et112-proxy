@@ -21,12 +21,33 @@ pio run -e esp32release
 # Upload firmware to ESP32
 pio run -e esp32debug -t upload
 
+# Upload filesystem (web files) to ESP32 - REQUIRED for web UI
+pio run -e esp32debug -t uploadfs
+
+# Complete build and upload (firmware + filesystem)
+pio run -e esp32debug -t upload && pio run -e esp32debug -t uploadfs
+
 # Monitor serial output
 pio run -e esp32debug -t monitor
 
 # Clean build files
 pio run -t clean
 ```
+
+### Web Interface
+
+The ESP32 serves a modern Preact-based web interface with:
+- Real-time power monitoring dashboard at `/` (or `/app`)
+- Auto-updating metrics (Watts, Amps, Volts) refreshing every 2 seconds
+- Modern responsive design with mobile support  
+- All configuration and debug interfaces accessible from navigation
+
+**Important**: After making changes to the web interface (`web/` directory), you must upload the filesystem:
+```bash
+pio run -e esp32debug -t uploadfs
+```
+
+The web files are served from the ESP32's LittleFS filesystem, not embedded in firmware.
 
 ## Architecture
 

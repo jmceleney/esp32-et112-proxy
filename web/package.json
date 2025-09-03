@@ -1,0 +1,21 @@
+{
+  "name": "esp32-et112-proxy-web",
+  "version": "1.0.0",
+  "description": "Modern Preact UI for ESP32 ET112 Modbus Proxy",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "preact": "^10.19.3",
+    "preact-router": "^4.1.2"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.7.0",
+    "vite": "^5.0.12",
+    "vite-plugin-compression": "^0.5.1"
+  }
+}

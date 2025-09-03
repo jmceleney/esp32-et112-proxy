@@ -16,6 +16,7 @@
 *.bin
 *.elf
 *.hex
+data/
 
 # Backup files
 *.bak

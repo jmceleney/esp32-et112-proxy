@@ -44,3 +44,19 @@ tools/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Security - Sensitive files
+*.env
+.env.*
+secrets/
+credentials.json
+*.key
+*.pem
+*.p12
+*.pfx
+private/
+config.secret.json
+
+# Gitleaks
+gitleaks-report.json
+gitleaks-report.sarif

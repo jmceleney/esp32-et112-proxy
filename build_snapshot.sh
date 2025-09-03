@@ -27,6 +27,21 @@ echo "===================================================="
 echo "Building project with environment: $ENVIRONMENT"
 echo "===================================================="
 
+# Run security scan before building
+echo "Running security scan with gitleaks..."
+if command -v gitleaks &> /dev/null; then
+    gitleaks detect --source . --verbose
+    if [ $? -ne 0 ]; then
+        echo "❌ Security scan failed! Secrets detected in repository."
+        echo "Please remove secrets before building. Check gitleaks output above."
+        exit 1
+    fi
+    echo "✅ Security scan passed - no secrets detected"
+else
+    echo "⚠️  Warning: gitleaks not installed - skipping security scan"
+    echo "   Install with: wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz -O - | tar -xz && sudo mv gitleaks /usr/local/bin/"
+fi
+
 # Make sure we're in a clean state first
 echo "Checking git status..."
 git status

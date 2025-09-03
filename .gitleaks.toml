@@ -1,0 +1,53 @@
+# Gitleaks configuration for ESP32 ET112 Proxy
+# https://github.com/gitleaks/gitleaks
+
+[extend]
+# Use the default gitleaks configuration
+useDefault = true
+
+[allowlist]
+# Project-specific allowlist
+description = "ESP32 ET112 Proxy allowlist"
+
+# Allow paths that might trigger false positives
+paths = [
+    '''.pio/''',
+    '''\.git/''',
+    '''LICENSE''',
+    '''\.gitleaks\.toml''',
+    '''docs/.*\.md''',
+]
+
+# Allow specific patterns that are safe in this context
+regexes = [
+    # WiFiManager getters (not hardcoded secrets)
+    '''wm\.getWiFi(Pass|SSID)\(\)''',
+    # Token references in ModbusCache (not auth tokens)
+    '''tokenList|tokens\.size\(\)|token\s*=\s*\d+''',
+    # Common ESP32 preference keys (not actual secrets)
+    '''preferences\.(get|put)String\("(ssid|password)"''',
+]
+
+[[rules]]
+# Custom rule for ESP32 hardcoded WiFi credentials
+id = "esp32-wifi-hardcoded"
+description = "Hardcoded WiFi credentials in ESP32 code"
+regex = '''WiFi\.(begin|softAP)\s*\(\s*"[^"]+"\s*,\s*"[^"]+"\s*\)'''
+tags = ["wifi", "esp32", "hardcoded"]
+secretGroup = 2
+
+[[rules]]
+# Custom rule for hardcoded IP addresses (excluding documentation)
+id = "hardcoded-ip"
+description = "Hardcoded IP addresses (potential security issue)"
+regex = '''(192\.168\.[0-9]{1,3}\.[0-9]{1,3}|10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})'''
+[rules.allowlist]
+# Allow common ESP32 AP default IP
+regexes = [
+    '''192\.168\.4\.1''',  # ESP32 default AP IP
+]
+paths = [
+    '''docs/.*''',
+    '''CLAUDE\.md''',
+    '''README\.md''',
+]

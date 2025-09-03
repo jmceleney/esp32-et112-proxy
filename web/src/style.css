@@ -420,6 +420,22 @@ body {
 .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem; }
 .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.5rem; }
 
+/* Power Metrics Grid - Custom layout with center emphasis */
+.power-metrics-grid {
+  display: grid;
+  grid-template-columns: 0.7fr 1fr 0.7fr;
+  gap: 1.5rem;
+  align-items: center;
+}
+
+.metric-card-small {
+  transform: scale(0.95);
+}
+
+.metric-card-large {
+  z-index: 1;
+}
+
 .text-center { text-align: center; }
 .text-muted { color: var(--text-muted); }
 .text-sm { font-size: 0.875rem; }
@@ -446,6 +462,7 @@ body {
 @media (max-width: 1024px) {
   .grid-4 { grid-template-columns: repeat(2, 1fr); }
   .grid-3 { grid-template-columns: repeat(2, 1fr); }
+  .power-metrics-grid { grid-template-columns: 0.75fr 1fr 0.75fr; }
 }
 
 @media (max-width: 768px) {
@@ -483,6 +500,14 @@ body {
   
   .grid-2, .grid-3, .grid-4 {
     grid-template-columns: 1fr;
+  }
+  
+  .power-metrics-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .metric-card-small {
+    transform: none;
   }
   
   .metric-value {

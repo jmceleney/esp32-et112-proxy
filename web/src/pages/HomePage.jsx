@@ -29,14 +29,20 @@ export function HomePage() {
       });
 
       // Extract key metrics with proper parsing
+      const parseNumericValue = (value) => {
+        if (!value) return null;
+        const parsed = parseFloat(value);
+        return isNaN(parsed) ? null : parsed;
+      };
+
       setMetrics({
-        voltage: parseFloat(metricsMap['Volts']?.replace(' V', '')) || null,
-        current: parseFloat(metricsMap['Amps']?.replace(' A', '')) || null,
-        power: parseFloat(metricsMap['Watts']?.replace(' W', '')) || null,
-        frequency: parseFloat(metricsMap['Frequency']?.replace(' Hz', '')) || null,
+        voltage: parseNumericValue(metricsMap['Volts']?.replace(' V', '')),
+        current: parseNumericValue(metricsMap['Amps']?.replace(' A', '')),
+        power: parseNumericValue(metricsMap['Watts']?.replace(' W', '')),
+        frequency: parseNumericValue(metricsMap['Frequency']?.replace(' Hz', '')),
         uptime: metricsMap['ESP Uptime'] || null,
-        cpuCore0: parseFloat(metricsMap['ESP CPU Core 0 Load']?.replace('%', '')) || null,
-        cpuCore1: parseFloat(metricsMap['ESP CPU Core 1 Load']?.replace('%', '')) || null
+        cpuCore0: parseNumericValue(metricsMap['ESP CPU Core 0 Load']?.replace('%', '')),
+        cpuCore1: parseNumericValue(metricsMap['ESP CPU Core 1 Load']?.replace('%', ''))
       });
 
       setError(null);
@@ -61,6 +67,7 @@ export function HomePage() {
 
   const formatValue = (value, unit, precision = 1) => {
     if (value === null || value === undefined) return '---';
+    if (value === 0) return `0${unit}`;
     return `${value.toFixed(precision)}${unit}`;
   };
 
@@ -109,18 +116,9 @@ export function HomePage() {
       )}
 
       {/* Power Metrics Grid */}
-      <div class="grid-3">
-        {/* Voltage */}
-        <div class="card metric-card" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%);">
-          <div class="card-title">Voltage</div>
-          <div class="metric-value">
-            {loading ? '---' : formatValue(metrics.voltage, '', 1)}
-          </div>
-          <div class="metric-unit">Volts</div>
-        </div>
-
+      <div class="power-metrics-grid">
         {/* Current */}
-        <div class="card metric-card" style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);">
+        <div class="card metric-card metric-card-small" style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);">
           <div class="card-title">Current</div>
           <div class="metric-value">
             {loading ? '---' : formatValue(metrics.current, '', 2)}
@@ -129,12 +127,21 @@ export function HomePage() {
         </div>
 
         {/* Power */}
-        <div class="card metric-card" style="background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);">
+        <div class="card metric-card metric-card-large" style="background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);">
           <div class="card-title">Active Power</div>
           <div class="metric-value">
             {loading ? '---' : formatValue(metrics.power, '', 0)}
           </div>
           <div class="metric-unit">Watts</div>
+        </div>
+
+        {/* Voltage */}
+        <div class="card metric-card metric-card-small" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%);">
+          <div class="card-title">Voltage</div>
+          <div class="metric-value">
+            {loading ? '---' : formatValue(metrics.voltage, '', 1)}
+          </div>
+          <div class="metric-unit">Volts</div>
         </div>
       </div>
 

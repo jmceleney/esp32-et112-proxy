@@ -1361,21 +1361,8 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     sendResponseTrailer(response);
     request->send(response);
   });
-  server->on("/update", HTTP_GET, [config](AsyncWebServerRequest *request){
-    logHeapMemory("/update");
-    const String &hostname = config->getHostname();
-    auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Firmware Update", false, hostname);
-    response->print("<form method=\"post\" enctype=\"multipart/form-data\">"
-      "<input type=\"file\" name=\"file\" id=\"file\" required/>"
-      "<p></p>"
-      "<button class=\"r\">Upload</button>"
-      "</form>"
-      "<p></p>");
-    sendButton(response, "Back", "/");
-    sendResponseTrailer(response);
-    request->send(response);
-  });
+
+  // OTA Upload endpoint for Preact frontend (POST only - no legacy HTML GET)
   server->on("/update", HTTP_POST, [config](AsyncWebServerRequest *request){
     String hostname = config->getHostname();
     dbgln("[webserver] Adaptive OTA finished");
@@ -1563,6 +1550,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       dbgln("[webserver] Adaptive OTA finalized successfully");
     }
   });
+
   server->on("/wifi", HTTP_GET, [config](AsyncWebServerRequest *request){
     logHeapMemory("/wifi");
     auto *response = request->beginResponseStream("text/html");
@@ -1725,7 +1713,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       if (path.startsWith("/api") || path.startsWith("/metrics") || 
           path.startsWith("/config") || 
           path.startsWith("/debug") || path.startsWith("/log") || 
-          path.startsWith("/update") || path.startsWith("/wifi") || 
+          path.startsWith("/wifi") || 
           path.startsWith("/reboot") || path.startsWith("/style.css") || 
           path.startsWith("/favicon.ico") || path.startsWith("/baudrate") ||
           path.startsWith("/menu")) {

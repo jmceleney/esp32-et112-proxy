@@ -150,17 +150,6 @@ export function StatusPage() {
         {renderMetricsTable(statusData.data, "Energy Metrics")}
       </div>
 
-      <div class="card">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-          <h3 class="card-title" style="margin: 0;">Raw Status Data</h3>
-          <button class="btn btn-primary" onClick={fetchStatusData}>
-            🔄 Refresh
-          </button>
-        </div>
-        <pre style="background: #f8f9fa; padding: 1rem; border-radius: 4px; overflow-x: auto; font-size: 0.875rem;">
-          {JSON.stringify(statusData, null, 2)}
-        </pre>
-      </div>
     </div>
   );
 }

@@ -20,17 +20,19 @@ if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
     exit 1
 fi
 
-# Check for uncommitted changes
-if ! git diff-index --quiet HEAD --; then
+# Check for uncommitted changes (excluding auto-generated files)
+uncommitted_files=$(git diff-index --name-only HEAD -- | grep -v "include/version.h" | grep -v "pre_build_debug.log")
+if [ -n "$uncommitted_files" ]; then
     print_color $YELLOW "Warning: You have uncommitted changes"
-    echo "Current status:"
-    git status --short
+    echo "Files to commit:"
+    echo "$uncommitted_files" | sed 's/^/  /'
     echo ""
     read -p "Do you want to commit these changes first? (y/n) " -n 1 -r
     echo ""
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         read -p "Enter commit message: " commit_msg
-        git add -A
+        # Add all files except auto-generated ones
+        echo "$uncommitted_files" | xargs git add
         git commit -m "$commit_msg"
     else
         print_color $RED "Please commit or stash your changes before creating a release"

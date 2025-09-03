@@ -58,6 +58,19 @@ def git_get_tag():
     debug_log(f"Git tag: {tag}")
     return tag
 
+def git_get_exact_tag():
+    """Get exact tag on current commit (not just latest)"""
+    tag = run_command("git describe --exact-match --tags HEAD 2>/dev/null || echo ''")
+    debug_log(f"Exact git tag: {tag}")
+    return tag
+
+def git_is_release_tag(tag):
+    """Check if tag is a release version (starts with v followed by number)"""
+    import re
+    is_release = bool(re.match(r'^v\d+', tag))
+    debug_log(f"Is release tag '{tag}': {is_release}")
+    return is_release
+
 debug_log("Pre-build script started")
 debug_log(f"Working directory: {os.getcwd()}")
 
@@ -65,20 +78,34 @@ timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 # Default version information if not in a git repo
 version_info = f"Build: {timestamp}"
+exact_tag = ""  # Initialize for non-git scenarios
 
 # Check if we're in a git repository
 if git_is_repo():
     git_hash = git_get_hash()
     git_branch = git_get_branch()
     git_tag = git_get_tag()
+    exact_tag = git_get_exact_tag()
     
-    # Create version string with git information
-    version_info = f"Git: {git_branch}@{git_hash} ({git_tag}) - Build: {timestamp}"
+    # If we're on a release tag, use simplified version string
+    if exact_tag and git_is_release_tag(exact_tag):
+        version_info = f"{exact_tag} - Build: {timestamp}"
+    else:
+        # For development builds, include full git information
+        version_info = f"Git: {git_branch}@{git_hash} ({git_tag}) - Build: {timestamp}"
 
 debug_log(f"Generated version: {version_info}")
 
-# Create header file
-header_content = f'#ifndef VERSION_H\n#define VERSION_H\n#define FIRMWARE_VERSION "{version_info}"\n#endif\n'
+# Create header file with release version if applicable
+release_define = ""
+if exact_tag and git_is_release_tag(exact_tag):
+    release_define = f'#define RELEASE_VERSION "{exact_tag}"\n'
+
+header_content = f'''#ifndef VERSION_H
+#define VERSION_H
+#define FIRMWARE_VERSION "{version_info}"
+{release_define}#endif
+'''
 try:
     with open("include/version.h", "w") as f:
         f.write(header_content)

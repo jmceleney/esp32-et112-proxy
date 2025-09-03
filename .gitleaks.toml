@@ -50,4 +50,5 @@ paths = [
     '''docs/.*''',
     '''CLAUDE\.md''',
     '''README\.md''',
+    '''stream\.py''',  # Test file with commented IPs
 ]

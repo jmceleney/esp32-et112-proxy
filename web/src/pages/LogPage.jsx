@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { api } from '../utils/api';
+import { Play, Pause, Trash2, RotateCcw, AlertTriangle, XCircle, RefreshCw, Lightbulb, FileText } from '../components/Icons';
 
 export function LogPage() {
   const [logs, setLogs] = useState('');
@@ -111,7 +112,7 @@ export function LogPage() {
             onClick={togglePause}
             style="padding: 0.5rem 1rem; font-size: 0.875rem;"
           >
-            {isPaused ? '▶️ Resume' : '⏸️ Pause'}
+            {isPaused ? <><Play size={16} style="margin-right: 0.25rem;" />Resume</> : <><Pause size={16} style="margin-right: 0.25rem;" />Pause</>}
           </button>
           
           <button
@@ -119,7 +120,7 @@ export function LogPage() {
             onClick={clearLogs}
             style="padding: 0.5rem 1rem; font-size: 0.875rem;"
           >
-            🗑️ Clear
+            <Trash2 size={16} style="margin-right: 0.25rem;" />Clear
           </button>
           
           <button
@@ -127,7 +128,7 @@ export function LogPage() {
             onClick={() => fetchLogs(true)}
             style="padding: 0.5rem 1rem; font-size: 0.875rem;"
           >
-            🔄 Refresh
+            <RefreshCw size={16} style="margin-right: 0.25rem;" />Refresh
           </button>
         </div>
       </div>
@@ -135,12 +136,12 @@ export function LogPage() {
       {/* Status indicators */}
       <div style="display: flex; gap: 1rem; margin-bottom: 1rem; font-size: 0.875rem;">
         <div style={`color: ${isPaused ? 'var(--warning-color)' : 'var(--success-color)'};`}>
-          {isPaused ? '⏸️ Paused' : '🔄 Live'}
+          {isPaused ? <><Pause size={16} style="display: inline; margin-right: 0.25rem;" />Paused</> : <><RotateCcw size={16} style="display: inline; margin-right: 0.25rem;" />Live</>}
         </div>
         
         {isOverflow && (
           <div style="color: var(--warning-color);">
-            ⚠️ Buffer overflow - some logs may be missing
+            <AlertTriangle size={16} style="display: inline; margin-right: 0.25rem;" />Buffer overflow - some logs may be missing
           </div>
         )}
         
@@ -149,13 +150,13 @@ export function LogPage() {
         </div>
         
         <div style={`color: ${autoScroll ? 'var(--success-color)' : 'var(--text-muted)'};`}>
-          {autoScroll ? '📄 Auto-scroll ON' : '📄 Auto-scroll OFF'}
+          {autoScroll ? <><FileText size={16} style="display: inline; margin-right: 0.25rem;" />Auto-scroll ON</> : <><FileText size={16} style="display: inline; margin-right: 0.25rem;" />Auto-scroll OFF</>}
         </div>
       </div>
 
       {error && (
         <div class="card" style="background-color: var(--danger-color); color: white; margin-bottom: 1rem;">
-          <p style="margin: 0;">❌ {error}</p>
+          <p style="margin: 0;"><XCircle size={16} style="display: inline; margin-right: 0.25rem;" />{error}</p>
         </div>
       )}
 
@@ -183,7 +184,7 @@ export function LogPage() {
 
       {/* Usage tips */}
       <div style="margin-top: 1rem; padding: 1rem; background-color: var(--light-color); border-radius: 4px; font-size: 0.875rem; color: var(--text-muted);">
-        <h4 style="margin-top: 0;">💡 Tips:</h4>
+        <h4 style="margin-top: 0;"><Lightbulb size={18} style="display: inline; margin-right: 0.25rem;" />Tips:</h4>
         <ul style="margin: 0; padding-left: 1.5rem;">
           <li><strong>Auto-scroll:</strong> Scroll to bottom to enable auto-scroll for new logs</li>
           <li><strong>Pause:</strong> Use pause to stop fetching new logs while investigating</li>

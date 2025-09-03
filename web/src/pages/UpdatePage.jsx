@@ -1,5 +1,6 @@
 import { useState, useRef } from 'preact/hooks';
 import { api } from '../utils/api';
+import { AlertTriangle, XCircle, CheckCircle, FileText, X, Upload, RotateCcw, Trash2, Wrench, FileCheck } from '../components/Icons';
 
 export function UpdatePage() {
   const [selectedFile, setSelectedFile] = useState(null);
@@ -110,7 +111,7 @@ export function UpdatePage() {
       
       {/* Warning */}
       <div class="card" style="background-color: #fff3cd; border: 1px solid #ffeaa7; color: #856404; margin-bottom: 2rem;">
-        <h3 style="margin-top: 0; color: #856404;">⚠️ Important Warning</h3>
+        <h3 style="margin-top: 0; color: #856404;"><AlertTriangle size={20} style="display: inline; margin-right: 0.5rem;" />Important Warning</h3>
         <ul style="margin: 0; padding-left: 1.5rem; line-height: 1.6;">
           <li><strong>Do not disconnect power</strong> during the update process</li>
           <li><strong>Do not close this page</strong> until the update completes</li>
@@ -122,13 +123,13 @@ export function UpdatePage() {
 
       {error && (
         <div class="card" style="background-color: var(--danger-color); color: white; margin-bottom: 1rem;">
-          <p style="margin: 0;">❌ {error}</p>
+          <p style="margin: 0;"><XCircle size={16} style="display: inline; margin-right: 0.25rem;" />{error}</p>
         </div>
       )}
       
       {success && uploadResult && (
         <div class="card" style="background-color: var(--success-color); color: white; margin-bottom: 1rem;">
-          <h3 style="margin-top: 0;">✅ Update Successful!</h3>
+          <h3 style="margin-top: 0;"><CheckCircle size={20} style="display: inline; margin-right: 0.5rem;" />Update Successful!</h3>
           <p style="margin: 0;">{uploadResult.message}</p>
           {uploadResult.details && (
             <div style="margin-top: 1rem; padding: 1rem; background-color: rgba(255,255,255,0.1); border-radius: 4px; font-family: monospace; font-size: 0.875rem; white-space: pre-wrap;">
@@ -161,7 +162,7 @@ export function UpdatePage() {
           <div style="background-color: var(--light-color); padding: 1rem; border-radius: 4px; margin-top: 1rem;">
             <h4 style="margin-top: 0;">Selected File:</h4>
             <div style="display: grid; grid-template-columns: auto 1fr auto; gap: 1rem; align-items: center;">
-              <div>📄</div>
+              <div><FileText size={24} /></div>
               <div>
                 <div style="font-weight: 500;">{selectedFile.name}</div>
                 <div style="font-size: 0.875rem; color: var(--text-muted);">
@@ -174,7 +175,7 @@ export function UpdatePage() {
                 disabled={uploading}
                 style="padding: 0.5rem; font-size: 0.875rem;"
               >
-                ✕
+                <X size={16} />
               </button>
             </div>
           </div>
@@ -184,7 +185,7 @@ export function UpdatePage() {
       {/* Upload Progress */}
       {uploading && (
         <div class="card">
-          <h3 class="card-title">🔄 Uploading Firmware</h3>
+          <h3 class="card-title"><RotateCcw size={18} style="display: inline; margin-right: 0.25rem;" />Uploading Firmware</h3>
           
           <div style="margin-bottom: 1rem;">
             <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
@@ -219,7 +220,7 @@ export function UpdatePage() {
           disabled={!selectedFile || uploading}
           style="flex: 1;"
         >
-          {uploading ? '⏳ Uploading...' : '📤 Start Upload'}
+          {uploading ? <>⏳ Uploading...</> : <><Upload size={16} style="margin-right: 0.25rem;" />Start Upload</>}
         </button>
         
         <button
@@ -227,13 +228,13 @@ export function UpdatePage() {
           onClick={clearSelection}
           disabled={uploading}
         >
-          🗑️ Clear
+          <Trash2 size={16} style="margin-right: 0.25rem;" />Clear
         </button>
       </div>
 
       {/* Information */}
       <div class="card" style="margin-top: 2rem;">
-        <h3 class="card-title">📋 Update Process</h3>
+        <h3 class="card-title"><FileCheck size={18} style="display: inline; margin-right: 0.25rem;" />Update Process</h3>
         
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
           <div>
@@ -258,7 +259,7 @@ export function UpdatePage() {
         </div>
         
         <div style="margin-top: 1.5rem; padding: 1rem; background-color: var(--light-color); border-radius: 4px; font-size: 0.875rem;">
-          <h4 style="margin-top: 0;">🔧 Build Instructions</h4>
+          <h4 style="margin-top: 0;"><Wrench size={18} style="display: inline; margin-right: 0.25rem;" />Build Instructions</h4>
           <p style="margin: 0;">To build firmware for this device:</p>
           <div style="background-color: #1e1e1e; color: #ffffff; padding: 0.75rem; border-radius: 4px; margin-top: 0.5rem; font-family: monospace;">
             # Debug build<br/>

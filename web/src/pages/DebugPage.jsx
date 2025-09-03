@@ -1,5 +1,6 @@
 import { useState } from 'preact/hooks';
 import { api } from '../utils/api';
+import { XCircle, Wrench, CheckCircle, Trash2 } from '../components/Icons';
 
 const MODBUS_FUNCTIONS = {
   1: 'Read Coils',
@@ -112,7 +113,7 @@ export function DebugPage() {
           }
         }
       } else if (cleanLine.includes('Error:')) {
-        results.push(`❌ ${cleanLine}`);
+        results.push(`[ERROR] ${cleanLine}`);
       } else if (cleanLine && !cleanLine.includes('<!DOCTYPE') && !cleanLine.includes('<')) {
         debugInfo.push(cleanLine);
       }
@@ -127,7 +128,7 @@ export function DebugPage() {
       
       {error && (
         <div class="card" style="background-color: var(--danger-color); color: white; margin-bottom: 1rem;">
-          <p style="margin: 0;">❌ {error}</p>
+          <p style="margin: 0;"><XCircle size={16} style="display: inline; margin-right: 0.25rem;" />{error}</p>
         </div>
       )}
 
@@ -202,7 +203,7 @@ export function DebugPage() {
               disabled={loading}
               style="flex: 1;"
             >
-              {loading ? '⏳ Sending...' : '🔧 Send Command'}
+              {loading ? <>⏳ Sending...</> : <><Wrench size={16} style="margin-right: 0.25rem;" />Send Command</>}
             </button>
             
             <button
@@ -210,7 +211,7 @@ export function DebugPage() {
               class="btn btn-danger"
               onClick={clearHistory}
             >
-              🗑️ Clear History
+              <Trash2 size={16} style="margin-right: 0.25rem;" />Clear History
             </button>
           </div>
         </form>
@@ -220,7 +221,7 @@ export function DebugPage() {
       {debugResult && (
         <div class="card">
           <h3 class="card-title">
-            {debugResult.success ? '✅ Command Result' : '❌ Command Failed'}
+            {debugResult.success ? <><CheckCircle size={18} style="display: inline; margin-right: 0.25rem;" />Command Result</> : <><XCircle size={18} style="display: inline; margin-right: 0.25rem;" />Command Failed</>}
           </h3>
           
           <div style="background-color: var(--light-color); padding: 1rem; border-radius: 4px; margin-bottom: 1rem;">
@@ -258,7 +259,7 @@ export function DebugPage() {
                     {item.timestamp} • {item.duration}
                   </div>
                   <div style={`font-size: 0.875rem; font-weight: bold; color: ${item.success ? 'var(--success-color)' : 'var(--danger-color)'};`}>
-                    {item.success ? '✅ Success' : '❌ Failed'}
+                    {item.success ? <><CheckCircle size={14} style="display: inline; margin-right: 0.25rem;" />Success</> : <><XCircle size={14} style="display: inline; margin-right: 0.25rem;" />Failed</>}
                   </div>
                 </div>
                 

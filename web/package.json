@@ -10,6 +10,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "lucide-preact": "^0.542.0",
     "preact": "^10.19.3",
     "preact-router": "^4.1.2"
   },

@@ -1,6 +1,7 @@
 import { Link } from 'preact-router';
 import { useState } from 'preact/hooks';
 import { api } from '../utils/api';
+import { Home, BarChart3, Settings, Wrench, FileText, Upload, Wifi, RotateCcw, AlertTriangle, CheckCircle, XCircle } from './Icons';
 
 export function Navigation({ currentRoute }) {
   const [showWifiDialog, setShowWifiDialog] = useState(false);
@@ -51,22 +52,22 @@ export function Navigation({ currentRoute }) {
           
           <div class="nav-menu">
             <Link class={`nav-link ${isActive('/') ? 'active' : ''}`} href="/">
-              🏠 Home
+              <Home size={18} /> Home
             </Link>
             <Link class={`nav-link ${isActive('/status') ? 'active' : ''}`} href="/status">
-              📊 Status
+              <BarChart3 size={18} /> Status
             </Link>
             <Link class={`nav-link ${isActive('/config') ? 'active' : ''}`} href="/config">
-              ⚙️ Config
+              <Settings size={18} /> Config
             </Link>
             <Link class={`nav-link ${isActive('/debug') ? 'active' : ''}`} href="/debug">
-              🔧 Debug
+              <Wrench size={18} /> Debug
             </Link>
             <Link class={`nav-link ${isActive('/log') ? 'active' : ''}`} href="/log">
-              📝 Logs
+              <FileText size={18} /> Logs
             </Link>
             <Link class={`nav-link ${isActive('/update') ? 'active' : ''}`} href="/update">
-              📤 Update
+              <Upload size={18} /> Update
             </Link>
           </div>
 
@@ -77,7 +78,7 @@ export function Navigation({ currentRoute }) {
               disabled={loading}
               title="Reset WiFi Settings"
             >
-              📶
+              <Wifi size={18} />
             </button>
             <button 
               class="nav-link danger btn-link" 
@@ -85,7 +86,7 @@ export function Navigation({ currentRoute }) {
               disabled={loading}
               title="Reboot Device"
             >
-              🔄
+              <RotateCcw size={18} />
             </button>
           </div>
         </div>
@@ -95,7 +96,7 @@ export function Navigation({ currentRoute }) {
       {showWifiDialog && (
         <div class="modal-overlay">
           <div class="modal">
-            <h3>⚠️ WiFi Reset Confirmation</h3>
+            <h3><AlertTriangle size={20} style="display: inline; margin-right: 0.5rem;" />WiFi Reset Confirmation</h3>
             <p>This will reset all WiFi settings and restart the device in configuration mode.</p>
             <ul style="margin: 1rem 0; padding-left: 1.5rem; line-height: 1.6;">
               <li>Current WiFi credentials will be erased</li>
@@ -106,7 +107,7 @@ export function Navigation({ currentRoute }) {
             
             {error && (
               <div class="error-message" style="margin-bottom: 1rem; color: var(--danger-color);">
-                ❌ {error}
+                <XCircle size={16} style="display: inline; margin-right: 0.25rem;" />{error}
               </div>
             )}
             
@@ -116,7 +117,7 @@ export function Navigation({ currentRoute }) {
                 onClick={handleWifiReset}
                 disabled={loading}
               >
-                {loading ? '⏳ Resetting...' : '🔄 Reset WiFi'}
+                {loading ? <>⏳ Resetting...</> : <><RotateCcw size={16} style="margin-right: 0.25rem;" />Reset WiFi</>}
               </button>
               <button 
                 class="btn btn-secondary" 
@@ -134,7 +135,7 @@ export function Navigation({ currentRoute }) {
       {showRebootDialog && (
         <div class="modal-overlay">
           <div class="modal">
-            <h3>🔄 Reboot Confirmation</h3>
+            <h3><RotateCcw size={20} style="display: inline; margin-right: 0.5rem;" />Reboot Confirmation</h3>
             <p>This will restart the ESP32 device immediately.</p>
             <ul style="margin: 1rem 0; padding-left: 1.5rem; line-height: 1.6;">
               <li>Device will restart and take ~30 seconds to boot</li>
@@ -145,7 +146,7 @@ export function Navigation({ currentRoute }) {
             
             {error && (
               <div class="error-message" style="margin-bottom: 1rem; color: var(--danger-color);">
-                ❌ {error}
+                <XCircle size={16} style="display: inline; margin-right: 0.25rem;" />{error}
               </div>
             )}
             
@@ -155,7 +156,7 @@ export function Navigation({ currentRoute }) {
                 onClick={handleReboot}
                 disabled={loading}
               >
-                {loading ? '⏳ Rebooting...' : '🔄 Reboot Device'}
+                {loading ? <>⏳ Rebooting...</> : <><RotateCcw size={16} style="margin-right: 0.25rem;" />Reboot Device</>}
               </button>
               <button 
                 class="btn btn-secondary" 

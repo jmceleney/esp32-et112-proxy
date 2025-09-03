@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api } from '../utils/api';
+import { XCircle, Save } from '../components/Icons';
 
 export function ConfigPage() {
   const [config, setConfig] = useState({
@@ -126,7 +127,7 @@ export function ConfigPage() {
       
       {error && (
         <div class="card" style="background-color: var(--danger-color); color: white; margin-bottom: 1rem;">
-          <p style="margin: 0;">❌ {error}</p>
+          <p style="margin: 0;"><XCircle size={16} style="display: inline; margin-right: 0.25rem;" />{error}</p>
         </div>
       )}
       
@@ -539,7 +540,7 @@ export function ConfigPage() {
             disabled={loading}
             style="flex: 1;"
           >
-            {loading ? '⏳ Saving...' : '💾 Save Configuration'}
+            {loading ? <>⏳ Saving...</> : <><Save size={16} style="margin-right: 0.25rem;" />Save Configuration</>}
           </button>
         </div>
       </form>

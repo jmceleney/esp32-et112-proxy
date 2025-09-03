@@ -13,9 +13,10 @@ struct CPULoadInfo {
 };
 
 /**
- * Gets the current CPU load percentage for both ESP32 cores using FreeRTOS statistics
+ * Gets the current CPU load percentage for both ESP32 cores using idle time measurement
+ * with 2-second rolling average. Automatically initializes idle tracking tasks on first call.
  * 
- * @return CPULoadInfo structure containing load percentages for both cores
+ * @return CPULoadInfo structure containing averaged load percentages for both cores
  */
 CPULoadInfo getCPULoad();
 

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api } from '../utils/api';
+import { Zap, Cpu, Clock, Radio, BarChart3, Settings, Wrench, XCircle, Link2, Info, FileText, Upload, TrendingUp } from '../components/Icons';
 
 export function HomePage() {
   const [metrics, setMetrics] = useState({
@@ -103,7 +104,7 @@ export function HomePage() {
 
       {error && (
         <div class="card" style="background-color: var(--danger-color); color: white; margin-bottom: 1.5rem;">
-          <p style="margin: 0;">❌ {error}</p>
+          <p style="margin: 0;"><XCircle size={16} style="display: inline; margin-right: 0.25rem;" />{error}</p>
         </div>
       )}
 
@@ -140,28 +141,28 @@ export function HomePage() {
       {/* Additional Metrics */}
       <div class="grid-4">
         <div class="card">
-          <div class="card-title">⚡ Frequency</div>
+          <div class="card-title"><Zap size={18} style="display: inline; margin-right: 0.25rem;" />Frequency</div>
           <div style="font-size: 1.5rem; font-weight: 600; color: var(--primary-color);">
             {loading ? '---' : formatValue(metrics.frequency, ' Hz', 2)}
           </div>
         </div>
 
         <div class="card">
-          <div class="card-title">🖥️ CPU Core 0</div>
+          <div class="card-title"><Cpu size={18} style="display: inline; margin-right: 0.25rem;" />CPU Core 0</div>
           <div style="font-size: 1.5rem; font-weight: 600; color: var(--secondary-color);">
             {loading ? '---' : formatValue(metrics.cpuCore0, '%', 1)}
           </div>
         </div>
 
         <div class="card">
-          <div class="card-title">🖥️ CPU Core 1</div>
+          <div class="card-title"><Cpu size={18} style="display: inline; margin-right: 0.25rem;" />CPU Core 1</div>
           <div style="font-size: 1.5rem; font-weight: 600; color: var(--secondary-color);">
             {loading ? '---' : formatValue(metrics.cpuCore1, '%', 1)}
           </div>
         </div>
 
         <div class="card">
-          <div class="card-title">⏱️ System Uptime</div>
+          <div class="card-title"><Clock size={18} style="display: inline; margin-right: 0.25rem;" />System Uptime</div>
           <div style="font-size: 1.5rem; font-weight: 600; color: var(--primary-color);">
             {loading ? '---' : (metrics.uptime || 'Unknown')}
           </div>
@@ -170,18 +171,18 @@ export function HomePage() {
 
       {/* Quick Actions */}
       <div class="card">
-        <div class="card-title">⚡ Quick Actions</div>
+        <div class="card-title"><Zap size={18} style="display: inline; margin-right: 0.25rem;" />Quick Actions</div>
         <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
-          <a href="/status" class="btn btn-primary">📊 View Detailed Status</a>
-          <a href="/config" class="btn btn-secondary">⚙️ Configuration</a>
-          <a href="/debug" class="btn btn-secondary">🔧 Debug Tools</a>
+          <a href="/status" class="btn btn-primary"><BarChart3 size={16} style="margin-right: 0.25rem;" />View Detailed Status</a>
+          <a href="/config" class="btn btn-secondary"><Settings size={16} style="margin-right: 0.25rem;" />Configuration</a>
+          <a href="/debug" class="btn btn-secondary"><Wrench size={16} style="margin-right: 0.25rem;" />Debug Tools</a>
         </div>
       </div>
 
       {/* Information Cards */}
       <div class="grid-2">
         <div class="card">
-          <div class="card-title">📡 About This Device</div>
+          <div class="card-title"><Radio size={18} style="display: inline; margin-right: 0.25rem;" />About This Device</div>
           <div class="text-sm" style="line-height: 1.6;">
             <p>This ESP32 device acts as a Modbus RTU/TCP gateway for the Carlo Gavazzi ET112 energy meter, providing real-time power monitoring data.</p>
             <ul style="margin: 0.5rem 0; padding-left: 1.5rem;">
@@ -194,13 +195,13 @@ export function HomePage() {
         </div>
 
         <div class="card">
-          <div class="card-title">🔗 Quick Links</div>
+          <div class="card-title"><Link2 size={18} style="display: inline; margin-right: 0.25rem;" />Quick Links</div>
           <div class="text-sm">
             <div style="display: flex; flex-direction: column; gap: 0.5rem;">
-              <a href="/log" style="color: var(--primary-color); text-decoration: none;">📝 View System Logs</a>
-              <a href="/update" style="color: var(--primary-color); text-decoration: none;">📤 Update Firmware</a>
-              <a href="/debug" style="color: var(--primary-color); text-decoration: none;">🔧 Test Modbus Communication</a>
-              <a href="/metrics" style="color: var(--primary-color); text-decoration: none;">📈 Prometheus Metrics</a>
+              <a href="/log" style="color: var(--primary-color); text-decoration: none;"><FileText size={16} style="display: inline; margin-right: 0.25rem;" />View System Logs</a>
+              <a href="/update" style="color: var(--primary-color); text-decoration: none;"><Upload size={16} style="display: inline; margin-right: 0.25rem;" />Update Firmware</a>
+              <a href="/debug" style="color: var(--primary-color); text-decoration: none;"><Wrench size={16} style="display: inline; margin-right: 0.25rem;" />Test Modbus Communication</a>
+              <a href="/metrics" style="color: var(--primary-color); text-decoration: none;"><TrendingUp size={16} style="display: inline; margin-right: 0.25rem;" />Prometheus Metrics</a>
             </div>
           </div>
         </div>

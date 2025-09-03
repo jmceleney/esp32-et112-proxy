@@ -5,6 +5,9 @@
 #include <atomic>
 #include <map>
 #include <LittleFS.h>
+#include <esp_partition.h>
+#include <esp_ota_ops.h>
+#include <esp_image_format.h>
 
 
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
@@ -38,6 +41,31 @@ static const int MAX_CONNECTIONS = 10; // Maximum concurrent connections
 static std::map<String, std::pair<String, unsigned long>> bssidCache;
 static const unsigned long BSSID_CACHE_EXPIRY = 24 * 60 * 60 * 1000; // 24 hours
 static const size_t MAX_BSSID_CACHE_SIZE = 50;
+
+// Adaptive OTA constants and structures
+enum class FirmwareType {
+    UNKNOWN,
+    LEGACY_APP,      // Traditional single-partition firmware
+    LEGACY_SPIFFS,   // Traditional filesystem only
+    COMBINED         // Multi-partition combined firmware
+};
+
+struct OTAContext {
+    FirmwareType type;
+    esp_ota_handle_t ota_handle;
+    const esp_partition_t* update_partition;
+    size_t written;
+    bool initialized;
+    bool finalization_successful;
+    uint8_t* buffer;
+    size_t buffer_size;
+    size_t buffer_pos;
+    
+    OTAContext() : type(FirmwareType::UNKNOWN), ota_handle(0), update_partition(nullptr), 
+                   written(0), initialized(false), finalization_successful(false), buffer(nullptr), buffer_size(0), buffer_pos(0) {}
+};
+
+static OTAContext ota_context;
 
 // Helper function to log heap memory at the start of each page request
 void logHeapMemory(const char* route) {
@@ -75,6 +103,336 @@ void cleanupBssidCache() {
       ++it;
     }
   }
+}
+
+// Firmware detection functions
+FirmwareType detectFirmwareType(const uint8_t* data, size_t len, const String& filename) {
+    dbgln("[OTA] Detecting firmware type from " + filename + ", data length: " + String(len));
+    
+    // Debug first few bytes
+    dbg("[OTA] First 16 bytes: ");
+    for (int i = 0; i < 16 && i < len; i++) {
+        dbg("0x"); dbg(data[i], HEX); dbg(" ");
+    }
+    dbgln();
+    
+    // If filename explicitly indicates filesystem, treat as legacy filesystem
+    if (filename == "filesystem" || filename.endsWith(".spiffs") || filename.endsWith(".littlefs")) {
+        dbgln("[OTA] Detected LEGACY_SPIFFS from filename");
+        return FirmwareType::LEGACY_SPIFFS;
+    }
+    
+    if (len < 0x10000) {  // Need at least 64KB to check for combined firmware structure
+        dbgln("[OTA] Not enough data for combined firmware detection (" + String(len) + " < 65536), checking for legacy app");
+        // Check for ESP32 app image magic byte at start (legacy firmware)
+        if (len >= 4 && data[0] == ESP_IMAGE_HEADER_MAGIC) {
+            dbgln("[OTA] Detected LEGACY_APP from magic byte 0x" + String(data[0], HEX) + " at start");
+            return FirmwareType::LEGACY_APP;
+        }
+        dbgln("[OTA] No magic byte found at start (0x" + String(data[0], HEX) + "), returning UNKNOWN");
+        return FirmwareType::UNKNOWN;
+    }
+    
+    // Check for combined firmware structure
+    dbgln("[OTA] Checking for combined firmware structure in " + String(len) + " byte file");
+    
+    // Combined firmware should have:
+    // - Bootloader at 0x1000 with magic byte 0xE9
+    // - Partition table at 0x8000
+    // - Application at 0x10000 with magic byte 0xE9
+    
+    bool has_bootloader = (len > 0x1000 && data[0x1000] == ESP_IMAGE_HEADER_MAGIC);
+    bool has_app = (len > 0x10000 && data[0x10000] == ESP_IMAGE_HEADER_MAGIC);
+    
+    // Check for partition table signature at 0x8000
+    // ESP32 partition table starts with 0xAA50 magic
+    bool has_partition_table = (len > 0x8002 && 
+                               data[0x8000] == 0xAA && 
+                               data[0x8001] == 0x50);
+    
+    dbgln("[OTA] Bootloader at 0x1000: " + String(has_bootloader ? "YES" : "NO") + 
+          " (0x" + String(len > 0x1000 ? data[0x1000] : 0, HEX) + ")");
+    dbgln("[OTA] App at 0x10000: " + String(has_app ? "YES" : "NO") + 
+          " (0x" + String(len > 0x10000 ? data[0x10000] : 0, HEX) + ")");
+    dbgln("[OTA] Partition table at 0x8000: " + String(has_partition_table ? "YES" : "NO") + 
+          " (0x" + String(len > 0x8000 ? data[0x8000] : 0, HEX) + 
+          String(len > 0x8001 ? data[0x8001] : 0, HEX) + ")");
+    
+    if (has_bootloader && has_partition_table && has_app) {
+        dbgln("[OTA] Detected COMBINED firmware (bootloader + partition table + app found)");
+        return FirmwareType::COMBINED;
+    }
+    
+    // Check if it's a legacy app firmware (starts with ESP image header)
+    if (data[0] == ESP_IMAGE_HEADER_MAGIC) {
+        dbgln("[OTA] Detected LEGACY_APP from magic byte 0x" + String(data[0], HEX) + " at start");
+        return FirmwareType::LEGACY_APP;
+    }
+    
+    dbgln("[OTA] Could not detect firmware type, magic byte at start: 0x" + String(data[0], HEX));
+    dbgln("[OTA] Defaulting to UNKNOWN");
+    return FirmwareType::UNKNOWN;
+}
+
+bool initializeLegacyOTA(const String& filename, FirmwareType type) {
+    dbgln("[OTA] Initializing legacy OTA for " + filename + ", type: " + String(static_cast<int>(type)));
+    
+    int cmd = (type == FirmwareType::LEGACY_SPIFFS) ? U_SPIFFS : U_FLASH;
+    dbgln("[OTA] Using Update command: " + String(cmd) + " (" + (cmd == U_SPIFFS ? "U_SPIFFS" : "U_FLASH") + ")");
+    
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, cmd)) {
+        dbgln("[OTA] Legacy Update.begin() failed");
+        Update.printError(Serial);
+        return false;
+    }
+    
+    ota_context.type = type;
+    ota_context.initialized = true;
+    dbgln("[OTA] Legacy OTA initialized successfully - context type: " + String(static_cast<int>(ota_context.type)) + 
+          ", initialized: " + String(ota_context.initialized));
+    return true;
+}
+
+bool initializeCombinedOTA() {
+    dbgln("[OTA] Initializing combined firmware OTA");
+    
+    // For combined firmware, we need to use low-level ESP32 OTA APIs
+    // Get the next available OTA partition
+    ota_context.update_partition = esp_ota_get_next_update_partition(NULL);
+    if (!ota_context.update_partition) {
+        dbgln("[OTA] No available OTA partition found");
+        return false;
+    }
+    
+    dbgln("[OTA] Found OTA partition: " + String(ota_context.update_partition->label) + 
+          " at address 0x" + String(ota_context.update_partition->address, HEX) +
+          ", size: " + String(ota_context.update_partition->size));
+    
+    // For combined firmware, we'll write directly to flash at specific addresses
+    // First, we need to erase the entire flash area we'll write to
+    esp_err_t err = esp_ota_begin(ota_context.update_partition, OTA_SIZE_UNKNOWN, &ota_context.ota_handle);
+    if (err != ESP_OK) {
+        dbgln("[OTA] esp_ota_begin failed: " + String(esp_err_to_name(err)));
+        return false;
+    }
+    
+    ota_context.type = FirmwareType::COMBINED;
+    ota_context.initialized = true;
+    ota_context.written = 0;
+    
+    dbgln("[OTA] Combined firmware OTA initialized successfully - handle: " + String(ota_context.ota_handle) +
+          ", context type: " + String(static_cast<int>(ota_context.type)) + 
+          ", initialized: " + String(ota_context.initialized));
+    return true;
+}
+
+bool writeLegacyOTAData(const uint8_t* data, size_t len) {
+    if (!data || len == 0) {
+        dbgln("[OTA] Invalid data for legacy write");
+        return false;
+    }
+    
+    if (!ota_context.initialized) {
+        dbgln("[OTA] Legacy OTA not properly initialized");
+        return false;
+    }
+    
+    if (Update.write(const_cast<uint8_t*>(data), len) != len) {
+        dbgln("[OTA] Legacy Update.write failed");
+        return false;
+    }
+    
+    ota_context.written += len;
+    return true;
+}
+
+bool writeCombinedOTAData(const uint8_t* data, size_t len, size_t offset) {
+    // For combined firmware, we need to extract only the application portion (0x10000-0x290000)
+    // The ESP32 OTA API expects pure application firmware data starting with 0xE9 magic byte
+    
+    // Validate input
+    if (!data || len == 0) {
+        dbgln("[OTA] Invalid data for combined firmware write");
+        return false;
+    }
+    
+    if (!ota_context.initialized || ota_context.ota_handle == 0) {
+        dbgln("[OTA] Combined OTA not properly initialized");
+        return false;
+    }
+    
+    // Define flash layout constants
+    const size_t APP_OFFSET = 0x10000;     // Application starts at 64KB
+    const size_t SPIFFS_OFFSET = 0x290000; // Filesystem starts at ~2.6MB
+    
+    // Calculate which part of current chunk overlaps with application area
+    size_t chunk_start = offset;
+    size_t chunk_end = offset + len;
+    
+    static uint32_t combined_chunk_count = 0;
+    
+    // Reset counter when processing starts fresh  
+    if (offset == 0) {
+      combined_chunk_count = 0;
+    }
+    combined_chunk_count++;
+    
+    // Only log chunk processing details every 4th chunk to reduce verbosity
+    if (combined_chunk_count % 4 == 0) {
+      dbgln("[OTA] Processing chunk: offset=" + String(chunk_start, HEX) + 
+            ", len=" + String(len) + ", end=" + String(chunk_end, HEX));
+    }
+    
+    // Check if this chunk contains application data
+    if (chunk_end <= APP_OFFSET || chunk_start >= SPIFFS_OFFSET) {
+        // Chunk is entirely before app area or after app area - skip it
+        dbgln("[OTA] Skipping non-application data (bootloader/partition table/filesystem)");
+        return true;
+    }
+    
+    // Calculate the portion of this chunk that belongs to application
+    size_t app_start_in_chunk = 0;
+    size_t app_len_in_chunk = len;
+    
+    if (chunk_start < APP_OFFSET) {
+        // Chunk starts before app area, skip the beginning
+        app_start_in_chunk = APP_OFFSET - chunk_start;
+        app_len_in_chunk -= app_start_in_chunk;
+    }
+    
+    if (chunk_end > SPIFFS_OFFSET) {
+        // Chunk extends beyond app area, truncate the end
+        app_len_in_chunk -= (chunk_end - SPIFFS_OFFSET);
+    }
+    
+    if (app_len_in_chunk == 0) {
+        dbgln("[OTA] No application data in this chunk");
+        return true;
+    }
+    
+    // Check if we would exceed the OTA partition size
+    size_t remaining_partition_space = ota_context.update_partition->size - ota_context.written;
+    if (app_len_in_chunk > remaining_partition_space) {
+        if (remaining_partition_space == 0) {
+            dbgln("[OTA] OTA partition is full (" + String(ota_context.update_partition->size) + 
+                  " bytes), skipping remaining data");
+            return true;
+        }
+        
+        dbgln("[OTA] Truncating write to fit partition: " + String(app_len_in_chunk) + 
+              " -> " + String(remaining_partition_space) + " bytes");
+        app_len_in_chunk = remaining_partition_space;
+    }
+    
+    // Extract application data from chunk
+    const uint8_t* app_data = data + app_start_in_chunk;
+    
+    // Check if the data looks like valid application code (starts with 0xE9 or is continuation)
+    if (ota_context.written == 0 && app_data[0] != 0xE9) {
+        dbgln("[OTA] Warning: First application byte is not 0xE9 (got 0x" + String(app_data[0], HEX) + ")");
+    }
+    
+    // Skip chunks that are all 0xFF (padding/unused space)
+    bool all_ff = true;
+    for (size_t i = 0; i < app_len_in_chunk && all_ff; i++) {
+        if (app_data[i] != 0xFF) {
+            all_ff = false;
+        }
+    }
+    
+    if (all_ff) {
+        dbgln("[OTA] Skipping padding data (all 0xFF bytes)");
+        return true;
+    }
+    
+    // Only log write details every 4th chunk to reduce verbosity
+    if (combined_chunk_count % 4 == 0) {
+      dbgln("[OTA] Writing " + String(app_len_in_chunk) + " bytes of application data (chunk offset: " + 
+            String(app_start_in_chunk) + ")");
+    }
+    
+    // Write application data to OTA partition
+    esp_err_t err = esp_ota_write(ota_context.ota_handle, app_data, app_len_in_chunk);
+    if (err != ESP_OK) {
+        dbgln("[OTA] esp_ota_write failed: " + String(esp_err_to_name(err)));
+        return false;
+    }
+    
+    ota_context.written += app_len_in_chunk;
+    // Only log progress details every 4th chunk to reduce verbosity
+    if (combined_chunk_count % 4 == 0) {
+      dbgln("[OTA] Combined firmware: wrote " + String(app_len_in_chunk) + 
+            " app bytes, total app written: " + String(ota_context.written) +
+            "/" + String(ota_context.update_partition->size));
+    }
+    return true;
+}
+
+bool finalizeLegacyOTA() {
+    dbgln("[OTA] Finalizing legacy OTA");
+    
+    if (!Update.end(true)) {
+        dbgln("[OTA] Legacy Update.end failed");
+        Update.printError(Serial);
+        ota_context.finalization_successful = false;
+        return false;
+    }
+    
+    ota_context.finalization_successful = true;
+    dbgln("[OTA] Legacy OTA finalized successfully");
+    return true;
+}
+
+bool finalizeCombinedOTA() {
+    dbgln("[OTA] Finalizing combined firmware OTA");
+    
+    esp_err_t err = esp_ota_end(ota_context.ota_handle);
+    if (err != ESP_OK) {
+        dbgln("[OTA] esp_ota_end failed: " + String(esp_err_to_name(err)));
+        ota_context.finalization_successful = false;
+        return false;
+    }
+    
+    // Set the new partition as the next boot partition
+    err = esp_ota_set_boot_partition(ota_context.update_partition);
+    if (err != ESP_OK) {
+        dbgln("[OTA] esp_ota_set_boot_partition failed: " + String(esp_err_to_name(err)));
+        ota_context.finalization_successful = false;
+        return false;
+    }
+    
+    ota_context.finalization_successful = true;
+    dbgln("[OTA] Combined firmware OTA finalized successfully");
+    return true;
+}
+
+void cleanupOTAContext() {
+    dbgln("[OTA] Cleaning up OTA context");
+    if (ota_context.buffer) {
+        free(ota_context.buffer);
+        ota_context.buffer = nullptr;
+    }
+    ota_context.buffer_size = 0;
+    ota_context.buffer_pos = 0;
+    // Only reset type if we're doing a real cleanup, not mid-process
+    ota_context.type = FirmwareType::UNKNOWN;
+    ota_context.initialized = false;
+    // Don't reset finalization_successful - we need it for the response
+    ota_context.written = 0;
+    ota_context.ota_handle = 0;
+    ota_context.update_partition = nullptr;
+}
+
+void resetOTAContextForNewUpload() {
+    dbgln("[OTA] Resetting OTA context for new upload");
+    dbgln("[OTA] Context before reset - type: " + String(static_cast<int>(ota_context.type)) + 
+          ", initialized: " + String(ota_context.initialized) + 
+          ", written: " + String(ota_context.written));
+    cleanupOTAContext();
+    ota_context.finalization_successful = false;
+    dbgln("[OTA] Context after reset - type: " + String(static_cast<int>(ota_context.type)) + 
+          ", initialized: " + String(ota_context.initialized) + 
+          ", finalization_successful: " + String(ota_context.finalization_successful));
 }
 
 void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config, AsyncWiFiManager *wm){
@@ -1020,47 +1378,189 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
   });
   server->on("/update", HTTP_POST, [config](AsyncWebServerRequest *request){
     String hostname = config->getHostname();
-    request->onDisconnect([](){
-      ESP.restart();
-    });
-    dbgln("[webserver] OTA finished");
-    if (Update.hasError()){
-      auto *response = request->beginResponse(500, "text/plain", "Ota failed");
-      response->addHeader("Connection", "close");
-      request->send(response);
+    dbgln("[webserver] Adaptive OTA finished");
+    
+    // Check for errors based on firmware type and finalization success
+    bool hasError = false;
+    String errorMsg = "";
+    String successMsg = "";
+    
+    if (ota_context.type == FirmwareType::COMBINED) {
+      // Combined firmware uses ESP32 OTA APIs, check finalization success
+      hasError = !ota_context.finalization_successful;
+      if (hasError) {
+        errorMsg = "Combined firmware OTA failed";
+      } else {
+        successMsg = "Combined firmware update successful! Device will reboot in 3 seconds...";
+      }
+    } else if (ota_context.type == FirmwareType::LEGACY_APP || ota_context.type == FirmwareType::LEGACY_SPIFFS) {
+      // Legacy firmware uses Arduino Update library
+      hasError = Update.hasError() || !ota_context.finalization_successful;
+      if (hasError) {
+        errorMsg = "Legacy firmware OTA failed";
+      } else {
+        successMsg = "Legacy firmware update successful! Device will reboot in 3 seconds...";
+      }
+    } else {
+      hasError = true;
+      errorMsg = "Unknown firmware type or OTA not properly initialized";
     }
-    else{
-      auto *response = request->beginResponseStream("text/html");
+    
+    if (hasError) {
+      // Cleanup context on failure
+      cleanupOTAContext();
+      String jsonResponse = "{\"success\": false, \"message\": \"" + errorMsg + "\", \"reboot\": false}";
+      auto *response = request->beginResponse(500, "application/json", jsonResponse);
       response->addHeader("Connection", "close");
-      sendResponseHeader(response, "Firmware Update", true, hostname);
-      response->print("<p>Update successful.</p>");
-      sendButton(response, "Back", "/");
-      sendResponseTrailer(response);
       request->send(response);
+    } else {
+      // Success - send JSON response then schedule reboot
+      String jsonResponse = "{\"success\": true, \"message\": \"" + successMsg + "\", \"reboot\": true}";
+      auto *response = request->beginResponse(200, "application/json", jsonResponse);
+      response->addHeader("Connection", "close");
+      request->send(response);
+      
+      // Schedule reboot after a delay to ensure response is sent
+      request->onDisconnect([](){
+        // Give extra time for response to be sent
+        unsigned long rebootTime = millis() + 3000; // 3 second delay
+        while (millis() < rebootTime) {
+          delay(100);
+          yield(); // Keep feeding watchdog
+        }
+        dbgln("[webserver] Rebooting after successful OTA update...");
+        ESP.restart();
+      });
+      
+      // Also cleanup context after successful response
+      cleanupOTAContext();
     }
   }, [&](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
-    dbg("[webserver] OTA progress ");dbgln(index);
-    if (!index) {
-      //TODO add MD5 Checksum and Update.setMD5
-      int cmd = (filename == "filesystem") ? U_SPIFFS : U_FLASH;
-      if (!Update.begin(UPDATE_SIZE_UNKNOWN, cmd)) { // Start with max available size
-        Update.printError(Serial);
-        return request->send(400, "text/plain", "OTA could not begin");
+    static uint32_t chunk_count = 0;
+    
+    // Reset counter at start of new upload
+    if (index == 0) {
+      chunk_count = 0;
+    }
+    chunk_count++;
+    
+    // Only log progress every 4th chunk to reduce verbosity
+    if (chunk_count % 4 == 0 || !index || final) {
+      dbg("[webserver] Adaptive OTA progress ");dbg(index);dbg(" len=");dbgln(len);
+      dbgln("[webserver] Context state check - type: " + String(static_cast<int>(ota_context.type)) + 
+            ", initialized: " + String(ota_context.initialized) + 
+            ", written: " + String(ota_context.written));
+    }
+    
+    // Check if this is either the first chunk OR if context is uninitialized
+    if (!index || !ota_context.initialized) {
+      if (!index) {
+        dbgln("[webserver] Starting adaptive OTA for file: " + filename + " (first chunk)");
+      } else {
+        dbgln("[webserver] Starting adaptive OTA for file: " + filename + " (context uninitialized, index=" + String(index) + ")");
+      }
+      
+      // Reset context for new upload
+      resetOTAContextForNewUpload();
+      
+      // For non-zero index, we can't detect firmware type from partial data
+      // Default to combined firmware type for uploads not starting at index 0
+      FirmwareType detectedType;
+      if (!index) {
+        detectedType = detectFirmwareType(data, len, filename);
+      } else {
+        dbgln("[webserver] Cannot detect firmware type from partial data, defaulting to combined");
+        detectedType = FirmwareType::COMBINED;
+      }
+      
+      bool initSuccess = false;
+      switch (detectedType) {
+        case FirmwareType::LEGACY_APP:
+        case FirmwareType::LEGACY_SPIFFS:
+          initSuccess = initializeLegacyOTA(filename, detectedType);
+          break;
+          
+        case FirmwareType::COMBINED:
+          initSuccess = initializeCombinedOTA();
+          break;
+          
+        default:
+          dbgln("[webserver] Unknown firmware type, attempting legacy app detection");
+          // Fallback to legacy app if detection failed
+          initSuccess = initializeLegacyOTA(filename, FirmwareType::LEGACY_APP);
+          break;
+      }
+      
+      if (!initSuccess) {
+        cleanupOTAContext();
+        return request->send(400, "text/plain", "Adaptive OTA could not begin");
+      }
+      
+      dbgln("[webserver] Adaptive OTA initialized for type: " + String(static_cast<int>(ota_context.type)));
+    }
+    
+    // Write data chunk
+    if (len > 0) {
+      bool writeSuccess = false;
+      
+      // Debug current context state - only log every 4th chunk to reduce verbosity
+      if (chunk_count % 4 == 0 || final) {
+        dbg("[webserver] Context type: ");dbg(static_cast<int>(ota_context.type));
+        dbg(", initialized: ");dbg(ota_context.initialized);
+        dbg(", written so far: ");dbgln(ota_context.written);
+      }
+      
+      switch (ota_context.type) {
+        case FirmwareType::LEGACY_APP:
+        case FirmwareType::LEGACY_SPIFFS:
+          writeSuccess = writeLegacyOTAData(data, len);
+          break;
+          
+        case FirmwareType::COMBINED:
+          writeSuccess = writeCombinedOTAData(data, len, index);
+          break;
+          
+        default:
+          dbgln("[webserver] Invalid OTA context type during write - type: " + String(static_cast<int>(ota_context.type)));
+          cleanupOTAContext();
+          return request->send(400, "text/plain", "Invalid OTA state during write");
+      }
+      
+      if (!writeSuccess) {
+        dbgln("[webserver] Failed to write OTA data chunk");
+        cleanupOTAContext();
+        return request->send(400, "text/plain", "Adaptive OTA could not write data");
       }
     }
-    // Write chunked data to the free sketch space
-    if(len){
-      if (Update.write(data, len) != len) {
-        return request->send(400, "text/plain", "OTA could not write data");
+    
+    // Finalize on last chunk
+    if (final) {
+      dbgln("[webserver] Finalizing adaptive OTA");
+      
+      bool finalizeSuccess = false;
+      
+      switch (ota_context.type) {
+        case FirmwareType::LEGACY_APP:
+        case FirmwareType::LEGACY_SPIFFS:
+          finalizeSuccess = finalizeLegacyOTA();
+          break;
+          
+        case FirmwareType::COMBINED:
+          finalizeSuccess = finalizeCombinedOTA();
+          break;
+          
+        default:
+          dbgln("[webserver] Invalid OTA context type during finalize");
+          break;
       }
-    }
-    if (final) { // if the final flag is set then this is the last frame of data
-      if (!Update.end(true)) { //true to set the size to the current progress
-        Update.printError(Serial);
-        return request->send(400, "text/plain", "Could not end OTA");
+      
+      if (!finalizeSuccess) {
+        dbgln("[webserver] Failed to finalize adaptive OTA");
+        cleanupOTAContext();
+        return request->send(400, "text/plain", "Could not finalize adaptive OTA");
       }
-    }else{
-      return;
+      
+      dbgln("[webserver] Adaptive OTA finalized successfully");
     }
   });
   server->on("/wifi", HTTP_GET, [config](AsyncWebServerRequest *request){

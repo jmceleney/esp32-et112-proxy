@@ -118,7 +118,19 @@ export const api = {
 
       xhr.addEventListener('load', () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(xhr.responseText);
+          try {
+            // Try to parse as JSON, fall back to raw text
+            const response = xhr.responseText;
+            const contentType = xhr.getResponseHeader('content-type');
+            if (contentType && contentType.includes('application/json')) {
+              resolve(JSON.parse(response));
+            } else {
+              resolve(response);
+            }
+          } catch (e) {
+            // If JSON parsing fails, return raw text
+            resolve(xhr.responseText);
+          }
         } else {
           reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`));
         }

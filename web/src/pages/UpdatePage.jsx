@@ -67,10 +67,18 @@ export function UpdatePage() {
       });
       
       setSuccess(true);
-      setUploadResult({
-        message: 'Firmware uploaded successfully! The device will restart automatically.',
-        details: result
-      });
+      // Handle both JSON response and legacy text response
+      if (typeof result === 'object' && result.message) {
+        setUploadResult({
+          message: result.message,
+          details: result.success ? 'Update completed successfully' : result
+        });
+      } else {
+        setUploadResult({
+          message: 'Firmware uploaded successfully! The device will restart automatically.',
+          details: result
+        });
+      }
       
       // Clear the form after successful upload
       setSelectedFile(null);

@@ -51,7 +51,7 @@ export async function apiPost(endpoint, data = null) {
   if (data) {
     if (data instanceof FormData) {
       // Don't set Content-Type for FormData, let browser set it
-      delete options.headers;
+      options.headers = {};
       options.body = data;
     } else {
       options.body = JSON.stringify(data);
@@ -67,20 +67,23 @@ export async function apiPost(endpoint, data = null) {
 export const api = {
   // Status and monitoring
   getStatus: () => apiGet('/status.json'),
+  getVersion: () => apiGet('/version.json'),
   getLogs: (position = 0, chunkSize = 8192) => 
     apiGet(`/logdata?position=${position}&chunk_size=${chunkSize}`),
   clearLogs: () => apiPost('/logclear'),
 
   // Configuration
-  getConfig: () => apiGet('/config'),
+  getConfig: () => apiGet('/config.json'),
   updateConfig: (config) => {
     const formData = new FormData();
     Object.entries(config).forEach(([key, value]) => {
       if (typeof value === 'boolean') {
-        // Only add checkbox values if they're true
+        // Send checkbox values as 'on' when true, or don't send when false
+        // The backend checks for presence of the parameter to determine true/false
         if (value) {
           formData.append(key, 'on');
         }
+        // Note: false values are not appended, backend treats missing params as false
       } else {
         formData.append(key, value);
       }

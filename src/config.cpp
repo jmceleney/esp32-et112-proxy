@@ -90,9 +90,8 @@ String Config::getTargetIP() const {
 }
 
 void Config::setTargetIP(const String& ip) {
+    if (_targetIP == ip) return;
     _targetIP = ip;
-    // Save to preferences if needed
-    _prefs->begin("your_preference_namespace", false);
     _prefs->putString("targetIP", _targetIP);
 }
 

@@ -1,6 +1,6 @@
 import { useState } from 'preact/hooks';
 import { api } from '../utils/api';
-import { XCircle, Wrench, CheckCircle, Trash2 } from '../components/Icons';
+import { XCircle, Wrench, CheckCircle, Trash2, Clock, FileText, Lightbulb } from '../components/Icons';
 
 const MODBUS_FUNCTIONS = {
   1: 'Read Coils',
@@ -203,7 +203,7 @@ export function DebugPage() {
               disabled={loading}
               style="flex: 1;"
             >
-              {loading ? <>⏳ Sending...</> : <><Wrench size={16} style="margin-right: 0.25rem;" />Send Command</>}
+              {loading ? <><Clock size={16} style="margin-right: 0.25rem;" /> Sending...</> : <><Wrench size={16} style="margin-right: 0.25rem;" />Send Command</>}
             </button>
             
             <button
@@ -278,7 +278,7 @@ export function DebugPage() {
 
       {/* Quick Reference */}
       <div class="card">
-        <h3 class="card-title">📚 Modbus Quick Reference</h3>
+        <h3 class="card-title"><FileText size={18} style="display: inline; margin-right: 0.25rem;" />Modbus Quick Reference</h3>
         
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
           <div>
@@ -304,7 +304,7 @@ export function DebugPage() {
         </div>
         
         <div style="margin-top: 1rem; padding: 1rem; background-color: var(--light-color); border-radius: 4px; font-size: 0.875rem;">
-          <h4 style="margin-top: 0;">💡 Tips:</h4>
+          <h4 style="margin-top: 0;"><Lightbulb size={16} style="display: inline; margin-right: 0.25rem;" />Tips:</h4>
           <ul style="margin: 0; padding-left: 1.5rem;">
             <li>Use Function 3 (Read Holding Registers) for most ET112 data</li>
             <li>Start with Slave ID 1 and Register 0, Count 1 for basic testing</li>

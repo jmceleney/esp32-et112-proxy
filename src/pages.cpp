@@ -1,5 +1,4 @@
 #include "pages.h"
-#include "system_utils.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <atomic>
@@ -8,7 +7,12 @@
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <esp_image_format.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
 
+// Global flags for scheduled restart after filesystem upload
+bool filesystemUploadRestart = false;
+unsigned long restartTime = 0;
 
 #define ETAG "\"" __DATE__ "" __TIME__ "\""
 // Define a build time string for display on the status page
@@ -247,8 +251,8 @@ bool writeLegacyOTAData(const uint8_t* data, size_t len) {
 }
 
 bool writeCombinedOTAData(const uint8_t* data, size_t len, size_t offset) {
-    // For combined firmware, we need to extract only the application portion (0x10000-0x290000)
-    // The ESP32 OTA API expects pure application firmware data starting with 0xE9 magic byte
+    // For combined firmware, we need to extract both application (0x10000-0x290000) and filesystem (0x290000+) portions
+    // The ESP32 OTA API handles the application, and we handle filesystem separately
     
     // Validate input
     if (!data || len == 0) {
@@ -270,10 +274,16 @@ bool writeCombinedOTAData(const uint8_t* data, size_t len, size_t offset) {
     size_t chunk_end = offset + len;
     
     static uint32_t combined_chunk_count = 0;
+    static const esp_partition_t* spiffs_partition = nullptr;
+    static size_t filesystem_written = 0;
+    static bool filesystem_initialized = false;
     
     // Reset counter when processing starts fresh  
     if (offset == 0) {
       combined_chunk_count = 0;
+      spiffs_partition = nullptr;
+      filesystem_written = 0;
+      filesystem_initialized = false;
     }
     combined_chunk_count++;
     
@@ -283,88 +293,184 @@ bool writeCombinedOTAData(const uint8_t* data, size_t len, size_t offset) {
             ", len=" + String(len) + ", end=" + String(chunk_end, HEX));
     }
     
-    // Check if this chunk contains application data
-    if (chunk_end <= APP_OFFSET || chunk_start >= SPIFFS_OFFSET) {
-        // Chunk is entirely before app area or after app area - skip it
-        dbgln("[OTA] Skipping non-application data (bootloader/partition table/filesystem)");
-        return true;
+    // Handle different sections of the combined firmware
+    bool hasAppData = false;
+    bool hasFilesystemData = false;
+    
+    // Check what type of data this chunk contains
+    if (chunk_end > APP_OFFSET && chunk_start < SPIFFS_OFFSET) {
+        hasAppData = true;
     }
-    
-    // Calculate the portion of this chunk that belongs to application
-    size_t app_start_in_chunk = 0;
-    size_t app_len_in_chunk = len;
-    
-    if (chunk_start < APP_OFFSET) {
-        // Chunk starts before app area, skip the beginning
-        app_start_in_chunk = APP_OFFSET - chunk_start;
-        app_len_in_chunk -= app_start_in_chunk;
-    }
-    
     if (chunk_end > SPIFFS_OFFSET) {
-        // Chunk extends beyond app area, truncate the end
-        app_len_in_chunk -= (chunk_end - SPIFFS_OFFSET);
+        hasFilesystemData = true;
     }
     
-    if (app_len_in_chunk == 0) {
-        dbgln("[OTA] No application data in this chunk");
+    // Skip bootloader and partition table data (before APP_OFFSET)
+    if (chunk_end <= APP_OFFSET) {
+        dbgln("[OTA] Skipping bootloader/partition table data");
         return true;
     }
     
-    // Check if we would exceed the OTA partition size
-    size_t remaining_partition_space = ota_context.update_partition->size - ota_context.written;
-    if (app_len_in_chunk > remaining_partition_space) {
-        if (remaining_partition_space == 0) {
-            dbgln("[OTA] OTA partition is full (" + String(ota_context.update_partition->size) + 
-                  " bytes), skipping remaining data");
-            return true;
+    if (!hasAppData && !hasFilesystemData) {
+        dbgln("[OTA] No relevant data in this chunk");
+        return true;
+    }
+    
+    // Handle APPLICATION data (0x10000 - 0x290000)
+    if (hasAppData) {
+        // Calculate the portion of this chunk that belongs to application
+        size_t app_start_in_chunk = 0;
+        size_t app_len_in_chunk = len;
+        
+        if (chunk_start < APP_OFFSET) {
+            // Chunk starts before app area, skip the beginning
+            app_start_in_chunk = APP_OFFSET - chunk_start;
+            app_len_in_chunk -= app_start_in_chunk;
         }
         
-        dbgln("[OTA] Truncating write to fit partition: " + String(app_len_in_chunk) + 
-              " -> " + String(remaining_partition_space) + " bytes");
-        app_len_in_chunk = remaining_partition_space;
-    }
-    
-    // Extract application data from chunk
-    const uint8_t* app_data = data + app_start_in_chunk;
-    
-    // Check if the data looks like valid application code (starts with 0xE9 or is continuation)
-    if (ota_context.written == 0 && app_data[0] != 0xE9) {
-        dbgln("[OTA] Warning: First application byte is not 0xE9 (got 0x" + String(app_data[0], HEX) + ")");
-    }
-    
-    // Skip chunks that are all 0xFF (padding/unused space)
-    bool all_ff = true;
-    for (size_t i = 0; i < app_len_in_chunk && all_ff; i++) {
-        if (app_data[i] != 0xFF) {
-            all_ff = false;
+        if (chunk_end > SPIFFS_OFFSET) {
+            // Chunk extends beyond app area, truncate the end
+            app_len_in_chunk -= (chunk_end - SPIFFS_OFFSET);
+        }
+        
+        if (app_len_in_chunk > 0) {
+            // Check if we would exceed the OTA partition size
+            size_t remaining_partition_space = ota_context.update_partition->size - ota_context.written;
+            if (app_len_in_chunk > remaining_partition_space) {
+                if (remaining_partition_space == 0) {
+                    dbgln("[OTA] OTA partition is full (" + String(ota_context.update_partition->size) + 
+                          " bytes), skipping remaining app data");
+                } else {
+                    dbgln("[OTA] Truncating app write to fit partition: " + String(app_len_in_chunk) + 
+                          " -> " + String(remaining_partition_space) + " bytes");
+                    app_len_in_chunk = remaining_partition_space;
+                }
+            }
+            
+            if (app_len_in_chunk > 0) {
+                // Extract application data from chunk
+                const uint8_t* app_data = data + app_start_in_chunk;
+                
+                // Check if the data looks like valid application code (starts with 0xE9 or is continuation)
+                if (ota_context.written == 0 && app_data[0] != 0xE9) {
+                    dbgln("[OTA] Warning: First application byte is not 0xE9 (got 0x" + String(app_data[0], HEX) + ")");
+                }
+                
+                // Skip chunks that are all 0xFF (padding/unused space)
+                bool all_ff = true;
+                for (size_t i = 0; i < app_len_in_chunk && all_ff; i++) {
+                    if (app_data[i] != 0xFF) {
+                        all_ff = false;
+                    }
+                }
+                
+                if (!all_ff) {
+                    // Only log write details every 4th chunk to reduce verbosity
+                    if (combined_chunk_count % 4 == 0) {
+                        dbgln("[OTA] Writing " + String(app_len_in_chunk) + " bytes of application data (chunk offset: " + 
+                              String(app_start_in_chunk) + ")");
+                    }
+                    
+                    // Write application data to OTA partition
+                    esp_err_t err = esp_ota_write(ota_context.ota_handle, app_data, app_len_in_chunk);
+                    if (err != ESP_OK) {
+                        dbgln("[OTA] esp_ota_write failed: " + String(esp_err_to_name(err)));
+                        return false;
+                    }
+                    
+                    ota_context.written += app_len_in_chunk;
+                    // Only log progress details every 4th chunk to reduce verbosity
+                    if (combined_chunk_count % 4 == 0) {
+                        dbgln("[OTA] Combined firmware: wrote " + String(app_len_in_chunk) + 
+                              " app bytes, total app written: " + String(ota_context.written) +
+                              "/" + String(ota_context.update_partition->size));
+                    }
+                } else {
+                    dbgln("[OTA] Skipping app padding data (all 0xFF bytes)");
+                }
+            }
         }
     }
     
-    if (all_ff) {
-        dbgln("[OTA] Skipping padding data (all 0xFF bytes)");
-        return true;
+    // Handle FILESYSTEM data (0x290000+)
+    if (hasFilesystemData) {
+        // Initialize filesystem handling on first filesystem chunk
+        if (!filesystem_initialized) {
+            dbgln("[OTA] Initializing filesystem deployment from combined firmware");
+            
+            // Find the SPIFFS partition
+            spiffs_partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+            
+            if (!spiffs_partition) {
+                dbgln("[OTA] ERROR: SPIFFS partition not found for filesystem deployment!");
+                return false;
+            }
+            
+            dbgln("[OTA] Found SPIFFS partition for filesystem deployment, erasing...");
+            
+            // Erase the SPIFFS partition first
+            esp_err_t err = esp_partition_erase_range(spiffs_partition, 0, spiffs_partition->size);
+            if (err != ESP_OK) {
+                dbgln("[OTA] ERROR: Failed to erase SPIFFS partition: " + String(esp_err_to_name(err)));
+                return false;
+            }
+            
+            dbgln("[OTA] SPIFFS partition erased, ready for filesystem data");
+            filesystem_initialized = true;
+            filesystem_written = 0;
+        }
+        
+        // Calculate filesystem portion of this chunk
+        size_t fs_start_in_chunk = 0;
+        size_t fs_len_in_chunk = len;
+        
+        if (chunk_start < SPIFFS_OFFSET) {
+            // Chunk starts before filesystem area, skip the beginning
+            fs_start_in_chunk = SPIFFS_OFFSET - chunk_start;
+            fs_len_in_chunk -= fs_start_in_chunk;
+        }
+        
+        if (fs_len_in_chunk > 0) {
+            // Check if we would exceed the filesystem partition size
+            if (filesystem_written + fs_len_in_chunk > spiffs_partition->size) {
+                size_t remaining = spiffs_partition->size - filesystem_written;
+                if (remaining == 0) {
+                    dbgln("[OTA] Filesystem partition is full (" + String(spiffs_partition->size) + 
+                          " bytes), skipping remaining filesystem data");
+                } else {
+                    dbgln("[OTA] Truncating filesystem write to fit partition: " + String(fs_len_in_chunk) + 
+                          " -> " + String(remaining) + " bytes");
+                    fs_len_in_chunk = remaining;
+                }
+            }
+            
+            if (fs_len_in_chunk > 0) {
+                const uint8_t* fs_data = data + fs_start_in_chunk;
+                
+                // Only log write details every 4th chunk to reduce verbosity
+                if (combined_chunk_count % 4 == 0) {
+                    dbgln("[OTA] Writing " + String(fs_len_in_chunk) + " bytes of filesystem data (chunk offset: " + 
+                          String(fs_start_in_chunk) + ")");
+                }
+                
+                // Write filesystem data directly to SPIFFS partition
+                esp_err_t err = esp_partition_write(spiffs_partition, filesystem_written, fs_data, fs_len_in_chunk);
+                if (err != ESP_OK) {
+                    dbgln("[OTA] ERROR: Failed to write filesystem data at offset " + String(filesystem_written) + ": " + String(esp_err_to_name(err)));
+                    return false;
+                }
+                
+                filesystem_written += fs_len_in_chunk;
+                // Only log progress details every 4th chunk to reduce verbosity
+                if (combined_chunk_count % 4 == 0) {
+                    dbgln("[OTA] Combined firmware: wrote " + String(fs_len_in_chunk) + 
+                          " filesystem bytes, total filesystem written: " + String(filesystem_written) +
+                          "/" + String(spiffs_partition->size));
+                }
+            }
+        }
     }
     
-    // Only log write details every 4th chunk to reduce verbosity
-    if (combined_chunk_count % 4 == 0) {
-      dbgln("[OTA] Writing " + String(app_len_in_chunk) + " bytes of application data (chunk offset: " + 
-            String(app_start_in_chunk) + ")");
-    }
-    
-    // Write application data to OTA partition
-    esp_err_t err = esp_ota_write(ota_context.ota_handle, app_data, app_len_in_chunk);
-    if (err != ESP_OK) {
-        dbgln("[OTA] esp_ota_write failed: " + String(esp_err_to_name(err)));
-        return false;
-    }
-    
-    ota_context.written += app_len_in_chunk;
-    // Only log progress details every 4th chunk to reduce verbosity
-    if (combined_chunk_count % 4 == 0) {
-      dbgln("[OTA] Combined firmware: wrote " + String(app_len_in_chunk) + 
-            " app bytes, total app written: " + String(ota_context.written) +
-            "/" + String(ota_context.update_partition->size));
-    }
     return true;
 }
 
@@ -403,6 +509,9 @@ bool finalizeCombinedOTA() {
     
     ota_context.finalization_successful = true;
     dbgln("[OTA] Combined firmware OTA finalized successfully");
+    dbgln("[OTA] ✓ Application firmware deployed to OTA partition");
+    dbgln("[OTA] ✓ Filesystem deployed to LittleFS partition");
+    dbgln("[OTA] Combined firmware deployment complete - both firmware and web interface updated");
     return true;
 }
 
@@ -447,11 +556,6 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     response += String("esp_rssi ") + String(WiFi.RSSI()) + "\n";
     response += String("esp_heap_free_bytes ") + String(ESP.getFreeHeap()) + "\n";
 
-    CPULoadInfo cpuLoad = getCPULoad();
-    if (cpuLoad.isValid) {
-        response += String("esp_cpu0_load_percent ") + String(cpuLoad.core0Load, 2) + "\n";
-        response += String("esp_cpu1_load_percent ") + String(cpuLoad.core1Load, 2) + "\n";
-    }
 
     // Modbus metrics
     ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
@@ -657,11 +761,6 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     addSystemInfo("ESP Gateway", WiFi.gatewayIP().toString());
     addSystemInfo("ESP BSSID", WiFi.BSSIDstr());
 
-    CPULoadInfo cpuLoad = getCPULoad();
-    if (cpuLoad.isValid) {
-        addSystemInfo("ESP CPU Core 0 Load", String(cpuLoad.core0Load, 1) + "%");
-        addSystemInfo("ESP CPU Core 1 Load", String(cpuLoad.core1Load, 1) + "%");
-    }
 
     ModbusClientRTU* rtu = modbusCache->getModbusRTUClient();
     addSystemInfo("Primary RTU Messages", String(rtu->getMessageCount()));
@@ -793,18 +892,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     request->redirect("/baudrate");
   });
 
-  server->on("/reboot", HTTP_GET, [config](AsyncWebServerRequest *request){
-    logHeapMemory("/reboot");
-    const String &hostname = config->getHostname();
-    auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Really?", false, hostname);
-    sendButton(response, "Back", "/");
-    response->print("<form method=\"post\">"
-        "<button class=\"r\">Yes, do it!</button>"
-      "</form>");
-    sendResponseTrailer(response);
-    request->send(response);
-  });
+  // Legacy /reboot GET handler removed - now handled by Preact SPA
   server->on("/reboot", HTTP_POST, [](AsyncWebServerRequest *request){
     dbgln("[webserver] POST /reboot");
     request->redirect("/");
@@ -812,323 +900,84 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     ESP.restart();
     dbgln("[webserver] rebooted...")
   });
-  server->on("/config", HTTP_GET, [config](AsyncWebServerRequest *request){
-    logHeapMemory("/config");
-    const String &hostname = config->getHostname();
-    auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Configuration", false, hostname);
-    response->print("<form method=\"post\">");
-    response->printf("<table>"
-                      "<tr>"
-                        "<td>"
-                          "<label for=\"hostname\">Hostname</label>"
-                        "</td>"
-                        "<td>"
-                          "<input type=\"text\" id=\"hostname\" name=\"hostname\" value=\"%s\"><br/>", config->getHostname().c_str());
-    response->print("</td></tr>");
-    response->printf("<tr>"
-                      "<td>"
-                        "<label for=\"pi\">Modbus Client Polling Interval (ms)&nbsp;</label>"
-                      "</td>"
-                      "<td>"
-                        "<input type=\"number\" min=\"0\" id=\"pi\" name=\"pi\" value=\"%lu\">", config->getPollingInterval());
-    response->print("</td></tr>");
-    // Checkbox for Modbus Client is RTU
-    response->printf("<tr>"
-                      "<td>"
-                        "<label for=\"clientIsRTU\">Modbus Client is RTU</label>"
-                      "</td>"
-                      "<td>"
-                        "<input type=\"checkbox\" id=\"clientIsRTU\" name=\"clientIsRTU\" %s><br/>", config->getClientIsRTU() ? "checked" : "");
-    response->print("</td></tr></table>");
-    // Modbus Primary RTU section
-    response->print("<div id=\"rtuSettings\" style=\"display:none;\">"
-      "<h3>Modbus RTU Client</h3>"
-      "<table>");
-    response->print(
-        "<tr>"
-          "<td>"
-            "<label for=\"mb\">Baud rate</label>"
-          "</td>"
-          "<td>");
-    response->printf("<input type=\"number\" min=\"0\" id=\"mb\" name=\"mb\" value=\"%lu\">", config->getModbusBaudRate());
-    response->print("</td>"
-        "</tr>");
-    response->printf("<tr>"
-          "<td>"
-            "<label for=\"md\">Data bits</label>"
-          "</td>"
-          "<td>");
-    response->printf("<input type=\"number\" min=\"5\" max=\"8\" id=\"md\" name=\"md\" value=\"%d\">", config->getModbusDataBits());
-    response->print("</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"mp\">Parity</label>"
-          "</td>"
-          "<td>");
-    response->printf("<select id=\"mp\" name=\"mp\" data-value=\"%d\">", config->getModbusParity());
-    response->print("<option value=\"0\">None</option>"
-              "<option value=\"2\">Even</option>"
-              "<option value=\"3\">Odd</option>"
-            "</select>"
-          "</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"ms\">Stop bits</label>"
-          "</td>"
-          "<td>");
-    response->printf("<select id=\"ms\" name=\"ms\" data-value=\"%d\">", config->getModbusStopBits());
-    response->print("<option value=\"1\">1 bit</option>"
-              "<option value=\"2\">1.5 bits</option>"
-              "<option value=\"3\">2 bits</option>"
-            "</select>"
-          "</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"mr\">RTS Pin</label>"
-          "</td>"
-          "<td>");
-    response->printf("<select id=\"mr\" name=\"mr\" data-value=\"%d\">", config->getModbusRtsPin());
-    response->print("<option value=\"-1\">Auto</option>"
-              "<option value=\"4\">D4</option>"
-              "<option value=\"13\">D13</option>"
-              "<option value=\"14\">D14</option>"
-              "<option value=\"18\">D18</option>"
-              "<option value=\"19\">D19</option>"
-              "<option value=\"21\">D21</option>"
-              "<option value=\"22\">D22</option>"
-              "<option value=\"23\">D23</option>"
-              "<option value=\"25\">D25</option>"
-              "<option value=\"26\">D26</option>"
-              "<option value=\"27\">D27</option>"
-              "<option value=\"32\">D32</option>"
-              "<option value=\"33\">D33</option>"
-            "</select>"
-          "</td>"
-        "</tr>"
-      "</table>"
-    "</div>");
-    // TCP Settings section
-    response->print("<div id=\"tcpSettings\" style=\"display:none;\">"
-        "<h3>Modbus TCP Client Settings</h3>"
-        "<table>"
-        "<tr>"
-          "<td>"
-            "<label for=\"sip\">Server IP</label>"
-          "</td>"
-          "<td>");
-    response->printf("<input type=\"text\" id=\"sip\" name=\"sip\" value=\"%s\">", config->getTargetIP().c_str());
-    response->print("</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"tp2\">Server Port</label>"
-          "</td>"
-          "<td>");
-    response->printf("<input type=\"number\" min=\"1\" max=\"65535\" id=\"tp2\" name=\"tp2\" value=\"%d\">", config->getTcpPort2());
-
-    response->print("</td>"
-        "</tr>"
-        "</table>"
-        "</div>"
-        "<h3>Modbus Secondary RTU (server/slave)</h3>"
-        "<table>"
-        "<tr>"
-          "<td>"
-            "<label for=\"mb2\">Baud rate</label>"
-          "</td>"
-          "<td>");
-    response->printf("<input type=\"number\" min=\"0\" id=\"mb2\" name=\"mb2\" value=\"%lu\">", config->getModbusBaudRate2());
-    response->print("</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"md2\">Data bits</label>"
-          "</td>"
-          "<td>");
-    response->printf("<input type=\"number\" min=\"5\" max=\"8\" id=\"md2\" name=\"md2\" value=\"%d\">", config->getModbusDataBits2());
-    response->print("</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"mp2\">Parity</label>"
-          "</td>"
-          "<td>");
-    response->printf("<select id=\"mp2\" name=\"mp2\" data-value=\"%d\">", config->getModbusParity2());
-    response->print("<option value=\"0\">None</option>"
-              "<option value=\"2\">Even</option>"
-              "<option value=\"3\">Odd</option>"
-            "</select>"
-          "</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"ms2\">Stop bits</label>"
-          "</td>"
-          "<td>");
-    response->printf("<select id=\"ms2\" name=\"ms2\" data-value=\"%d\">", config->getModbusStopBits2());
-    response->print("<option value=\"1\">1 bit</option>"
-              "<option value=\"2\">1.5 bits</option>"
-              "<option value=\"3\">2 bits</option>"
-            "</select>"
-          "</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"mr2\">RTS Pin</label>"
-          "</td>"
-          "<td>");
-    response->printf("<select id=\"mr2\" name=\"mr2\" data-value=\"%d\">", config->getModbusRtsPin2());
-    response->print("<option value=\"-1\">Auto</option>"
-              "<option value=\"4\">D4</option>"
-              "<option value=\"13\">D13</option>"
-              "<option value=\"14\">D14</option>"
-              "<option value=\"18\">D18</option>"
-              "<option value=\"19\">D19</option>"
-              "<option value=\"21\">D21</option>"
-              "<option value=\"22\">D22</option>"
-              "<option value=\"23\">D23</option>"
-              "<option value=\"25\">D25</option>"
-              "<option value=\"26\">D26</option>"
-              "<option value=\"27\">D27</option>"
-              "<option value=\"32\">D32</option>"
-              "<option value=\"33\">D33</option>"
-            "</select>"
-          "</td>"
-        "</tr>"
-        "</table>"
-        "<h3>Modbus Secondary TCP Server</h3>"
-        "<table>"
-        "<tr>"
-          "<td>"
-            "<label for=\"mb2\">Port Number</label>"
-          "</td>"
-          "<td>");
-    response->printf("<input type=\"number\" min=\"1\" max=\"65535\" id=\"tp3\" name=\"tp3\" value=\"%d\">", config->getTcpPort3());
-    response->print("</td>"
-        "</tr>"
-        "</table>"
-        "<hr>"
-        "<h3>Serial (Debug)</h3>"
-        "<table>"
-        "<tr>"
-          "<td>"
-            "<label for=\"sb\">Baud rate</label>"
-          "</td>"
-          "<td>");
-    response->printf("<input type=\"number\" min=\"0\" id=\"sb\" name=\"sb\" value=\"%lu\">", config->getSerialBaudRate());
-    response->print("</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"sd\">Data bits</label>"
-          "</td>"
-          "<td>");
-    response->printf("<input type=\"number\" min=\"5\" max=\"8\" id=\"sd\" name=\"sd\" value=\"%d\">", config->getSerialDataBits());
-    response->print("</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"sp\">Parity</label>"
-          "</td>"
-          "<td>");
-    response->printf("<select id=\"sp\" name=\"sp\" data-value=\"%d\">", config->getSerialParity());
-    response->print("<option value=\"0\">None</option>"
-              "<option value=\"2\">Even</option>"
-              "<option value=\"3\">Odd</option>"
-            "</select>"
-          "</td>"
-        "</tr>"
-        "<tr>"
-          "<td>"
-            "<label for=\"ss\">Stop bits</label>"
-          "</td>"
-          "<td>");
-    response->printf("<select id=\"ss\" name=\"ss\" data-value=\"%d\">", config->getSerialStopBits());
-    response->print("<option value=\"1\">1 bit</option>"
-              "<option value=\"2\">1.5 bits</option>"
-              "<option value=\"3\">2 bits</option>"
-            "</select>"
-          "</td>"
-          "</tr>");
-    response->printf("</table>");
-    response->print("<h3>Network Settings</h3>"
-      "<table>"
-      "<tr>"
-        "<td>"
-          "<label for=\"useStaticIP\">Use Static IP</label>"
-        "</td>"
-        "<td>");
-    response->printf("<input type=\"checkbox\" id=\"useStaticIP\" name=\"useStaticIP\" %s>", config->getUseStaticIP() ? "checked" : "");
-    response->print("</td>"
-      "</tr>"
-      "<tr>"
-        "<td>"
-          "<label for=\"staticIP\">Static IP Address</label>"
-        "</td>"
-        "<td>");
-    response->printf("<input type=\"text\" id=\"staticIP\" name=\"staticIP\" value=\"%s\" pattern=\"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$\">", config->getStaticIP().c_str());
-    response->print("</td>"
-      "</tr>"
-      "<tr>"
-        "<td>"
-          "<label for=\"staticGateway\">Gateway IP</label>"
-        "</td>"
-        "<td>");
-    response->printf("<input type=\"text\" id=\"staticGateway\" name=\"staticGateway\" value=\"%s\" pattern=\"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$\">", config->getStaticGateway().c_str());
-    response->print("</td>"
-      "</tr>"
-      "<tr>"
-        "<td>"
-          "<label for=\"staticSubnet\">Subnet Mask</label>"
-        "</td>"
-        "<td>");
-    response->printf("<input type=\"text\" id=\"staticSubnet\" name=\"staticSubnet\" value=\"%s\" pattern=\"^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$\">", config->getStaticSubnet().c_str());
-    response->print("</td>"
-      "</tr>"
-      "</table>");
-    response->print("<button class=\"r\">Save</button>"
-      "</form>"
-      "<p></p>");
-    sendButton(response, "Back", "/");
-    response->print("<script>"
-      "(function(){"
-        "var s = document.querySelectorAll('select[data-value]');"
-        "for(d of s){"
-          "d.querySelector(`option[value='${d.dataset.value}']`).selected=true"
-      "}})();"
-      "document.addEventListener('DOMContentLoaded', function() {"
-      "  var checkbox = document.getElementById('clientIsRTU');"
-      "  var showRTU = function() {"
-      "    document.getElementById('rtuSettings').style.display = checkbox.checked ? 'block' : 'none';"
-      "    document.getElementById('tcpSettings').style.display = checkbox.checked ? 'none' : 'block';"
-      "  };"
-      "  checkbox.addEventListener('change', showRTU);"
-      "  showRTU();"
-      "  var staticIPCheckbox = document.getElementById('useStaticIP');"
-      "  var staticIPFields = ['staticIP', 'staticGateway', 'staticSubnet'];"
-      "  var toggleStaticFields = function() {"
-      "    staticIPFields.forEach(function(field) {"
-      "      document.getElementById(field).disabled = !staticIPCheckbox.checked;"
-      "    });"
-      "  };"
-      "  staticIPCheckbox.addEventListener('change', toggleStaticFields);"
-      "  toggleStaticFields();"
-      "});"
-      "</script>");
-    sendResponseTrailer(response);
-    request->send(response);
+  server->on("/config.json", HTTP_GET, [config](AsyncWebServerRequest *request){
+    logHeapMemory("/config.json");
+    
+    // Check if we can accept more connections
+    if (!canAcceptConnection()) {
+      request->send(503, "application/json", "{\"error\":\"Server busy\"}");
+      return;
+    }
+    
+    DynamicJsonDocument doc(2048);
+    
+    doc["hostname"] = config->getHostname();
+    doc["pi"] = config->getPollingInterval();
+    doc["clientIsRTU"] = config->getClientIsRTU();
+    
+    // RTU Settings
+    doc["mb"] = config->getModbusBaudRate();
+    doc["md"] = config->getModbusDataBits();
+    doc["mp"] = config->getModbusParity();
+    doc["ms"] = config->getModbusStopBits();
+    doc["mr"] = config->getModbusRtsPin();
+    
+    // TCP Settings
+    doc["sip"] = config->getTargetIP();
+    doc["tp2"] = config->getTcpPort2();
+    
+    // Secondary RTU Settings
+    doc["mb2"] = config->getModbusBaudRate2();
+    doc["md2"] = config->getModbusDataBits2();
+    doc["mp2"] = config->getModbusParity2();
+    doc["ms2"] = config->getModbusStopBits2();
+    doc["mr2"] = config->getModbusRtsPin2();
+    
+    // TCP Server Settings
+    doc["tp3"] = config->getTcpPort3();
+    
+    // Serial Debug Settings
+    doc["sb"] = config->getSerialBaudRate();
+    doc["sd"] = config->getSerialDataBits();
+    doc["sp"] = config->getSerialParity();
+    doc["ss"] = config->getSerialStopBits();
+    
+    // Network Settings
+    doc["useStaticIP"] = config->getUseStaticIP();
+    doc["staticIP"] = config->getStaticIP();
+    doc["staticGateway"] = config->getStaticGateway();
+    doc["staticSubnet"] = config->getStaticSubnet();
+    
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    request->send(200, "application/json", jsonResponse);
+    
+    // Release the connection count
+    releaseConnection();
   });
+  // Legacy GET /config handler removed - now handled by Preact SPA
   server->on("/config", HTTP_POST, [config](AsyncWebServerRequest *request){
     dbgln("[webserver] POST /config");
     bool validIP = true;
     if (request->hasParam("hostname", true)) {
         String hostname = request->getParam("hostname", true)->value();
+        String oldHostname = config->getHostname();
         config->setHostname(hostname);  // Save the hostname in preferences
         dbgln("[webserver] saved hostname");
+        
+        // Restart mDNS if hostname changed and WiFi is connected
+        if (hostname != oldHostname && WiFi.status() == WL_CONNECTED) {
+            dbgln("[webserver] Hostname changed, restarting mDNS");
+            MDNS.end();  // Stop current mDNS
+            if (MDNS.begin(hostname.c_str())) {
+                dbgln("[mDNS] Restarted with new hostname: " + hostname);
+                // Re-add services
+                MDNS.addService("http", "tcp", 80);
+                MDNS.addService("modbus", "tcp", 502);
+            } else {
+                logErrln("[mDNS] Failed to restart with new hostname");
+            }
+        }
     }
     if (request->hasParam("tp", true)){
       auto port = request->getParam("tp", true)->value().toInt();
@@ -1239,16 +1088,6 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       config->setPollingInterval(pollingInterval);
       dbgln("[webserver] saved polling interval");
     }
-    // Redirect logic with error handling
-    if (validIP) {
-        // Redirect to the config page or a success page
-        request->redirect("/");
-    } else {
-        // Redirect back to the form with an error message
-        // This can be implemented in different ways, for example:
-        request->redirect("/config?error=invalidIP");
-        // Then, on the GET handler for "/config", check for this error parameter and display a message if present
-    }
     // Handling new checkbox input for Modbus Client is RTU
     if (request->hasParam("clientIsRTU", true)){
       // If the parameter exists, the checkbox was checked
@@ -1299,17 +1138,17 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
             validIP = false;
         }
     }
+    
+    // Return JSON response instead of redirect for Preact SPA compatibility
+    if (validIP) {
+        String jsonResponse = "{\"success\": true, \"message\": \"Configuration updated successfully\"}";
+        request->send(200, "application/json", jsonResponse);
+    } else {
+        String jsonResponse = "{\"success\": false, \"message\": \"Invalid IP address provided\"}";
+        request->send(400, "application/json", jsonResponse);
+    }
   });
-  server->on("/debug", HTTP_GET, [config](AsyncWebServerRequest *request){
-    logHeapMemory("/debug");
-    const String &hostname = config->getHostname();
-    auto *response = request->beginResponseStream("text/html");
-    sendResponseHeader(response, "Debug RTU Client", false, hostname);
-    sendDebugForm(response, "1", "1", "3", "1");
-    sendButton(response, "Back", "/");
-    sendResponseTrailer(response);
-    request->send(response);
-  });
+  // Legacy /debug GET handler removed - now handled by Preact SPA
   server->on("/debug", HTTP_POST, [modbusCache, config](AsyncWebServerRequest *request){
     dbgln("[webserver] POST /debug");
     const String &hostname = config->getHostname();
@@ -1551,24 +1390,118 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     }
   });
 
-  server->on("/wifi", HTTP_GET, [config](AsyncWebServerRequest *request){
-    logHeapMemory("/wifi");
-    auto *response = request->beginResponseStream("text/html");
-    const String &hostname = config->getHostname();
-
-    sendResponseHeader(response, "WiFi reset", true, hostname);
-    response->print("<p class=\"e\">"
-        "This will delete the stored WiFi config<br/>"
-        "and restart the ESP in AP mode.<br/> Are you sure?"
-      "</p>");
-    sendButton(response, "Back", "/");
-    response->print("<p></p>"
-      "<form method=\"post\">"
-        "<button class=\"r\">Yes, do it!</button>"
-      "</form>");    
-    sendResponseTrailer(response);
-    request->send(response);
+  // Developer-only endpoint to wipe LittleFS filesystem for testing
+  server->on("/wipe-filesystem", HTTP_POST, [](AsyncWebServerRequest *request) {
+      dbgln("[webserver] POST /wipe-filesystem - DEVELOPER TESTING ENDPOINT");
+      
+      // Format the LittleFS filesystem (wipes all files)
+      if (LittleFS.format()) {
+          dbgln("[webserver] LittleFS filesystem wiped successfully");
+          String jsonResponse = "{\"success\": true, \"message\": \"Filesystem wiped successfully. Device may need reboot.\"}";
+          request->send(200, "application/json", jsonResponse);
+      } else {
+          dbgln("[webserver] LittleFS filesystem wipe failed");
+          String jsonResponse = "{\"success\": false, \"message\": \"Failed to wipe filesystem\"}";
+          request->send(500, "application/json", jsonResponse);
+      }
   });
+
+  // Dedicated filesystem upload handler (separate from firmware OTA)
+  server->on("/upload-filesystem", HTTP_POST, [&](AsyncWebServerRequest *request){
+      // This will be called when the upload is complete
+      if (filesystemUploadRestart) {
+          dbgln("[webserver] Filesystem upload completed successfully");
+      }
+  }, [&](AsyncWebServerRequest *request, const String& filename, size_t index, uint8_t *data, size_t len, bool final){
+      dbgln("[webserver] POST /upload-filesystem - Filesystem upload handler");
+      
+      static const esp_partition_t* spiffs_partition = nullptr;
+      static size_t totalSize = 0;
+      static bool uploadError = false;
+      
+      if (index == 0) {
+          // First chunk - initialize upload
+          dbgln("[webserver] Starting filesystem upload: " + filename);
+          totalSize = 0;
+          uploadError = false;
+          filesystemUploadRestart = false;
+          
+          // Find the SPIFFS partition
+          spiffs_partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+          
+          if (!spiffs_partition) {
+              dbgln("[webserver] SPIFFS partition not found");
+              request->send(500, "text/plain", "SPIFFS partition not found");
+              uploadError = true;
+              return;
+          }
+          
+          dbgln("[webserver] Found SPIFFS partition, erasing...");
+          
+          // Erase the SPIFFS partition first
+          esp_err_t err = esp_partition_erase_range(spiffs_partition, 0, spiffs_partition->size);
+          if (err != ESP_OK) {
+              dbgln("[webserver] Failed to erase SPIFFS partition: " + String(err));
+              request->send(500, "text/plain", "Failed to erase filesystem partition");
+              uploadError = true;
+              return;
+          }
+          
+          dbgln("[webserver] SPIFFS partition erased, ready for data");
+      }
+      
+      if (uploadError) {
+          return; // Skip processing if there was an error
+      }
+      
+      if (spiffs_partition) {
+          // Write chunk directly to SPIFFS partition
+          esp_err_t err = esp_partition_write(spiffs_partition, totalSize, data, len);
+          
+          if (err != ESP_OK) {
+              dbgln("[webserver] Failed to write to SPIFFS partition at offset " + String(totalSize) + ": " + String(err));
+              request->send(500, "text/plain", "Failed to write to filesystem partition");
+              uploadError = true;
+              return;
+          }
+          
+          totalSize += len;
+          dbgln("[webserver] Written " + String(len) + " bytes at offset " + String(totalSize - len) + ", total: " + String(totalSize));
+      }
+      
+      if (final && !uploadError) {
+          dbgln("[webserver] Filesystem upload complete. Total size: " + String(totalSize));
+          dbgln("[webserver] Filesystem upload successful. Scheduling restart...");
+          
+          // Send success response
+          request->send(200, "text/html", 
+              "<html><body style='background:#1a1a1a;color:white;text-align:center;font-family:Arial;'>"
+              "<h2>Filesystem Upload Successful!</h2>"
+              "<p>The device will reboot in 5 seconds...</p>"
+              "<p>Please wait 45-60 seconds and then <a href='/' style='color:#1fa3ec;'>click here</a> to access the full web interface.</p>"
+              "<script>"
+              "var countdown = 5;"
+              "function updateCountdown() {"
+              "  document.body.innerHTML = '<h2>Device Rebooting in ' + countdown + ' seconds...</h2><p>Please wait and <a href=\"/\" style=\"color:#1fa3ec;\">click here</a> after reboot.</p>';"
+              "  countdown--;"
+              "  if (countdown < 0) {"
+              "    document.body.innerHTML = '<h2>Device Rebooting Now...</h2><p>Please wait 45 seconds and <a href=\"/\" style=\"color:#1fa3ec;\">click here</a> to reload.</p>';"
+              "    setTimeout(function(){window.location.href='/';}, 45000);"
+              "  } else {"
+              "    setTimeout(updateCountdown, 1000);"
+              "  }"
+              "}"
+              "setTimeout(updateCountdown, 1000);"
+              "</script>"
+              "</body></html>");
+          
+          // Schedule restart for 5 seconds from now
+          filesystemUploadRestart = true;
+          restartTime = millis() + 5000;
+      }
+  });
+
+  // Legacy /wifi GET handler removed - now handled by Preact SPA
   server->on("/wifi", HTTP_POST, [wm](AsyncWebServerRequest *request){
     dbgln("[webserver] POST /wifi");
     inConfigPortal = true; // Set flag before erasing to prevent interference
@@ -1620,13 +1553,7 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     response->addHeader("ETag", ETAG);
     request->send(response);
   });
-  server->on("/log", HTTP_GET, [config](AsyncWebServerRequest *request) {
-    logHeapMemory("/log");
-    
-    AsyncResponseStream *response = request->beginResponseStream("text/html");
-    sendLogPage(response, config->getHostname());
-    request->send(response);
-  });
+  // Legacy /log GET handler removed - now handled by Preact SPA
   
   // Add log data endpoint for AJAX fallback - ultra lightweight version
   server->on("/logdata", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -1705,16 +1632,170 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     request->send(200, "text/plain", "OK");
   });
 
+  // Root handler - detect filesystem and redirect if missing
+  server->on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+      logHeapMemory("/");
+      
+      // Check if LittleFS is mounted and contains the Preact app
+      if (LittleFS.exists("/web/index.html")) {
+          // Filesystem exists, serve the Preact app
+          request->send(LittleFS, "/web/index.html", "text/html");
+      } else {
+          // Filesystem missing, redirect to upload page
+          dbgln("[webserver] Filesystem missing, redirecting to /filesystem-upload");
+          request->redirect("/filesystem-upload");
+      }
+  });
+
+  // Filesystem upload page for legacy devices
+  server->on("/filesystem-upload", HTTP_GET, [config](AsyncWebServerRequest *request) {
+      logHeapMemory("/filesystem-upload");
+      const String &hostname = config->getHostname();
+      auto *response = request->beginResponseStream("text/html");
+      
+      sendResponseHeader(response, "Upload Filesystem", true, hostname);
+      
+      response->print(
+          "<div style='text-align: left; max-width: 600px; margin: 0 auto;'>"
+          "<h4>Filesystem Upload Required</h4>"
+          "<p>This device needs the web interface filesystem to be uploaded. "
+          "This is a one-time setup required after upgrading from legacy firmware.</p>"
+          
+          "<h4>Steps:</h4>"
+          "<ol>"
+          "<li><strong>Build the filesystem:</strong><br/>"
+          "<code>pio run -e esp32debug -t buildfs</code></li>"
+          "<li><strong>Locate the file:</strong><br/>"
+          "Find <code>littlefs.bin</code> in <code>.pio/build/esp32debug/</code></li>"
+          "<li><strong>Upload below:</strong> Select the littlefs.bin file and click Upload</li>"
+          "</ol>"
+          
+          "<div style='background: #333; padding: 15px; border-radius: 5px; margin: 15px 0;'>"
+          "<form method='post' action='/upload-filesystem' enctype='multipart/form-data'>"
+          "<div style='margin: 10px 0;'>"
+          "<label for='file' style='display: block; margin-bottom: 5px;'>Select LittleFS file:</label>"
+          "<input type='file' id='file' name='file' accept='.bin' required "
+          "style='width: 100%; padding: 5px; background: #222; color: white; border: 1px solid #555;'/>"
+          "</div>"
+          "<div style='margin: 15px 0;'>"
+          "<button type='submit' style='width: 100%; padding: 10px; background: #1fa3ec; color: white; "
+          "border: none; border-radius: 5px; font-size: 16px; cursor: pointer;'>"
+          "Upload Filesystem</button>"
+          "</div>"
+          "</form>"
+          "</div>"
+          
+          "<div style='background: #2a2a2a; padding: 10px; border-radius: 5px; font-size: 14px;'>"
+          "<strong>Note:</strong> After successful upload, the device will reboot and the full web interface will be available."
+          "</div>"
+          "</div>"
+      );
+      
+      sendResponseTrailer(response);
+      request->send(response);
+  });
+
+  // Optimized asset serving routes for Preact - prevents filesystem blocking on simultaneous requests
+  server->on("/assets/*", HTTP_GET, [](AsyncWebServerRequest *request) {
+      String path = request->url();
+      
+      // Check if we can accept more connections
+      if (!canAcceptConnection()) {
+          request->send(503, "text/plain", "Server busy");
+          return;
+      }
+      
+      // Convert /assets/* to /web/assets/* for filesystem
+      String fsPath = "/web" + path;
+      
+      // Determine content type
+      String contentType = "text/plain";
+      if (path.endsWith(".js")) {
+          contentType = "application/javascript";
+      } else if (path.endsWith(".css")) {
+          contentType = "text/css";
+      } else if (path.endsWith(".json")) {
+          contentType = "application/json";
+      }
+      
+      // Try to serve the exact file first
+      if (LittleFS.exists(fsPath)) {
+          request->send(LittleFS, fsPath, contentType);
+          releaseConnection();
+          return;
+      }
+      
+      // Asset not found - try fallback for versioned assets (e.g., index.abc123.js)
+      String assetType = "";
+      if (path.indexOf("/index.") >= 0 && path.endsWith(".js")) {
+          assetType = "index";
+      } else if (path.indexOf("/vendor.") >= 0 && path.endsWith(".js")) {
+          assetType = "vendor";
+      } else if (path.indexOf("/style.") >= 0 && path.endsWith(".css")) {
+          assetType = "style";
+      }
+      
+      if (assetType != "") {
+          // Quick fallback - try a few common patterns first before directory scan
+          String basePath = "/web/assets/" + assetType;
+          String extensions[] = {".js", ".css"};
+          String patterns[] = {".min", "", ".prod", ".bundle"};
+          
+          for (String ext : extensions) {
+              if ((assetType != "style" && ext == ".css") || (assetType == "style" && ext == ".js")) continue;
+              for (String pattern : patterns) {
+                  String tryPath = basePath + pattern + ext;
+                  if (LittleFS.exists(tryPath)) {
+                      dbgln("[webserver] Asset fallback: " + path + " -> " + tryPath);
+                      request->send(LittleFS, tryPath, contentType);
+                      releaseConnection();
+                      return;
+                  }
+              }
+          }
+      }
+      
+      // Still not found - 404
+      request->send(404, "text/plain", "Asset not found: " + path);
+      releaseConnection();
+  });
+
+  // Legacy /assets/* route for compatibility
+  server->on("/assets/*", HTTP_GET, [](AsyncWebServerRequest *request) {
+      String path = "/web" + request->url();  // Prepend /web
+      
+      // Check if we can accept more connections
+      if (!canAcceptConnection()) {
+          request->send(503, "text/plain", "Server busy");
+          return;
+      }
+      
+      String contentType = "text/plain";
+      if (path.endsWith(".js")) {
+          contentType = "application/javascript";
+      } else if (path.endsWith(".css")) {
+          contentType = "text/css";
+      } else if (path.endsWith(".json")) {
+          contentType = "application/json";
+      }
+      
+      if (LittleFS.exists(path)) {
+          request->send(LittleFS, path, contentType);
+          releaseConnection();
+          return;
+      }
+      
+      request->send(404, "text/plain", "Asset not found");
+      releaseConnection();
+  });
+
   // Catch all route for SPA - redirect to modern UI for unhandled routes
   server->onNotFound([](AsyncWebServerRequest *request) {
       String path = request->url();
       
       // Skip API routes and existing legacy routes
       if (path.startsWith("/api") || path.startsWith("/metrics") || 
-          path.startsWith("/config") || 
-          path.startsWith("/debug") || path.startsWith("/log") || 
-          path.startsWith("/wifi") || 
-          path.startsWith("/reboot") || path.startsWith("/style.css") || 
+          path.startsWith("/style.css") || 
           path.startsWith("/favicon.ico") || path.startsWith("/baudrate") ||
           path.startsWith("/menu")) {
           // Let the default 404 handler handle these
@@ -1722,22 +1803,15 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
           return;
       }
 
-      // Check if it's a static web asset request
-      if (path.startsWith("/web/assets/") || path.startsWith("/assets/")) {
-          // Try to serve the file from LittleFS with proper MIME type
-          String filePath = path.startsWith("/web/") ? path : "/web" + path;
+      // Handle /version.json specifically (non-asset JSON file)
+      if (path == "/version.json") {
+          String filePath = "/web/version.json";
           if (LittleFS.exists(filePath)) {
-              String contentType = "text/plain";
-              if (path.endsWith(".js")) {
-                  contentType = "application/javascript";
-              } else if (path.endsWith(".css")) {
-                  contentType = "text/css";
-              } else if (path.endsWith(".json")) {
-                  contentType = "application/json";
-              }
-              request->send(LittleFS, filePath, contentType);
+              request->send(LittleFS, filePath, "application/json");
               return;
           }
+          request->send(404, "application/json", "{\"error\":\"Version file not found\"}");
+          return;
       }
 
       // For all other routes, serve the Preact SPA

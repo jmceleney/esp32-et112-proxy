@@ -43,6 +43,36 @@ def run_command(command):
         debug_log(f"Command failed: {e.stderr}")
         return None
 
+def get_build_timestamp(project_dir):
+    """Extract build timestamp from version.h"""
+    version_h_path = os.path.join(project_dir, "include", "version.h")
+    
+    if not os.path.exists(version_h_path):
+        debug_log("version.h not found, cannot determine build timestamp")
+        return None
+    
+    try:
+        with open(version_h_path, 'r') as f:
+            content = f.read()
+            
+        # Look for BUILD_TIMESTAMP define
+        import re
+        match = re.search(r'#define BUILD_TIMESTAMP "([^"]+)"', content)
+        if match:
+            timestamp_str = match.group(1)
+            # Parse timestamp: "2025-09-04 08:32:58"
+            from datetime import datetime
+            timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+            debug_log(f"Build timestamp from version.h: {timestamp_str}")
+            return timestamp
+        else:
+            debug_log("BUILD_TIMESTAMP not found in version.h")
+            return None
+            
+    except Exception as e:
+        debug_log(f"Error reading build timestamp: {e}")
+        return None
+
 def create_combined_firmware(source, target, env):
     """Create combined firmware binary after successful build"""
     debug_log("Starting combined firmware creation")
@@ -69,20 +99,51 @@ def create_combined_firmware(source, target, env):
             debug_log("Warning: Bootloader binary not found, combined firmware may not boot correctly")
             bootloader_bin = None
     
-    # Check if LittleFS image exists - if not, build it
+    # Get build timestamp from version.h
+    build_timestamp = get_build_timestamp(project_dir)
+    
+    # Check if LittleFS needs to be built/rebuilt
+    rebuild_fs = False
+    
     if not os.path.exists(littlefs_bin):
-        debug_log("LittleFS image not found, building filesystem...")
-        result = run_command(f"pio run -e {build_env} -t buildfs")
+        debug_log("LittleFS image not found - will build filesystem")
+        rebuild_fs = True
+    elif build_timestamp is not None:
+        # Check if littlefs.bin is older than build timestamp
+        from datetime import datetime
+        littlefs_mtime = datetime.fromtimestamp(os.path.getmtime(littlefs_bin))
+        
+        if littlefs_mtime < build_timestamp:
+            debug_log(f"LittleFS image is outdated (file: {littlefs_mtime}, build: {build_timestamp})")
+            debug_log("Removing old filesystem image and rebuilding...")
+            os.remove(littlefs_bin)
+            rebuild_fs = True
+        else:
+            debug_log(f"LittleFS image is current (file: {littlefs_mtime}, build: {build_timestamp})")
+    else:
+        debug_log("Cannot determine build timestamp - using existing filesystem if available")
+    
+    if rebuild_fs:
+        debug_log("Building filesystem to match firmware timestamp...")
+        
+        # Build filesystem using PlatformIO
+        buildfs_cmd = f"pio run -e {build_env} -t buildfs"
+        result = run_command(buildfs_cmd)
+        
         if result is None:
-            debug_log("Failed to build LittleFS filesystem")
+            debug_log("ERROR: Failed to build filesystem!")
+            debug_log("Cannot create combined firmware without filesystem.")
             return
+        
+        # Verify filesystem was created
+        if not os.path.exists(littlefs_bin):
+            debug_log("ERROR: Filesystem build completed but littlefs.bin not found!")
+            return
+            
+        debug_log("Filesystem built successfully - proceeding with combined firmware creation.")
     
     if not os.path.exists(firmware_bin):
         debug_log("ERROR: Firmware binary not found!")
-        return
-        
-    if not os.path.exists(littlefs_bin):
-        debug_log("ERROR: LittleFS binary not found!")
         return
     
     # Create combined binary using esptool.py

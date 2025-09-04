@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api } from '../utils/api';
-import { XCircle, Save } from '../components/Icons';
+import { XCircle, Save, Clock, CheckCircle } from '../components/Icons';
 
 export function ConfigPage() {
   const [config, setConfig] = useState({
@@ -42,8 +42,18 @@ export function ConfigPage() {
   const [formErrors, setFormErrors] = useState({});
 
   useEffect(() => {
-    // Load current configuration (this would need a backend endpoint)
-    // For now, using defaults as the backend doesn't provide a config GET endpoint
+    // Load current configuration from the backend
+    const loadConfig = async () => {
+      try {
+        const currentConfig = await api.getConfig();
+        setConfig(currentConfig);
+      } catch (err) {
+        console.warn('Failed to load current configuration:', err);
+        // Keep using defaults if API fails
+      }
+    };
+    
+    loadConfig();
   }, []);
 
   const validateForm = () => {
@@ -133,7 +143,7 @@ export function ConfigPage() {
       
       {success && (
         <div class="card" style="background-color: var(--success-color); color: white; margin-bottom: 1rem;">
-          <p style="margin: 0;">✅ Configuration updated successfully!</p>
+          <p style="margin: 0;"><CheckCircle size={16} style="display: inline; margin-right: 0.25rem;" />Configuration updated successfully!</p>
         </div>
       )}
 
@@ -540,7 +550,7 @@ export function ConfigPage() {
             disabled={loading}
             style="flex: 1;"
           >
-            {loading ? <>⏳ Saving...</> : <><Save size={16} style="margin-right: 0.25rem;" />Save Configuration</>}
+            {loading ? <><Clock size={16} style="margin-right: 0.25rem;" /> Saving...</> : <><Save size={16} style="margin-right: 0.25rem;" />Save Configuration</>}
           </button>
         </div>
       </form>

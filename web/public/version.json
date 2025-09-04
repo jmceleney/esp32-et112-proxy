@@ -1,0 +1,7 @@
+{
+  "filesystem_version": "Git: main@7a49dac (v1.03) - Build: 2025-09-04 00:08:20",
+  "build_time": "2025-09-04 00:08:20",
+  "description": "ESP32 ET112 Proxy Web Interface",
+  "git_hash": "7a49dac",
+  "git_branch": "main"
+}

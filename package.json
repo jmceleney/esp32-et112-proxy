@@ -1,0 +1,22 @@
+{
+  "name": "esp32-et112-proxy-tools",
+  "version": "1.0.0",
+  "description": "Node.js tools for ESP32 ET112 Proxy device management",
+  "scripts": {
+    "upload": "node scripts/upload_device.js"
+  },
+  "dependencies": {
+    "form-data": "^4.0.0",
+    "node-fetch": "^2.6.7"
+  },
+  "devDependencies": {},
+  "keywords": [
+    "esp32",
+    "modbus",
+    "et112",
+    "firmware",
+    "ota"
+  ],
+  "author": "",
+  "license": "ISC"
+}

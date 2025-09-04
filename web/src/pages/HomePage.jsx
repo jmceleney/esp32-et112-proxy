@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'preact/hooks';
 import { api } from '../utils/api';
-import { Zap, Cpu, Clock, Radio, BarChart3, Settings, Wrench, XCircle, Link2, Info, FileText, Upload, TrendingUp } from '../components/Icons';
+import { Zap, Clock, Radio, BarChart3, Settings, Wrench, XCircle, Link2, Info, FileText, Upload, TrendingUp } from '../components/Icons';
 
 export function HomePage() {
   const [metrics, setMetrics] = useState({
@@ -40,9 +40,7 @@ export function HomePage() {
         current: parseNumericValue(metricsMap['Amps']?.replace(' A', '')),
         power: parseNumericValue(metricsMap['Watts']?.replace(' W', '')),
         frequency: parseNumericValue(metricsMap['Frequency']?.replace(' Hz', '')),
-        uptime: metricsMap['ESP Uptime'] || null,
-        cpuCore0: parseNumericValue(metricsMap['ESP CPU Core 0 Load']?.replace('%', '')),
-        cpuCore1: parseNumericValue(metricsMap['ESP CPU Core 1 Load']?.replace('%', ''))
+        uptime: metricsMap['ESP Uptime'] || null
       });
 
       setError(null);
@@ -146,25 +144,11 @@ export function HomePage() {
       </div>
 
       {/* Additional Metrics */}
-      <div class="grid-4">
+      <div class="grid-2">
         <div class="card">
           <div class="card-title"><Zap size={18} style="display: inline; margin-right: 0.25rem;" />Frequency</div>
           <div style="font-size: 1.5rem; font-weight: 600; color: var(--primary-color);">
             {loading ? '---' : formatValue(metrics.frequency, ' Hz', 2)}
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-title"><Cpu size={18} style="display: inline; margin-right: 0.25rem;" />CPU Core 0</div>
-          <div style="font-size: 1.5rem; font-weight: 600; color: var(--secondary-color);">
-            {loading ? '---' : formatValue(metrics.cpuCore0, '%', 1)}
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-title"><Cpu size={18} style="display: inline; margin-right: 0.25rem;" />CPU Core 1</div>
-          <div style="font-size: 1.5rem; font-weight: 600; color: var(--secondary-color);">
-            {loading ? '---' : formatValue(metrics.cpuCore1, '%', 1)}
           </div>
         </div>
 

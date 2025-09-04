@@ -9,14 +9,11 @@ ESP32-based Modbus RTU/TCP proxy/gateway specifically designed for Carlo Gavazzi
 ## Build Commands
 
 ```bash
-# Build debug version (default)
+# Build debug version (automatically includes filesystem)
 pio run -e esp32debug
 
-# Build release version
+# Build release version (automatically includes filesystem)
 pio run -e esp32release
-
-# Build and create git snapshot (auto-commits on success)
-./build_snapshot.sh
 
 # Upload firmware to ESP32
 pio run -e esp32debug -t upload
@@ -42,12 +39,32 @@ The ESP32 serves a modern Preact-based web interface with:
 - Modern responsive design with mobile support  
 - All configuration and debug interfaces accessible from navigation
 
-**Important**: After making changes to the web interface (`web/` directory), you must upload the filesystem:
-```bash
-pio run -e esp32debug -t uploadfs
-```
+**Important**: The build system automatically ensures the filesystem is up-to-date with your latest changes. Just run `pio run -e esp32debug` and both firmware and filesystem will be built with matching timestamps.
 
 The web files are served from the ESP32's LittleFS filesystem, not embedded in firmware.
+
+## Upgrading Older Devices
+
+For devices running old firmware without the modern web interface, use the Node.js upload tool for a two-stage upgrade:
+
+1. **Build firmware (filesystem included automatically):**
+   ```bash
+   pio run -e esp32release
+   ```
+
+2. **Upload firmware first:**
+   ```bash
+   node scripts/upload_device.js firmware <device-ip> .pio/build/esp32release/firmware.bin
+   ```
+   Device will reboot with new OTA system but no web interface.
+
+3. **Upload filesystem:**
+   ```bash
+   node scripts/upload_device.js filesystem <device-ip> .pio/build/esp32release/littlefs.bin
+   ```
+   Device reboots with complete modern interface.
+
+After upgrade, devices can accept combined firmware files (`firmware_combined.bin`) for single-step updates.
 
 ## Architecture
 
@@ -110,12 +127,27 @@ Critical: Never cache `millis()` for timestamp comparisons. Always use fresh `mi
 - Configurable log levels (LOG_LEVEL define)
 - Serial output redirectable via REROUTE_DEBUG
 
-## Git Integration
+## Build System
 
-The project includes automatic git commit functionality:
-- `scripts/pre_build.py`: Extracts git info for firmware versioning
-- `scripts/post_build.py`: Auto-commits after successful builds
-- Creates timestamped build tags automatically
+The project uses an intelligent build system with automatic timestamp synchronization:
+
+### Pre-build (`scripts/pre_build.py`):
+- Determines build timestamp from most recent source file modification
+- Generates `version.h` and `data/web/version.json` with identical timestamps
+- Extracts git information for firmware versioning
+- Eliminates timestamp inconsistencies across multi-stage builds
+
+### Post-build (`scripts/create_combined_firmware.py`):
+- Automatically builds filesystem if missing or outdated
+- Creates combined firmware+filesystem binary for atomic updates
+- Ensures filesystem timestamp matches firmware timestamp
+- Copies combined binary to project root for easy access
+
+### Key Features:
+- **One command builds everything** - No manual `buildfs` required
+- **Timestamp consistency** - Firmware and filesystem always match
+- **Smart rebuilding** - Only rebuilds filesystem when source files change
+- **Atomic updates** - Combined binaries prevent version mismatches
 
 ## Hardware Configuration
 
@@ -123,6 +155,44 @@ The project includes automatic git commit functionality:
 - TTL to RS485 modules (one per Modbus RTU network)
 - Power can be sourced from CerboGX RS485 USB cable (5V)
 - UART2 pins for RS485 communication
+
+## Remote OTA Upload Tool
+
+A Node.js script is available for uploading firmware and filesystem images to ESP32 devices via HTTP, useful for devices with broken or missing web interfaces.
+
+### Installation
+```bash
+npm install  # Install required dependencies (form-data, node-fetch)
+```
+
+### Usage
+```bash
+# Upload firmware
+node scripts/upload_device.js firmware <device-ip> <firmware-file>
+
+# Upload filesystem
+node scripts/upload_device.js filesystem <device-ip> <filesystem-file>
+
+# Examples
+node scripts/upload_device.js firmware 192.168.1.100 .pio/build/esp32release/firmware.bin
+node scripts/upload_device.js filesystem 192.168.1.100 .pio/build/esp32release/littlefs.bin
+
+# For modern devices (single-step update)
+node scripts/upload_device.js firmware 192.168.1.100 firmware_combined.bin
+```
+
+### Features
+- Works with both legacy and current firmware versions
+- Shows upload progress percentage
+- Handles device reboots automatically
+- Clear error messages for troubleshooting
+- Supports both firmware (`/update`) and filesystem (`/upload-filesystem`) endpoints
+
+### Use Cases
+1. **Recovering devices with broken web interfaces** - Upload new firmware/filesystem without web UI
+2. **Batch updates** - Script can be integrated into automation tools
+3. **Older device upgrades** - Two-stage upgrade process for devices without modern web interface
+4. **Development/testing** - Quick command-line firmware deployment
 
 ## Testing
 

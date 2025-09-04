@@ -50,7 +50,9 @@ paths = [
     '''docs/.*''',
     '''CLAUDE\.md''',
     '''README\.md''',
+    '''UPGRADE_GUIDE\.md''',
     '''stream\.py''',  # Test file with commented IPs
     '''web/.*''',  # Web interface with placeholder IPs
     '''data/web/.*''',  # Built web assets with placeholder IPs
+    '''scripts/upload_device\.js''',  # Upload tool with example IPs
 ]

@@ -74,11 +74,80 @@ def git_is_release_tag(tag):
 debug_log("Pre-build script started")
 debug_log(f"Working directory: {os.getcwd()}")
 
-timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def get_most_recent_source_timestamp():
+    """Find the most recently modified source file and use its timestamp"""
+    import glob
+    import os
+    
+    # Define source file patterns to check
+    # Exclude generated files (version.h, version.json) and build artifacts
+    source_patterns = [
+        "src/**/*.cpp",
+        "src/**/*.c", 
+        "src/**/*.h",
+        "include/*.h",
+        "web/src/**/*.jsx",
+        "web/src/**/*.js",
+        "web/src/**/*.css",
+        "web/public/**/*.*",
+        "platformio.ini",
+        "package.json"
+    ]
+    
+    # Files to explicitly exclude
+    exclude_files = {
+        "include/version.h",
+        "data/web/version.json",
+        "web/public/version.json"
+    }
+    
+    most_recent_time = 0
+    most_recent_file = None
+    
+    for pattern in source_patterns:
+        for filepath in glob.glob(pattern, recursive=True):
+            # Normalize path for comparison
+            filepath = filepath.replace("\\", "/")
+            
+            # Skip excluded files
+            if filepath in exclude_files:
+                continue
+                
+            # Skip directories
+            if os.path.isdir(filepath):
+                continue
+                
+            try:
+                mtime = os.path.getmtime(filepath)
+                if mtime > most_recent_time:
+                    most_recent_time = mtime
+                    most_recent_file = filepath
+            except OSError:
+                # File might have been deleted or is inaccessible
+                continue
+    
+    if most_recent_file:
+        # Convert timestamp to datetime
+        dt = datetime.datetime.fromtimestamp(most_recent_time)
+        timestamp_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        debug_log(f"Most recent source file: {most_recent_file}")
+        debug_log(f"Source file timestamp: {timestamp_str}")
+        return timestamp_str
+    else:
+        # Fallback to current time if no source files found
+        timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        debug_log(f"No source files found, using current time: {timestamp_str}")
+        return timestamp_str
+
+# Get timestamp based on most recent source file
+timestamp = get_most_recent_source_timestamp()
+debug_log(f"Using timestamp: {timestamp}")
 
 # Default version information if not in a git repo
 version_info = f"Build: {timestamp}"
 exact_tag = ""  # Initialize for non-git scenarios
+git_hash = "unknown"
+git_branch = "unknown"
 
 # Check if we're in a git repository
 if git_is_repo():
@@ -104,12 +173,15 @@ if exact_tag and git_is_release_tag(exact_tag):
 header_content = f'''#ifndef VERSION_H
 #define VERSION_H
 #define FIRMWARE_VERSION "{version_info}"
+#define BUILD_TIMESTAMP "{timestamp}"
 {release_define}#endif
 '''
+
+# Always create version.h with the consistent timestamp
 try:
     with open("include/version.h", "w") as f:
         f.write(header_content)
-    debug_log("Created version.h header file")
+    debug_log("Created/updated version.h header file")
 except Exception as e:
     debug_log(f"Failed to create version.h: {e}")
 
@@ -121,55 +193,43 @@ try:
 except Exception as e:
     debug_log(f"Failed to add build flag: {e}")
 
-# Build frontend if it exists and has changed
-def build_frontend():
-    """Build the Preact frontend if necessary"""
-    web_dir = "web"
-    data_dir = "data"
+# Create version.json for web interface
+def create_web_version_file():
+    """Create version.json file for web interface to detect sync"""
+    # PlatformIO builds filesystem from data/ directory, not web/
+    data_web_dir = os.path.join("data", "web")
     
-    # Check if web directory exists
-    if not os.path.exists(web_dir):
-        debug_log("No web directory found, skipping frontend build")
+    # Only create if data directory exists
+    if not os.path.exists("data"):
+        debug_log("No data directory found, skipping web version file creation")
         return
     
-    # Check if package.json exists
-    package_json = os.path.join(web_dir, "package.json")
-    if not os.path.exists(package_json):
-        debug_log("No package.json found in web directory, skipping frontend build")
-        return
+    # Create data/web directory if it doesn't exist
+    if not os.path.exists(data_web_dir):
+        os.makedirs(data_web_dir)
+        debug_log("Created data/web directory")
     
-    debug_log("Frontend directory detected, checking if build is needed")
+    version_json_path = os.path.join(data_web_dir, "version.json")
     
-    # Create data directory if it doesn't exist
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-        debug_log("Created data directory")
+    # Use the EXACT SAME timestamp as version.h
+    version_json_content = {
+        "filesystem_version": version_info,
+        "build_time": timestamp,  # Same timestamp as version.h
+        "description": "ESP32 ET112 Proxy Web Interface",
+        "git_hash": git_hash,
+        "git_branch": git_branch
+    }
     
-    # Check if node_modules exists, if not install dependencies
-    node_modules_dir = os.path.join(web_dir, "node_modules")
-    if not os.path.exists(node_modules_dir):
-        debug_log("Installing frontend dependencies...")
-        try:
-            subprocess.run(["npm", "install"], cwd=web_dir, check=True)
-            debug_log("Frontend dependencies installed successfully")
-        except subprocess.CalledProcessError as e:
-            debug_log(f"Failed to install frontend dependencies: {e}")
-            return
-        except FileNotFoundError:
-            debug_log("npm not found, skipping frontend build")
-            return
-    
-    # Build the frontend
-    debug_log("Building frontend...")
     try:
-        subprocess.run(["npm", "run", "build"], cwd=web_dir, check=True)
-        debug_log("Frontend built successfully")
-    except subprocess.CalledProcessError as e:
-        debug_log(f"Frontend build failed: {e}")
-    except FileNotFoundError:
-        debug_log("npm not found, skipping frontend build")
+        import json
+        with open(version_json_path, "w") as f:
+            json.dump(version_json_content, f, indent=2)
+        debug_log(f"Created web version file: {version_json_path}")
+        debug_log(f"Web version: {version_info}")
+    except Exception as e:
+        debug_log(f"Failed to create web version file: {e}")
 
-# Build frontend
-build_frontend()
+# Create web version file
+create_web_version_file()
 
 debug_log("Pre-build script completed successfully")

@@ -701,7 +701,18 @@ void setup() {
     dbgln("[setup] finished");
 }
 
+// External variables from pages.cpp for filesystem upload restart
+extern bool filesystemUploadRestart;
+extern unsigned long restartTime;
+
 void loop() {
+    // Check for scheduled filesystem upload restart
+    if (filesystemUploadRestart && millis() >= restartTime) {
+        dbgln("[main] Executing scheduled restart after filesystem upload");
+        delay(100);
+        ESP.restart();
+    }
+    
     // If we're in config portal mode, just handle WiFiManager and return
     if (inConfigPortal) {
         wm.loop();
@@ -882,6 +893,8 @@ void loop() {
         updateDisplay();
         yield(); // Give WiFi stack CPU time after I2C OLED operations
     }
+    
+    // mDNS is handled automatically by ESP32 - no update() method needed
 
     // WiFiManager loop only needed during config portal mode
     // Calling wm.loop() when connected causes DNS UDP socket errors

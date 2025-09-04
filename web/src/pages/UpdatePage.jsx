@@ -1,6 +1,6 @@
 import { useState, useRef } from 'preact/hooks';
 import { api } from '../utils/api';
-import { AlertTriangle, XCircle, CheckCircle, FileText, X, Upload, RotateCcw, Trash2, Wrench, FileCheck } from '../components/Icons';
+import { AlertTriangle, XCircle, CheckCircle, FileText, X, Upload, RotateCcw, Trash2, Wrench, FileCheck, Zap, Clock } from '../components/Icons';
 
 export function UpdatePage() {
   const [selectedFile, setSelectedFile] = useState(null);
@@ -9,6 +9,8 @@ export function UpdatePage() {
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
   const [uploadResult, setUploadResult] = useState(null);
+  const [wipingFilesystem, setWipingFilesystem] = useState(false);
+  const [showWipeConfirm, setShowWipeConfirm] = useState(false);
   
   const fileInputRef = useRef();
 
@@ -111,6 +113,38 @@ export function UpdatePage() {
     const sizes = ['Bytes', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
+
+  const wipeFilesystem = async () => {
+    setWipingFilesystem(true);
+    setError(null);
+    setSuccess(false);
+    
+    try {
+      const response = await fetch('/wipe-filesystem', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      const result = await response.json();
+      
+      if (result.success) {
+        setSuccess(true);
+        setUploadResult({
+          message: 'Filesystem wiped successfully! Refresh the page to see the filesystem upload interface.',
+          details: 'The device now has no web interface files and will show the filesystem upload page.'
+        });
+      } else {
+        setError(result.message || 'Failed to wipe filesystem');
+      }
+    } catch (err) {
+      setError('Error wiping filesystem: ' + err.message);
+    } finally {
+      setWipingFilesystem(false);
+      setShowWipeConfirm(false);
+    }
   };
 
   return (
@@ -228,7 +262,7 @@ export function UpdatePage() {
           disabled={!selectedFile || uploading}
           style="flex: 1;"
         >
-          {uploading ? <>⏳ Uploading...</> : <><Upload size={16} style="margin-right: 0.25rem;" />Start Upload</>}
+          {uploading ? <><Clock size={16} style="margin-right: 0.25rem;" /> Uploading...</> : <><Upload size={16} style="margin-right: 0.25rem;" />Start Upload</>}
         </button>
         
         <button
@@ -238,6 +272,70 @@ export function UpdatePage() {
         >
           <Trash2 size={16} style="margin-right: 0.25rem;" />Clear
         </button>
+      </div>
+
+      {/* Developer Testing Section */}
+      <div class="card" style="margin-top: 2rem; background-color: #f8f9fa; border: 1px solid #dee2e6;">
+        <h3 class="card-title" style="color: #6c757d; font-size: 1rem;"><Zap size={16} style="display: inline; margin-right: 0.25rem;" />Developer Testing</h3>
+        
+        <div style="background-color: #f8f9fa; border: 1px solid #dee2e6; color: #6c757d; padding: 1rem; border-radius: 4px; margin-bottom: 1rem;">
+          <h4 style="margin-top: 0; color: #495057;">Filesystem Testing</h4>
+          <p style="margin-bottom: 0.5rem;">This feature allows testing the filesystem upload process:</p>
+          <ul style="margin: 0; padding-left: 1.5rem; line-height: 1.6; font-size: 0.9rem;">
+            <li>Removes web interface files from LittleFS</li>
+            <li>Device will show filesystem upload interface</li>
+            <li>Upload littlefs.bin to restore full functionality</li>
+          </ul>
+        </div>
+
+        {showWipeConfirm ? (
+          <div style="background-color: #e7f3ff; border: 1px solid #b8daff; color: #004085; padding: 1.5rem; border-radius: 4px;">
+            <h4 style="color: #004085; margin-top: 0;">Confirm Filesystem Wipe</h4>
+            <p style="margin-bottom: 1.5rem;">
+              This will remove the web interface files and switch to filesystem upload mode. 
+              Upload littlefs.bin to restore the web interface.
+              <br/><br/>
+              <strong>Continue?</strong>
+            </p>
+            
+            <div style="display: flex; gap: 1rem;">
+              <button
+                class="btn btn-danger"
+                onClick={wipeFilesystem}
+                disabled={wipingFilesystem || uploading}
+                style="flex: 1;"
+              >
+                {wipingFilesystem ? <><Clock size={16} style="margin-right: 0.25rem;" /> Wiping...</> : <>Wipe Filesystem</>}
+              </button>
+              
+              <button
+                class="btn btn-secondary"
+                onClick={() => setShowWipeConfirm(false)}
+                disabled={wipingFilesystem}
+                style="flex: 1;"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+          <button
+            class="btn btn-outline-secondary"
+            style="width: 100%;"
+            onClick={() => setShowWipeConfirm(true)}
+            disabled={uploading || wipingFilesystem}
+          >
+            <Zap size={16} style="margin-right: 0.25rem;" />Wipe LittleFS Filesystem
+          </button>
+        )}
+        
+        <div style="margin-top: 1rem; padding: 1rem; background-color: #1a1a1a; border-radius: 4px; font-size: 0.875rem; color: #cccccc;">
+          <strong>Recovery Instructions:</strong><br/>
+          1. After wiping, refresh this page<br/>
+          2. You should see the filesystem upload interface<br/>
+          3. Upload the littlefs.bin file (build with: <code>pio run -e esp32debug -t buildfs</code>)<br/>
+          4. Device will reboot and restore full functionality
+        </div>
       </div>
 
       {/* Information */}

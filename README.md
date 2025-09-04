@@ -64,6 +64,28 @@ Use this feature at your own risk. I have read about people losing access (brick
 
 There is a /metrics URL, which can be scraped by Prometheus.
 
+## Remote OTA Updates
+
+A Node.js command-line tool is provided for uploading firmware and filesystem images directly to ESP32 devices. This is especially useful for:
+- Devices with broken or missing web interfaces
+- Batch updates across multiple devices
+- Command-line deployment workflows
+- Recovering devices that cannot be accessed through the web UI
+
+### Quick Start
+```bash
+# Install dependencies
+npm install
+
+# Upload firmware
+node scripts/upload_device.js firmware 192.168.1.100 .pio/build/esp32release/firmware.bin
+
+# Upload filesystem (web interface)
+node scripts/upload_device.js filesystem 192.168.1.100 .pio/build/esp32release/littlefs.bin
+```
+
+The tool shows upload progress and handles device reboots automatically. It works with both legacy and current firmware versions.
+
 ## SDM120 Emulation - DISABLED in platform.ini
 
 There is code which was intended to create an RTU server which emulated an SDM120. This was never fully tested, and should not be expected to work witout some further effort.

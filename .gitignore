@@ -41,6 +41,11 @@ stream*.py
 # Tool directories
 .serena/
 tools/
+.cache/
+
+# Node.js
+node_modules/
+package-lock.json
 
 # OS files
 .DS_Store

@@ -53,7 +53,6 @@ void printHex(const uint8_t *buffer, size_t length) {
 // Initialize static instance pointer
 ModbusCache *ModbusCache::instance = nullptr;
 
-// Add this function before the ModbusCache constructor
 void configAmazonFreeRTOS() {
     // Ensure WiFi task has higher priority on Core 0
     esp_wifi_set_ps(WIFI_PS_NONE);

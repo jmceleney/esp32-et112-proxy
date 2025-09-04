@@ -7,12 +7,50 @@ export function StatusPage() {
 
   const fetchStatusData = async () => {
     try {
-      const response = await fetch('/status.json');
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+      // Fetch both status data and filesystem version
+      const [statusResponse, versionResponse] = await Promise.all([
+        fetch('/status.json'),
+        fetch('/version.json')
+      ]);
+
+      if (!statusResponse.ok) {
+        throw new Error(`HTTP error! status: ${statusResponse.status}`);
       }
-      const data = await response.json();
-      setStatusData(data);
+
+      const statusData = await statusResponse.json();
+      
+      // Try to fetch filesystem version, but don't fail if it's not available
+      let filesystemVersion = 'Unknown';
+      try {
+        if (versionResponse.ok) {
+          const versionData = await versionResponse.json();
+          filesystemVersion = versionData.filesystem_version || 'Unknown';
+        }
+      } catch (versionErr) {
+        console.warn('Failed to fetch filesystem version:', versionErr);
+      }
+
+      // Insert filesystem version right after firmware version in the data array
+      const modifiedData = [...statusData.data];
+      const firmwareVersionIndex = modifiedData.findIndex(item => item.name === 'Firmware Version');
+      
+      if (firmwareVersionIndex !== -1) {
+        // Insert filesystem version right after firmware version
+        modifiedData.splice(firmwareVersionIndex + 1, 0, {
+          name: 'Filesystem Version',
+          value: filesystemVersion
+        });
+      } else {
+        // If firmware version not found, add filesystem version after build time
+        const buildTimeIndex = modifiedData.findIndex(item => item.name === 'Firmware Build Time');
+        const insertIndex = buildTimeIndex !== -1 ? buildTimeIndex + 1 : 2; // fallback to index 2
+        modifiedData.splice(insertIndex, 0, {
+          name: 'Filesystem Version', 
+          value: filesystemVersion
+        });
+      }
+
+      setStatusData({ ...statusData, data: modifiedData });
       setError(null);
     } catch (err) {
       console.error('Failed to fetch status data:', err);

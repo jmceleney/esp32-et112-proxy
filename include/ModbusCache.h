@@ -3,11 +3,11 @@
 
 #include <Arduino.h>
 #include <ModbusServerRTU.h>
+#include <ModbusClientRTU.h>
+#include <ModbusClientTCPasync.h>
 #include "ModbusServerTCPasync.h"
 #include "config.h"
 #include <WiFi.h>
-#include <ModbusTCPWrapper.h>
-#include <ModbusRTUWrapper.h>
 #include <map>
 #include <set>
 #include <queue>

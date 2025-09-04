@@ -1,9 +1,9 @@
 import { Link } from 'preact-router';
 import { useState } from 'preact/hooks';
 import { api } from '../utils/api';
-import { Home, BarChart3, Settings, Wrench, FileText, Upload, Wifi, RotateCcw, AlertTriangle, CheckCircle, XCircle } from './Icons';
+import { Home, BarChart3, Settings, Wrench, FileText, Upload, Wifi, RotateCcw, AlertTriangle, CheckCircle, XCircle, Clock } from './Icons';
 
-export function Navigation({ currentRoute }) {
+export function Navigation({ currentRoute, hostname }) {
   const [showWifiDialog, setShowWifiDialog] = useState(false);
   const [showRebootDialog, setShowRebootDialog] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -47,7 +47,7 @@ export function Navigation({ currentRoute }) {
         <div class="nav-container">
           <Link href="/" class="nav-brand">
             <div class="nav-brand-icon">E</div>
-            <span>ET112 Proxy</span>
+            <span>{hostname || 'ET112 Proxy'}</span>
           </Link>
           
           <div class="nav-menu">
@@ -117,7 +117,7 @@ export function Navigation({ currentRoute }) {
                 onClick={handleWifiReset}
                 disabled={loading}
               >
-                {loading ? <>⏳ Resetting...</> : <><RotateCcw size={16} style="margin-right: 0.25rem;" />Reset WiFi</>}
+                {loading ? <><Clock size={16} style="margin-right: 0.25rem;" /> Resetting...</> : <><RotateCcw size={16} style="margin-right: 0.25rem;" />Reset WiFi</>}
               </button>
               <button 
                 class="btn btn-secondary" 
@@ -156,7 +156,7 @@ export function Navigation({ currentRoute }) {
                 onClick={handleReboot}
                 disabled={loading}
               >
-                {loading ? <>⏳ Rebooting...</> : <><RotateCcw size={16} style="margin-right: 0.25rem;" />Reboot Device</>}
+                {loading ? <><Clock size={16} style="margin-right: 0.25rem;" /> Rebooting...</> : <><RotateCcw size={16} style="margin-right: 0.25rem;" />Reboot Device</>}
               </button>
               <button 
                 class="btn btn-secondary" 

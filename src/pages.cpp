@@ -1591,6 +1591,9 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
         cleanupOTAContext();
         return request->send(400, "text/plain", "Adaptive OTA could not write data");
       }
+      
+      // Yield to other tasks after processing each chunk for better stability
+      delay(1);
     }
     
     // Finalize on last chunk

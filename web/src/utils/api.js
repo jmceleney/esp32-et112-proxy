@@ -98,7 +98,7 @@ export const api = {
     formData.append('reg', reg);
     formData.append('func', func);
     formData.append('count', count);
-    return apiPost('/debug', formData);
+    return apiPost('/debug.json', formData);
   },
 
   // System actions

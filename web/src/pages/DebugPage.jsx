@@ -46,13 +46,14 @@ export function DebugPage() {
       const endTime = Date.now();
       const duration = endTime - startTime;
       
-      // Parse the HTML response to extract debug info and result
+      // Handle JSON response from new /debug.json endpoint
       const result = {
         timestamp: new Date().toLocaleTimeString(),
         command: `Slave ${debugForm.slave}, Function ${debugForm.func}, Register ${debugForm.reg}, Count ${debugForm.count}`,
         duration: `${duration}ms`,
         response: response,
-        success: !response.includes('Error:')
+        success: response.success || false,
+        rawData: response
       };
       
       setDebugResult(result);
@@ -65,9 +66,10 @@ export function DebugPage() {
         timestamp: new Date().toLocaleTimeString(),
         command: `Slave ${debugForm.slave}, Function ${debugForm.func}, Register ${debugForm.reg}, Count ${debugForm.count}`,
         duration: `${Date.now() - startTime}ms`,
-        response: err.message,
+        response: { error_message: err.message, success: false },
         success: false,
-        error: true
+        error: true,
+        rawData: null
       };
       
       setDebugResult(result);
@@ -83,43 +85,39 @@ export function DebugPage() {
     setError(null);
   };
 
-  const parseDebugResponse = (response) => {
-    // Extract hex values and debug information from the HTML response
-    const lines = response.split('\n').filter(line => line.trim());
-    const debugInfo = [];
-    const results = [];
+  const formatDebugResponse = (response) => {
+    if (!response || typeof response !== 'object') {
+      return 'Invalid response format';
+    }
+
+    let output = [];
     
-    let inDebugSection = false;
+    // Add command details
+    const clientStr = response.client_type ? ` (${response.client_type.toUpperCase()})` : '';
+    output.push(`Command: Function ${response.function}, Slave ${response.slave}, Register ${response.register}, Count ${response.count}${clientStr}`);
+    output.push(`Timestamp: ${response.timestamp}ms`);
     
-    for (const line of lines) {
-      const cleanLine = line.replace(/<[^>]*>/g, '').trim();
+    if (response.success) {
+      output.push(`Status: SUCCESS`);
+      output.push(`Raw hex response: ${response.raw_hex}`);
+      output.push(`Byte count: ${response.byte_count}`);
       
-      if (cleanLine.includes('Answer: 0x')) {
-        const hex = cleanLine.replace('Answer: 0x', '');
-        results.push(`Raw Response: 0x${hex}`);
-        
-        // Try to interpret as 16-bit values
-        if (hex.length >= 4) {
-          const values = [];
-          for (let i = 0; i < hex.length; i += 4) {
-            const hexPair = hex.substr(i, 4);
-            if (hexPair.length === 4) {
-              const value = parseInt(hexPair, 16);
-              values.push(`${value} (0x${hexPair})`);
-            }
-          }
-          if (values.length > 0) {
-            results.push(`Interpreted as 16-bit values: ${values.join(', ')}`);
-          }
-        }
-      } else if (cleanLine.includes('Error:')) {
-        results.push(`[ERROR] ${cleanLine}`);
-      } else if (cleanLine && !cleanLine.includes('<!DOCTYPE') && !cleanLine.includes('<')) {
-        debugInfo.push(cleanLine);
+      if (response.values && response.values.length > 0) {
+        const valueStrings = response.values.map((val, idx) => `[${idx}]: ${val} (0x${val.toString(16).padStart(4, '0')})`);
+        output.push(`16-bit values: ${valueStrings.join(', ')}`);
       }
+    } else {
+      output.push(`Status: ERROR (code ${response.error_code})`);
+      output.push(`Error: ${response.error_message}`);
     }
     
-    return { debugInfo, results };
+    // Add debug logs if available
+    if (response.debug_logs && response.debug_logs.trim()) {
+      output.push('\nDebug logs:');
+      output.push(response.debug_logs.trim());
+    }
+    
+    return output.join('\n');
   };
 
   return (
@@ -238,7 +236,7 @@ export function DebugPage() {
           </div>
           
           <div style="background-color: #1e1e1e; color: #ffffff; padding: 1rem; border-radius: 4px; font-family: monospace; font-size: 0.875rem; white-space: pre-wrap; overflow-x: auto;">
-            {debugResult.response}
+            {debugResult.rawData ? formatDebugResponse(debugResult.rawData) : (debugResult.response?.error_message || 'No response data')}
           </div>
         </div>
       )}
@@ -268,7 +266,7 @@ export function DebugPage() {
                 </div>
                 
                 <div style="background-color: #f8f9fa; padding: 0.75rem; border-radius: 4px; font-family: monospace; font-size: 0.8125rem; max-height: 150px; overflow-y: auto;">
-                  {item.response}
+                  {item.rawData ? formatDebugResponse(item.rawData) : (item.response?.error_message || 'No response data')}
                 </div>
               </div>
             ))}

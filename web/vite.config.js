@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
 import viteCompression from 'vite-plugin-compression';
+import fs from 'fs';
+import path from 'path';
 
 export default defineConfig({
   plugins: [
@@ -10,6 +12,38 @@ export default defineConfig({
       ext: '.gz',
       threshold: 1024,
     }),
+    {
+      name: 'query-string-cache-buster',
+      generateBundle(options, bundle) {
+        const versionFile = path.resolve('../data/web/version.json');
+        let version = 'v1.0.0';
+        try {
+          if (fs.existsSync(versionFile)) {
+            const versionData = JSON.parse(fs.readFileSync(versionFile, 'utf8'));
+            version = versionData.version || version;
+          }
+        } catch (e) {
+          console.warn('Could not read version.json, using default version');
+        }
+        
+        // Add version query string to HTML assets
+        Object.keys(bundle).forEach(fileName => {
+          if (fileName.endsWith('.html')) {
+            let html = bundle[fileName].source;
+            // Replace asset references with version query strings
+            html = html.replace(
+              /src="(assets\/[^"]+)"/g, 
+              `src="$1?v=${version}"`
+            );
+            html = html.replace(
+              /href="(assets\/[^"]+)"/g, 
+              `href="$1?v=${version}"`
+            );
+            bundle[fileName].source = html;
+          }
+        });
+      }
+    }
   ],
   build: {
     outDir: '../data/web',
@@ -21,16 +55,9 @@ export default defineConfig({
         manualChunks: {
           vendor: ['preact', 'preact-router'],
         },
-        assetFileNames: (assetInfo) => {
-          const info = assetInfo.name.split('.');
-          const ext = info[info.length - 1];
-          if (/\.(css)$/.test(assetInfo.name)) {
-            return `assets/[name].[hash][extname]`;
-          }
-          return `assets/[name].[hash][extname]`;
-        },
-        chunkFileNames: 'assets/[name].[hash].js',
-        entryFileNames: 'assets/[name].[hash].js',
+        assetFileNames: 'assets/[name][extname]',
+        chunkFileNames: 'assets/[name].js',
+        entryFileNames: 'assets/[name].js',
       },
     },
     target: 'es2018',

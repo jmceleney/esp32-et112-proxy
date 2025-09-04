@@ -39,7 +39,10 @@ extern unsigned long lastWiFiConnectionTime;
 
 // Variables for connection handling
 static std::atomic<int> activeConnections{0};
-static const int MAX_CONNECTIONS = 10; // Maximum concurrent connections
+static const int MAX_CONNECTIONS = 15; // Maximum concurrent connections (increased for browser parallelism)
+
+// LittleFS mutex for concurrent file access protection
+static SemaphoreHandle_t fileMutex = nullptr;
 
 // BSSID cache with expiry and size limits
 static std::map<String, std::pair<String, unsigned long>> bssidCache;
@@ -77,15 +80,17 @@ void logHeapMemory(const char* route) {
   dbgln(message);
 }
 
-// Helper function for handling connection limits
+// Helper function for handling connection limits (atomic check-and-increment)
 bool canAcceptConnection() {
-  int currentConnections = activeConnections.load();
-  if (currentConnections >= MAX_CONNECTIONS) {
-    dbgln("[webserver] Too many active connections: " + String(currentConnections) + " - Rejecting new connection");
-    return false;
+  int expected = activeConnections.load();
+  while (expected < MAX_CONNECTIONS) {
+    if (activeConnections.compare_exchange_weak(expected, expected + 1)) {
+      return true; // Successfully incremented
+    }
+    // expected was updated by compare_exchange_weak, retry with new value
   }
-  activeConnections.fetch_add(1);
-  return true;
+  dbgln("[webserver] Too many active connections: " + String(expected) + " - Rejecting new connection");
+  return false;
 }
 
 // Helper function to release connection count
@@ -545,6 +550,14 @@ void resetOTAContextForNewUpload() {
 }
 
 void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config, AsyncWiFiManager *wm){
+    // Initialize LittleFS mutex for concurrent file access protection
+    if (fileMutex == nullptr) {
+        fileMutex = xSemaphoreCreateMutex();
+        if (fileMutex == nullptr) {
+            logErrln("Failed to create LittleFS mutex!");
+        }
+    }
+
     server->on("/metrics", HTTP_GET, [modbusCache](AsyncWebServerRequest *request) {
     logHeapMemory("/metrics");
 
@@ -1201,6 +1214,227 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     request->send(response);
   });
 
+  // Test endpoint - no Modbus call to isolate the issue
+  server->on("/debug-test.json", HTTP_POST, [](AsyncWebServerRequest *request){
+    dbgln("[webserver] POST /debug-test.json");
+    
+    // Get parameters
+    String slaveId = "1";
+    if (request->hasParam("slave", true)){
+      slaveId = request->getParam("slave", true)->value();
+    }
+    String reg = "1";
+    if (request->hasParam("reg", true)){
+      reg = request->getParam("reg", true)->value();
+    }
+    String func = "3";
+    if (request->hasParam("func", true)){
+      func = request->getParam("func", true)->value();
+    }
+    String count = "1";
+    if (request->hasParam("count", true)){
+      count = request->getParam("count", true)->value();
+    }
+    
+    // Build test JSON response without Modbus call
+    String jsonResponse = "{";
+    jsonResponse += "\"slave\":" + slaveId + ",";
+    jsonResponse += "\"function\":" + func + ",";
+    jsonResponse += "\"register\":" + reg + ",";
+    jsonResponse += "\"count\":" + count + ",";
+    jsonResponse += "\"timestamp\":" + String(millis()) + ",";
+    jsonResponse += "\"success\":true,";
+    jsonResponse += "\"error_code\":0,";
+    jsonResponse += "\"error_message\":\"\",";
+    jsonResponse += "\"raw_hex\":\"0x12345678\",";
+    jsonResponse += "\"byte_count\":4,";
+    jsonResponse += "\"values\":[4660,22136],";
+    jsonResponse += "\"debug_logs\":\"Test response - no Modbus call made\"}";
+    
+    request->send(200, "application/json", jsonResponse);
+  });
+
+  // JSON Debug endpoint for Preact frontend - Using async addRequest like normal polling
+  server->on("/debug.json", HTTP_POST, [modbusCache](AsyncWebServerRequest *request){
+    dbgln("[webserver] POST /debug.json - async Modbus client");
+    
+    // Get parameters
+    String slaveId = "1";
+    if (request->hasParam("slave", true)){
+      slaveId = request->getParam("slave", true)->value();
+    }
+    String reg = "1";
+    if (request->hasParam("reg", true)){
+      reg = request->getParam("reg", true)->value();
+    }
+    String func = "3";
+    if (request->hasParam("func", true)){
+      func = request->getParam("func", true)->value();
+    }
+    String count = "1";
+    if (request->hasParam("count", true)){
+      count = request->getParam("count", true)->value();
+    }
+    
+    // Basic parameter validation
+    uint8_t slave = slaveId.toInt();
+    uint8_t function = func.toInt();
+    uint16_t regAddr = reg.toInt();
+    uint16_t regCount = count.toInt();
+    
+    // Limit register count for safety
+    if (regCount > 125) regCount = 125;  // Max allowed by Modbus spec
+    
+    String clientType = "none";
+    String debugLogs = "";
+    
+    try {
+      // Create Modbus request message (like sendModbusRequest does)
+      ModbusMessage debugRequest = ModbusMessage(slave, function, regAddr, regCount);
+      
+      // Get a unique token for this debug request (use high values to avoid conflicts)
+      uint32_t debugToken = 0xDEB0000 + (millis() & 0xFFF); // Use timestamp for uniqueness
+      
+      // Determine client type and send async request (like normal polling)
+      ModbusClientTCPasync* tcpClient = modbusCache->getModbusTCPClient();
+      ModbusClientRTU* rtuClient = modbusCache->getModbusRTUClient();
+      
+      if (tcpClient != nullptr) {
+        clientType = "tcp";
+        debugLogs += "Using TCP client with async addRequest; ";
+        tcpClient->addRequest(debugRequest, debugToken);
+      } else if (rtuClient != nullptr) {
+        clientType = "rtu";
+        debugLogs += "Using RTU client with async addRequest; ";
+        rtuClient->addRequest(debugRequest, debugToken);
+      } else {
+        // No client available - return error immediately
+        String jsonResponse = "{";
+        jsonResponse += "\"slave\":" + String(slave) + ",";
+        jsonResponse += "\"function\":" + String(function) + ",";
+        jsonResponse += "\"register\":" + String(regAddr) + ",";
+        jsonResponse += "\"count\":" + String(regCount) + ",";
+        jsonResponse += "\"timestamp\":" + String(millis()) + ",";
+        jsonResponse += "\"client_type\":\"none\",";
+        jsonResponse += "\"success\":false,";
+        jsonResponse += "\"error_code\":1,";
+        jsonResponse += "\"error_message\":\"No Modbus client configured\",";
+        jsonResponse += "\"raw_hex\":\"\",";
+        jsonResponse += "\"byte_count\":0,";
+        jsonResponse += "\"values\":[],";
+        jsonResponse += "\"debug_logs\":\"No client configured\"}";
+        
+        request->send(200, "application/json", jsonResponse);
+        return;
+      }
+      
+      // Wait briefly for the async response to arrive (but with timeout to avoid hanging)
+      debugLogs += "Request sent (token: " + String(debugToken) + "); ";
+      
+      // Wait up to 2 seconds for a response, checking every 100ms
+      bool responseReceived = false;
+      String hexData = "";
+      String values = "[";
+      String errorMsg = "";
+      uint8_t errorCode = 0;
+      unsigned long waitStartTime = millis();
+      const unsigned long maxWaitTime = 2000; // 2 second timeout
+      
+      while (!responseReceived && (millis() - waitStartTime) < maxWaitTime) {
+        delay(100); // Wait 100ms between checks
+        
+        // Check if we have cached data for the requested registers now
+        try {
+          std::vector<uint16_t> cachedValues = modbusCache->getRegisterValues(regAddr, regCount);
+          if (!cachedValues.empty()) {
+            responseReceived = true;
+            debugLogs += "Response found in cache after " + String(millis() - waitStartTime) + "ms; ";
+            
+            // Format the cached data
+            for (size_t i = 0; i < cachedValues.size() && i < 10; i++) {
+              uint16_t value = cachedValues[i];
+              
+              // Add hex representation
+              char hexStr[5];
+              sprintf(hexStr, "%04x", value);
+              hexData += hexStr;
+              
+              // Add to values array
+              if (i > 0) values += ",";
+              values += String(value);
+            }
+          }
+        } catch (...) {
+          // Continue waiting if cache access fails
+        }
+        
+        // Yield to other tasks
+        yield();
+      }
+      
+      values += "]";
+      
+      if (!responseReceived) {
+        debugLogs += "Timeout after " + String(millis() - waitStartTime) + "ms - no response received; ";
+        errorMsg = "Request timeout - no response within 2 seconds";
+        errorCode = 2;
+      }
+      
+      // Build final response
+      String jsonResponse = "{";
+      jsonResponse += "\"slave\":" + String(slave) + ",";
+      jsonResponse += "\"function\":" + String(function) + ",";
+      jsonResponse += "\"register\":" + String(regAddr) + ",";
+      jsonResponse += "\"count\":" + String(regCount) + ",";
+      jsonResponse += "\"timestamp\":" + String(millis()) + ",";
+      jsonResponse += "\"client_type\":\"" + clientType + "\",";
+      jsonResponse += "\"success\":" + String(responseReceived ? "true" : "false") + ",";
+      jsonResponse += "\"error_code\":" + String(errorCode) + ",";
+      jsonResponse += "\"error_message\":\"" + errorMsg + "\",";
+      jsonResponse += "\"raw_hex\":\"0x" + hexData + "\",";
+      jsonResponse += "\"byte_count\":" + String(hexData.length() / 2) + ",";
+      jsonResponse += "\"values\":" + values + ",";
+      jsonResponse += "\"debug_logs\":\"" + debugLogs + "\"}";
+      
+      request->send(200, "application/json", jsonResponse);
+      
+    } catch (const std::exception& e) {
+      String jsonResponse = "{";
+      jsonResponse += "\"slave\":" + String(slave) + ",";
+      jsonResponse += "\"function\":" + String(function) + ",";
+      jsonResponse += "\"register\":" + String(regAddr) + ",";
+      jsonResponse += "\"count\":" + String(regCount) + ",";
+      jsonResponse += "\"timestamp\":" + String(millis()) + ",";
+      jsonResponse += "\"client_type\":\"" + clientType + "\",";
+      jsonResponse += "\"success\":false,";
+      jsonResponse += "\"error_code\":255,";
+      jsonResponse += "\"error_message\":\"Exception: " + String(e.what()) + "\",";
+      jsonResponse += "\"raw_hex\":\"\",";
+      jsonResponse += "\"byte_count\":0,";
+      jsonResponse += "\"values\":[],";
+      jsonResponse += "\"debug_logs\":\"" + debugLogs + "Exception occurred\"}";
+      
+      request->send(200, "application/json", jsonResponse);
+    } catch (...) {
+      String jsonResponse = "{";
+      jsonResponse += "\"slave\":" + String(slave) + ",";
+      jsonResponse += "\"function\":" + String(function) + ",";
+      jsonResponse += "\"register\":" + String(regAddr) + ",";
+      jsonResponse += "\"count\":" + String(regCount) + ",";
+      jsonResponse += "\"timestamp\":" + String(millis()) + ",";
+      jsonResponse += "\"client_type\":\"" + clientType + "\",";
+      jsonResponse += "\"success\":false,";
+      jsonResponse += "\"error_code\":254,";
+      jsonResponse += "\"error_message\":\"Unknown exception occurred\",";
+      jsonResponse += "\"raw_hex\":\"\",";
+      jsonResponse += "\"byte_count\":0,";
+      jsonResponse += "\"values\":[],";
+      jsonResponse += "\"debug_logs\":\"" + debugLogs + "Unknown exception\"}";
+      
+      request->send(200, "application/json", jsonResponse);
+    }
+  });
+
   // OTA Upload endpoint for Preact frontend (POST only - no legacy HTML GET)
   server->on("/update", HTTP_POST, [config](AsyncWebServerRequest *request){
     String hostname = config->getHostname();
@@ -1270,8 +1504,8 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
     }
     chunk_count++;
     
-    // Only log progress every 4th chunk to reduce verbosity
-    if (chunk_count % 4 == 0 || !index || final) {
+    // Only log progress every 10th chunk to reduce verbosity
+    if (chunk_count % 10 == 0 || !index || final) {
       dbg("[webserver] Adaptive OTA progress ");dbg(index);dbg(" len=");dbgln(len);
       dbgln("[webserver] Context state check - type: " + String(static_cast<int>(ota_context.type)) + 
             ", initialized: " + String(ota_context.initialized) + 
@@ -1636,14 +1870,22 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
   server->on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
       logHeapMemory("/");
       
-      // Check if LittleFS is mounted and contains the Preact app
-      if (LittleFS.exists("/web/index.html")) {
-          // Filesystem exists, serve the Preact app
-          request->send(LittleFS, "/web/index.html", "text/html");
+      // Protect LittleFS access with mutex
+      if (xSemaphoreTake(fileMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          // Check if LittleFS is mounted and contains the Preact app
+          bool exists = LittleFS.exists("/web/index.html");
+          if (exists) {
+              // Filesystem exists, serve the Preact app
+              request->send(LittleFS, "/web/index.html", "text/html");
+              xSemaphoreGive(fileMutex);
+          } else {
+              xSemaphoreGive(fileMutex);
+              // Filesystem missing, redirect to upload page
+              dbgln("[webserver] Filesystem missing, redirecting to /filesystem-upload");
+              request->redirect("/filesystem-upload");
+          }
       } else {
-          // Filesystem missing, redirect to upload page
-          dbgln("[webserver] Filesystem missing, redirecting to /filesystem-upload");
-          request->redirect("/filesystem-upload");
+          request->send(503, "text/plain", "Filesystem busy");
       }
   });
 
@@ -1695,9 +1937,9 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       request->send(response);
   });
 
-  // Optimized asset serving routes for Preact - prevents filesystem blocking on simultaneous requests
+  // Asset serving route for Preact web interface
   server->on("/assets/*", HTTP_GET, [](AsyncWebServerRequest *request) {
-      String path = request->url();
+      String path = "/web" + request->url();  // Convert /assets/* to /web/assets/*
       
       // Check if we can accept more connections
       if (!canAcceptConnection()) {
@@ -1705,10 +1947,9 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
           return;
       }
       
-      // Convert /assets/* to /web/assets/* for filesystem
-      String fsPath = "/web" + path;
+      // Add yield to prevent blocking other operations
+      yield();
       
-      // Determine content type
       String contentType = "text/plain";
       if (path.endsWith(".js")) {
           contentType = "application/javascript";
@@ -1718,74 +1959,36 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
           contentType = "application/json";
       }
       
-      // Try to serve the exact file first
-      if (LittleFS.exists(fsPath)) {
-          request->send(LittleFS, fsPath, contentType);
-          releaseConnection();
-          return;
-      }
-      
-      // Asset not found - try fallback for versioned assets (e.g., index.abc123.js)
-      String assetType = "";
-      if (path.indexOf("/index.") >= 0 && path.endsWith(".js")) {
-          assetType = "index";
-      } else if (path.indexOf("/vendor.") >= 0 && path.endsWith(".js")) {
-          assetType = "vendor";
-      } else if (path.indexOf("/style.") >= 0 && path.endsWith(".css")) {
-          assetType = "style";
-      }
-      
-      if (assetType != "") {
-          // Quick fallback - try a few common patterns first before directory scan
-          String basePath = "/web/assets/" + assetType;
-          String extensions[] = {".js", ".css"};
-          String patterns[] = {".min", "", ".prod", ".bundle"};
+      // Protect LittleFS operations with mutex (short timeout to prevent blocking)
+      if (xSemaphoreTake(fileMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          // Check if file exists before trying to serve it
+          bool fileExists = LittleFS.exists(path);
           
-          for (String ext : extensions) {
-              if ((assetType != "style" && ext == ".css") || (assetType == "style" && ext == ".js")) continue;
-              for (String pattern : patterns) {
-                  String tryPath = basePath + pattern + ext;
-                  if (LittleFS.exists(tryPath)) {
-                      dbgln("[webserver] Asset fallback: " + path + " -> " + tryPath);
-                      request->send(LittleFS, tryPath, contentType);
-                      releaseConnection();
-                      return;
-                  }
+          if (fileExists) {
+              // Use async response to prevent blocking
+              AsyncWebServerResponse *response = request->beginResponse(LittleFS, path, contentType);
+              xSemaphoreGive(fileMutex); // Release mutex after beginResponse
+              
+              if (response) {
+                  // Add cache headers to reduce repeat requests
+                  response->addHeader("Cache-Control", "public, max-age=3600");
+                  request->send(response);
+              } else {
+                  request->send(500, "text/plain", "Failed to create response");
               }
+              releaseConnection();
+              return;
+          } else {
+              xSemaphoreGive(fileMutex); // Release mutex if file doesn't exist
           }
-      }
-      
-      // Still not found - 404
-      request->send(404, "text/plain", "Asset not found: " + path);
-      releaseConnection();
-  });
-
-  // Legacy /assets/* route for compatibility
-  server->on("/assets/*", HTTP_GET, [](AsyncWebServerRequest *request) {
-      String path = "/web" + request->url();  // Prepend /web
-      
-      // Check if we can accept more connections
-      if (!canAcceptConnection()) {
-          request->send(503, "text/plain", "Server busy");
-          return;
-      }
-      
-      String contentType = "text/plain";
-      if (path.endsWith(".js")) {
-          contentType = "application/javascript";
-      } else if (path.endsWith(".css")) {
-          contentType = "text/css";
-      } else if (path.endsWith(".json")) {
-          contentType = "application/json";
-      }
-      
-      if (LittleFS.exists(path)) {
-          request->send(LittleFS, path, contentType);
+      } else {
+          // Mutex timeout - filesystem is busy, return error
+          request->send(503, "text/plain", "Filesystem busy, try again");
           releaseConnection();
           return;
       }
       
-      request->send(404, "text/plain", "Asset not found");
+      request->send(404, "text/plain", "Asset not found: " + path);
       releaseConnection();
   });
 
@@ -1806,19 +2009,31 @@ void setupPages(AsyncWebServer *server, ModbusCache *modbusCache, Config *config
       // Handle /version.json specifically (non-asset JSON file)
       if (path == "/version.json") {
           String filePath = "/web/version.json";
-          if (LittleFS.exists(filePath)) {
-              request->send(LittleFS, filePath, "application/json");
-              return;
+          if (xSemaphoreTake(fileMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+              bool exists = LittleFS.exists(filePath);
+              if (exists) {
+                  request->send(LittleFS, filePath, "application/json");
+                  xSemaphoreGive(fileMutex);
+                  return;
+              }
+              xSemaphoreGive(fileMutex);
           }
           request->send(404, "application/json", "{\"error\":\"Version file not found\"}");
           return;
       }
 
       // For all other routes, serve the Preact SPA
-      if (LittleFS.exists("/web/index.html")) {
-          request->send(LittleFS, "/web/index.html", "text/html");
+      if (xSemaphoreTake(fileMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          bool exists = LittleFS.exists("/web/index.html");
+          if (exists) {
+              request->send(LittleFS, "/web/index.html", "text/html");
+              xSemaphoreGive(fileMutex);
+          } else {
+              xSemaphoreGive(fileMutex);
+              request->send(404, "text/plain", "Web UI not found - please upload filesystem");
+          }
       } else {
-          request->send(404, "text/plain", "Web UI not found - please upload filesystem");
+          request->send(503, "text/plain", "Filesystem busy");
       }
   });
 }

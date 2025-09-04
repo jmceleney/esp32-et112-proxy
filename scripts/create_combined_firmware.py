@@ -126,6 +126,26 @@ def create_combined_firmware(source, target, env):
     if rebuild_fs:
         debug_log("Building filesystem to match firmware timestamp...")
         
+        # Build web interface first
+        debug_log("Building Preact web interface...")
+        web_dir = os.path.join(project_dir, "web")
+        if os.path.exists(web_dir):
+            # Change to web directory and run npm build
+            original_dir = os.getcwd()
+            os.chdir(web_dir)
+            try:
+                npm_build_result = run_command("npm run build")
+                if npm_build_result is None:
+                    debug_log("ERROR: Failed to build web interface!")
+                    debug_log("Cannot create combined firmware without web interface.")
+                    return
+                debug_log("Web interface built successfully")
+            finally:
+                # Always change back to original directory
+                os.chdir(original_dir)
+        else:
+            debug_log("Warning: web directory not found, skipping npm build")
+        
         # Build filesystem using PlatformIO
         buildfs_cmd = f"pio run -e {build_env} -t buildfs"
         result = run_command(buildfs_cmd)
